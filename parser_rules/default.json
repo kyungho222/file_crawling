@@ -1,0 +1,48 @@
+{
+  "default": {
+    "title_selectors": [
+      "#divTable .tr",
+      ".table .tr",
+      ".board_view .title",
+      ".bbs_view .subject",
+      ".view_title",
+      ".view-title",
+      ".view_tit h4",
+      ".view_tit h5",
+      "#bo_view .view_tit h5",
+      "caption.tit_article",
+      "table caption.tit_article",
+      ".board-view-title",
+      ".p-table__subject_text",
+      "td.title",
+      "th.subject",
+      ".subject",
+      ".title",
+      ".tit",
+      "h1",
+      "h2",
+      "meta[property='og:title']",
+      "meta[name='twitter:title']",
+      "title"
+    ],
+    "content_selectors": [
+      ".content",
+      ".view_content",
+      ".view_cont",
+      ".board_view",
+      ".bbs_view",
+      "article",
+      "main"
+    ],
+    "score": {
+      "inside_post_area": 40,
+      "heading_or_title": 30,
+      "semantic_class_or_id": 25,
+      "label_value_row": 35,
+      "bad_length": -20,
+      "site_or_menu_only": -30,
+      "same_as_body_first_sentence": -10,
+      "breadcrumb": -20
+    }
+  }
+}

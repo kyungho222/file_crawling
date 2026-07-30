@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Doc Format Migration Dashboard</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #1f2933;
+      --muted: #667085;
+      --line: #cfd8e3;
+      --accent: #0f766e;
+      --accent-dark: #0b5f59;
+      --danger: #b42318;
+      --warn: #b54708;
+      --good: #067647;
+      --soft: #eef4ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Malgun Gothic", sans-serif;
+      font-size: 14px;
+    }
+    header, main {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 6px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+      align-items: end;
+    }
+    .config-grid {
+      grid-template-columns: minmax(160px, .7fr) minmax(260px, 1.2fr) minmax(260px, 1.2fr) minmax(260px, 1.2fr);
+    }
+    .filter-grid {
+      grid-template-columns: minmax(150px, .7fr) minmax(150px, .7fr) minmax(120px, .5fr) minmax(220px, 1fr) minmax(100px, .45fr);
+    }
+    .action-grid {
+      grid-template-columns: minmax(190px, .8fr) minmax(140px, .5fr) minmax(170px, .6fr) minmax(170px, .6fr) auto;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    input, select {
+      width: 100%;
+      height: 34px;
+      border: 1px solid #b9c2cf;
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 9px;
+      font-size: 13px;
+    }
+    button {
+      height: 34px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+      padding: 0 12px;
+      cursor: pointer;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    button:hover { background: var(--accent-dark); }
+    button:disabled { opacity: .55; cursor: wait; }
+    button.secondary {
+      border: 1px solid #b9c2cf;
+      background: #fff;
+      color: var(--text);
+    }
+    button.secondary:hover { background: #eef2f7; }
+    button.danger { background: var(--danger); }
+    button.danger:hover { background: #8f1f17; }
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .check {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+    }
+    .check input {
+      width: 16px;
+      height: 16px;
+      padding: 0;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .metric {
+      background: #fbfcfe;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 68px;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+    }
+    .metric.good strong { color: var(--good); }
+    .metric.warn strong { color: var(--warn); }
+    .status-line {
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status-line.error { color: var(--danger); }
+    .status-line.ok { color: var(--good); }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      max-height: 560px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1160px;
+    }
+    th, td {
+      border-bottom: 1px solid #edf0f5;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f8fafc;
+      color: #344054;
+      font-size: 12px;
+    }
+    tr:hover td { background: #fbfcfe; }
+    .id { width: 72px; color: var(--muted); }
+    .ck { width: 44px; text-align: center; }
+    .ck input { width: 16px; height: 16px; }
+    .subject {
+      min-width: 260px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .path {
+      min-width: 320px;
+      color: #475467;
+      overflow-wrap: anywhere;
+    }
+    .small { color: var(--muted); font-size: 12px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-width: 48px;
+      height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: #1849a9;
+      font-size: 12px;
+      font-weight: 800;
+      justify-content: center;
+    }
+    .log {
+      max-height: 220px;
+      overflow: auto;
+      display: grid;
+      gap: 5px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .log div {
+      border-top: 1px solid #edf0f5;
+      padding-top: 5px;
+    }
+    @media (max-width: 980px) {
+      header { display: block; }
+      .config-grid, .filter-grid, .action-grid, .metrics {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Doc Format Dashboard</h1>
+      <div class="sub">learn_list의 file 항목을 cate 기준으로 추려 doc_format 대상 테이블에 일괄 등록합니다.</div>
+    </div>
+    <div class="button-row">
+      <button class="secondary" id="reloadBtn" type="button">새로고침</button>
+      <button class="secondary" id="clearLogBtn" type="button">로그 지우기</button>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="grid config-grid">
+        <div>
+          <label for="dbName">DB</label>
+          <input id="dbName" value="dev_user">
+        </div>
+        <div>
+          <label for="chatBotId">chat_bot_id</label>
+          <input id="chatBotId" placeholder="예: 82381d41-50ec-4f98-84d3-2d67f885c8f9">
+        </div>
+        <div>
+          <label for="sourceTable">source learn_list table</label>
+          <input id="sourceTable" placeholder="비우면 ASADAL_{suffix}_LEARN_LIST 자동 추정">
+        </div>
+        <div>
+          <label for="targetTable">target doc_format table</label>
+          <select id="targetTable"></select>
+        </div>
+      </div>
+      <div class="status-line" id="bootstrapStatus"></div>
+    </section>
+
+    <section class="panel">
+      <div class="grid filter-grid">
+        <div>
+          <label for="cate1">cate1</label>
+          <input id="cate1" list="cate1List" placeholder="대분류 코드">
+          <datalist id="cate1List"></datalist>
+        </div>
+        <div>
+          <label for="cate2">cate2</label>
+          <input id="cate2" list="cate2List" placeholder="소분류 코드">
+          <datalist id="cate2List"></datalist>
+        </div>
+        <div>
+          <label for="status">learn_list status</label>
+          <select id="status">
+            <option value="all">전체</option>
+            <option value="N">N</option>
+            <option value="Y">Y</option>
+          </select>
+        </div>
+        <div>
+          <label for="keyword">검색어</label>
+          <input id="keyword" placeholder="파일명 또는 경로">
+        </div>
+        <div>
+          <label for="limit">개수</label>
+          <select id="limit">
+            <option>50</option>
+            <option selected>100</option>
+            <option>200</option>
+            <option>500</option>
+            <option>1000</option>
+          </select>
+        </div>
+      </div>
+      <div class="button-row" style="margin-top:10px;">
+        <button id="searchBtn" type="button">조회</button>
+        <button class="secondary" id="prevBtn" type="button">이전</button>
+        <button class="secondary" id="nextBtn" type="button">다음</button>
+        <button class="secondary" id="selectAllBtn" type="button">현재 페이지 전체 선택</button>
+        <button class="secondary" id="clearSelectionBtn" type="button">선택 해제</button>
+      </div>
+    </section>
+
+    <section class="metrics">
+      <div class="metric"><span>검색 결과</span><strong id="totalCount">0</strong></div>
+      <div class="metric"><span>현재 페이지</span><strong id="pageCount">0</strong></div>
+      <div class="metric good"><span>선택</span><strong id="selectedCount">0</strong></div>
+      <div class="metric warn"><span>오프셋</span><strong id="offsetText">0</strong></div>
+      <div class="metric"><span>등록 상태</span><strong id="lastResult">-</strong></div>
+    </section>
+
+    <section class="panel">
+      <div class="grid action-grid">
+        <div>
+          <label for="siteName">doc_format site</label>
+          <input id="siteName" placeholder="비우면 source site 또는 file">
+        </div>
+        <div>
+          <label for="targetStatus">target status</label>
+          <select id="targetStatus">
+            <option value="N" selected>N</option>
+            <option value="Y">Y</option>
+          </select>
+        </div>
+        <label class="check">
+          <input id="allowDuplicates" type="checkbox">
+          중복 허용
+        </label>
+        <label class="check">
+          <input id="confirmApply" type="checkbox">
+          실등록 확인
+        </label>
+        <div class="button-row">
+          <button class="secondary" id="dryRunBtn" type="button">등록 미리보기</button>
+          <button class="danger" id="applyBtn" type="button">선택 항목 등록</button>
+        </div>
+      </div>
+      <div class="status-line" id="actionStatus"></div>
+    </section>
+
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="ck"><input id="headCheck" type="checkbox"></th>
+              <th class="id">ID</th>
+              <th>cate1</th>
+              <th>cate2</th>
+              <th>status</th>
+              <th>subject</th>
+              <th>content / file_path</th>
+              <th>size</th>
+              <th>created_at</th>
+            </tr>
+          </thead>
+          <tbody id="rowsBody">
+            <tr><td colspan="9" class="small">조회 버튼을 눌러 대상을 확인하세요.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      rows: [],
+      total: 0,
+      offset: 0,
+      selected: new Set(),
+      idColumn: "id",
+      busy: false
+    };
+    const CRAWLING_DEV_API_BASE = "https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler";
+
+    function api(path) {
+      return `${CRAWLING_DEV_API_BASE}/doc-format-dashboard/api/${path}`;
+    }
+
+    function setBusy(value) {
+      state.busy = value;
+      for (const id of ["reloadBtn", "searchBtn", "prevBtn", "nextBtn", "dryRunBtn", "applyBtn"]) {
+        $(id).disabled = value;
+      }
+    }
+
+    function log(message, data) {
+      const line = document.createElement("div");
+      const stamp = new Date().toLocaleTimeString();
+      line.textContent = `[${stamp}] ${message}${data ? "\n" + JSON.stringify(data, null, 2) : ""}`;
+      $("log").prepend(line);
+    }
+
+    function formPayload() {
+      return {
+        db_name: $("dbName").value.trim(),
+        chat_bot_id: $("chatBotId").value.trim(),
+        source_table: $("sourceTable").value.trim(),
+        target_table: $("targetTable").value,
+        cate1: $("cate1").value.trim(),
+        cate2: $("cate2").value.trim(),
+        status: $("status").value,
+        keyword: $("keyword").value.trim(),
+        limit: Number($("limit").value || 100),
+        offset: state.offset,
+        site: $("siteName").value.trim(),
+        target_status: $("targetStatus").value,
+        allow_duplicates: $("allowDuplicates").checked
+      };
+    }
+
+    async function post(path, payload) {
+      const res = await fetch(api(path), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.message || `HTTP ${res.status}`);
+      }
+      return data;
+    }
+
+    function updateMetrics() {
+      $("totalCount").textContent = String(state.total);
+      $("pageCount").textContent = String(state.rows.length);
+      $("selectedCount").textContent = String(state.selected.size);
+      $("offsetText").textContent = String(state.offset);
+      $("headCheck").checked = state.rows.length > 0 && state.rows.every(row => state.selected.has(String(row[state.idColumn])));
+    }
+
+    function renderRows() {
+      const body = $("rowsBody");
+      body.innerHTML = "";
+      if (!state.rows.length) {
+        body.innerHTML = '<tr><td colspan="9" class="small">조건에 맞는 데이터가 없습니다.</td></tr>';
+        updateMetrics();
+        return;
+      }
+      for (const row of state.rows) {
+        const id = String(row[state.idColumn] ?? "");
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="ck"><input type="checkbox" data-id="${escapeHtml(id)}"></td>
+          <td class="id">${escapeHtml(id)}</td>
+          <td><span class="pill">${escapeHtml(row.cate1 || "-")}</span></td>
+          <td><span class="pill">${escapeHtml(row.cate2 || "-")}</span></td>
+          <td>${escapeHtml(row.status || "")}</td>
+          <td class="subject">${escapeHtml(row.subject || row.title || "")}</td>
+          <td class="path">${escapeHtml(row.content || row.file_path || row.path || "")}</td>
+          <td>${escapeHtml(row.size || row.file_size || row.bytes || "")}</td>
+          <td class="small">${escapeHtml(row.created_at || row.modify_at || row.regdate || row.wdate || "")}</td>
+        `;
+        const ck = tr.querySelector("input[type=checkbox]");
+        ck.checked = state.selected.has(id);
+        ck.addEventListener("change", () => {
+          if (ck.checked) state.selected.add(id);
+          else state.selected.delete(id);
+          updateMetrics();
+        });
+        body.appendChild(tr);
+      }
+      updateMetrics();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function fillDatalist(id, values) {
+      const list = $(id);
+      list.innerHTML = "";
+      for (const value of values || []) {
+        const option = document.createElement("option");
+        option.value = value;
+        list.appendChild(option);
+      }
+    }
+
+    function fillTargetTables(tables) {
+      const select = $("targetTable");
+      const current = select.value;
+      select.innerHTML = "";
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "대상 테이블 선택";
+      select.appendChild(empty);
+      for (const row of tables || []) {
+        const name = row.TABLE_NAME || row.table_name || "";
+        if (!name) continue;
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = `${name}${row.TABLE_ROWS != null ? ` (${row.TABLE_ROWS})` : ""}`;
+        select.appendChild(option);
+      }
+      if (current) select.value = current;
+    }
+
+    async function bootstrap() {
+      setBusy(true);
+      $("bootstrapStatus").className = "status-line";
+      try {
+        const payload = formPayload();
+        const data = await post("bootstrap", payload);
+        if (!$("sourceTable").value.trim()) $("sourceTable").value = data.source_table || "";
+        fillTargetTables(data.tables);
+        fillDatalist("cate1List", data.categories?.cate1 || []);
+        fillDatalist("cate2List", data.categories?.cate2 || []);
+        $("bootstrapStatus").textContent = `source columns: ${(data.source_columns || []).join(", ") || "확인 안 됨"}`;
+        log("bootstrap 완료", { source_table: data.source_table, tables: (data.tables || []).length });
+      } catch (err) {
+        $("bootstrapStatus").className = "status-line error";
+        $("bootstrapStatus").textContent = err.message;
+        log("bootstrap 실패", { error: err.message });
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function search(resetOffset = true) {
+      if (resetOffset) state.offset = 0;
+      setBusy(true);
+      try {
+        const data = await post("search", formPayload());
+        state.rows = data.rows || [];
+        state.total = data.total || 0;
+        state.idColumn = data.id_column || "id";
+        renderRows();
+        log("조회 완료", { total: state.total, page: state.rows.length, offset: state.offset });
+      } catch (err) {
+        state.rows = [];
+        state.total = 0;
+        renderRows();
+        log("조회 실패", { error: err.message });
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function register(dryRun) {
+      const ids = Array.from(state.selected);
+      if (!ids.length) {
+        $("actionStatus").className = "status-line error";
+        $("actionStatus").textContent = "선택된 항목이 없습니다.";
+        return;
+      }
+      if (!dryRun && !$("confirmApply").checked) {
+        $("actionStatus").className = "status-line error";
+        $("actionStatus").textContent = "실등록 확인 체크 후 등록하세요.";
+        return;
+      }
+      setBusy(true);
+      $("actionStatus").className = "status-line";
+      try {
+        const payload = { ...formPayload(), ids, dry_run: dryRun };
+        const data = await post("register", payload);
+        $("lastResult").textContent = dryRun ? "preview" : String(data.inserted || 0);
+        $("actionStatus").className = data.errors?.length ? "status-line error" : "status-line ok";
+        $("actionStatus").textContent = dryRun
+          ? `미리보기 ${data.preview?.length || 0}건, 중복 ${data.skipped_duplicates || 0}건`
+          : `등록 ${data.inserted || 0}건, 중복 스킵 ${data.skipped_duplicates || 0}건`;
+        log(dryRun ? "등록 미리보기 완료" : "등록 완료", data);
+      } catch (err) {
+        $("lastResult").textContent = "error";
+        $("actionStatus").className = "status-line error";
+        $("actionStatus").textContent = err.message;
+        log("등록 실패", { error: err.message });
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    $("reloadBtn").addEventListener("click", bootstrap);
+    $("clearLogBtn").addEventListener("click", () => $("log").innerHTML = "");
+    $("searchBtn").addEventListener("click", () => search(true));
+    $("prevBtn").addEventListener("click", () => {
+      const limit = Number($("limit").value || 100);
+      state.offset = Math.max(0, state.offset - limit);
+      search(false);
+    });
+    $("nextBtn").addEventListener("click", () => {
+      const limit = Number($("limit").value || 100);
+      if (state.offset + limit < state.total) {
+        state.offset += limit;
+        search(false);
+      }
+    });
+    $("selectAllBtn").addEventListener("click", () => {
+      for (const row of state.rows) state.selected.add(String(row[state.idColumn]));
+      renderRows();
+    });
+    $("clearSelectionBtn").addEventListener("click", () => {
+      state.selected.clear();
+      renderRows();
+    });
+    $("headCheck").addEventListener("change", (event) => {
+      for (const row of state.rows) {
+        const id = String(row[state.idColumn]);
+        if (event.target.checked) state.selected.add(id);
+        else state.selected.delete(id);
+      }
+      renderRows();
+    });
+    $("dryRunBtn").addEventListener("click", () => register(true));
+    $("applyBtn").addEventListener("click", () => register(false));
+
+    bootstrap();
+  </script>
+</body>
+</html>

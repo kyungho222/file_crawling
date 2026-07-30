@@ -1,0 +1,2862 @@
+import os
+import logging
+import requests
+import random
+import time
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from urllib.parse import urlparse, urljoin
+from db.db_operations import insert_data, delete_data
+# from utils.get_mysql import insert_url_learn_list
+from config import Config
+from config.settings import Config
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from logs.logging_util import LoggerSingleton
+from db.db_job_managers import AsyncJobManager, AsyncJobProgress
+from socket_sender import send_message_to_socket
+from urllib3.util import ssl_
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+import ssl
+import asyncio
+import aiohttp
+import json
+from db.db_redis import get_redis
+import multiprocessing
+from typing import List, Dict, Any, Optional
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import xml.etree.ElementTree as ET
+import hashlib
+from datetime import datetime, timedelta
+
+# ✅ 전역 SSL 검증 완전 비활성화
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', message='.*SSL.*')
+warnings.filterwarnings('ignore', message='.*ssl.*')
+
+# SSL 관련 모든 경고 무시
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# aiohttp 기본 SSL 설정 비활성화
+aiohttp.ClientSession._build_ssl_context = lambda self, *args, **kwargs: False
+
+# 전역 SSL 컨텍스트 설정
+try:
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+
+# 환경변수로 SSL 검증 비활성화
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['SSL_VERIFY'] = 'False'
+
+# 로거 설정
+logger = LoggerSingleton.get_logger(logger_name="edu.url", level=logging.INFO)
+
+# ✅ Playwright 동시성 제어를 위한 전역 세마포어 추가 (Config 설정 적용)
+PLAYWRIGHT_SEMAPHORE = asyncio.Semaphore(Config.PLAYWRIGHT_MAX_CONCURRENT)  # 최대 브라우저 동시 실행
+
+embedding_model = OpenAIEmbeddings(openai_api_key=Config.OPENAI_API_KEY)
+
+# ✅ 배치 임베딩 및 벌크 삽입을 위한 전역 변수 (Config 설정 적용)
+EMBEDDING_BATCH_SIZE = Config.URL_SINGLE_EMBEDDING_BATCH_SIZE  # 단일 URL 처리 시 배치 크기
+DB_BULK_SIZE = Config.URL_SINGLE_DB_BULK_SIZE  # 단일 URL 처리 시 벌크 삽입 크기
+CRAWLING_EMBEDDING_BATCH_SIZE = 50  # 크롤링 모드 최적화: 5 → 20으로 증가 (4배 성능 개선)
+
+
+# ✅ 웹페이지 변경감지 시스템 (3단계 접근법)
+async def check_url_changes(url: str, table_name: str, dbname: str) -> dict:
+    """
+    URL 변경 감지 메인 함수 (content_hash 비교)
+    """
+    try:
+        logger.info(f"🔍 [변경감지 시작] URL: {url}")
+        logger.info(f"📊 [변경감지] 테이블: {table_name}, DB: {dbname}")
+        
+        # 기존 메타데이터 조회
+        stored_metadata = await get_url_metadata(url, table_name, dbname)
+        
+        if not stored_metadata:
+            logger.info(f"🆕 [변경감지] 신규 URL로 판단: {url}")
+            return {'status': 'NEW_URL', 'reason': '기존 데이터 없음'}
+        
+        logger.info(f"📂 [변경감지] 기존 메타데이터 확인: {url}")
+        logger.info(f"   - Content-Hash: {stored_metadata.get('content_hash')}")
+        logger.info(f"   - Last-Check: {stored_metadata.get('last_check')}")
+        
+        # 콘텐츠 HASH 확인 (최종)
+        logger.info(f"🔐 [변경감지] 콘텐츠 HASH 확인: {url}")
+        content_result = await check_content_hash(url, stored_metadata)
+        logger.info(f"🔐 [변경감지 결과] {content_result['status']}: {content_result.get('reason', '')}")
+        
+        if content_result['status'] == 'NO_CHANGE':
+            logger.info(f"✅ [변경감지 완료] 콘텐츠 변경 없음 확인: {url}")
+            await update_last_check_time(url, table_name, dbname)
+        else:
+            logger.info(f"🔄 [변경감지 완료] 콘텐츠 변경 감지됨: {url}")
+            if content_result.get('current_hash'):
+                logger.info(f"   - 새로운 해시: {content_result.get('current_hash')}")
+        
+        return content_result
+        
+    except Exception as e:
+        logger.error(f"❌ [변경감지 오류] URL: {url}, 오류: {e}")
+        import traceback
+        logger.error(f"❌ [변경감지 오류 상세] {traceback.format_exc()}")
+        return {'status': 'ERROR', 'message': str(e)}
+
+
+async def check_content_hash(url: str, stored_metadata: dict) -> dict:
+    """
+    메인 콘텐츠 HASH 비교를 통한 변경 감지
+    """
+    try:
+        # HTTP 요청으로 HTML 가져오기
+        logger.info(f"🌐 [변경감지] HTTP 요청으로 HTML 가져오기: {url}")
+        ssl_context = ssl.create_default_context()
+        ssl_context.set_ciphers("DEFAULT@SECLEVEL=0")
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        try:
+            ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        except AttributeError:
+            pass
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(url) as resp:
+                logger.info(f"📡 [변경감지] HTTP 응답 수신: {url}, 상태코드: {resp.status}")
+                html_content = await resp.text()
+                logger.info(f"📄 [변경감지] HTML 추출 완료, 크기: {len(html_content)} bytes")
+        
+        # 메인 콘텐츠 추출 및 해시 계산
+        logger.info(f"🔍 [변경감지] 메인 콘텐츠 추출 시작: {url}")
+        main_content = extract_main_content(html_content)
+        logger.info(f"📝 [변경감지] 메인 콘텐츠 추출 완료, 크기: {len(main_content)} 글자")
+        
+        current_hash = hashlib.sha256(main_content.encode('utf-8')).hexdigest()
+        stored_hash = stored_metadata.get('content_hash')
+        
+        logger.info(f"🔐 [변경감지] 해시 비교:")
+        logger.info(f"   - 저장된 해시: {stored_hash}")
+        logger.info(f"   - 현재 해시: {current_hash}")
+        
+        if stored_hash and current_hash == stored_hash:
+            logger.info(f"✅ [변경감지 성공] 콘텐츠 해시 동일, 변경 없음: {url}")
+            return {'status': 'NO_CHANGE', 'reason': 'CONTENT_HASH_SAME'}
+        
+        logger.info(f"🔄 [변경감지 완료] 콘텐츠 변경 감지됨: {url}")
+        logger.info(f"   해시 변경: {stored_hash} → {current_hash}")
+        
+        return {
+            'status': 'CHANGED',
+            'reason': 'CONTENT_HASH_CHANGED',
+            'current_hash': current_hash,
+            'html_content': html_content
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [변경감지 오류] 콘텐츠 해시 확인 실패: {url}, 오류: {e}")
+        import traceback
+        logger.error(f"❌ [변경감지 오류 상세] {traceback.format_exc()}")
+        return {'status': 'ERROR', 'reason': f'콘텐츠 해시 확인 오류: {str(e)}'}
+
+
+def extract_main_content(html_content: str) -> str:
+    """
+    HTML에서 메인 콘텐츠 영역만 추출하여 의미있는 변경 감지
+    """
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # 스크립트, 스타일, 광고 등 제거
+        for tag in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+            tag.decompose()
+        
+        # 광고나 네비게이션 관련 클래스 제거
+        for tag in soup.find_all(class_=lambda x: x and any(
+            keyword in str(x).lower() for keyword in [
+                'ad', 'advertisement', 'banner', 'menu', 'nav', 'sidebar',
+                'footer', 'header', 'social', 'share', 'comment'
+            ]
+        )):
+            tag.decompose()
+        
+        # 메인 콘텐츠 영역 우선 순위로 추출
+        main_selectors = [
+            'main', '[role="main"]', '.main', '#main',
+            'article', '.article', '.content', '#content',
+            '.post', '.entry', '.board_view_content'
+        ]
+        
+        main_content = ""
+        for selector in main_selectors:
+            main_element = soup.select_one(selector)
+            if main_element:
+                main_content = main_element.get_text(separator=' ', strip=True)
+                break
+        
+        # 메인 영역을 찾지 못한 경우 body 전체 사용
+        if not main_content:
+            body = soup.find('body')
+            if body:
+                main_content = body.get_text(separator=' ', strip=True)
+            else:
+                main_content = soup.get_text(separator=' ', strip=True)
+        
+        # 연속된 공백 정리
+        import re
+        main_content = re.sub(r'\s+', ' ', main_content).strip()
+        
+        return main_content
+        
+    except Exception as e:
+        logger.warning(f"[메인 콘텐츠 추출 오류] 전체 텍스트 사용: {e}")
+        # 오류 시 전체 텍스트 사용
+        return extract_text_from_html(html_content)
+
+
+async def get_url_metadata(url: str, table_name: str, dbname: str) -> dict:
+    """
+    URL의 기존 메타데이터 조회 (변경감지용) - 모든 청크에서 조회 가능
+    """
+    try:
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+        
+        # content_metadata JSONB 필드에서 메타데이터 조회 (우선)
+        query_jsonb = """
+            SELECT content_metadata
+            FROM {table_name}
+            WHERE content = $1
+            AND content_metadata IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        """.format(table_name=table_name)
+        
+        result_jsonb = await conn.fetchrow(query_jsonb, url)
+        
+        if result_jsonb and result_jsonb['content_metadata']:
+            # JSONB 필드에서 메타데이터 추출
+            content_metadata_raw = result_jsonb['content_metadata']
+            
+            # content_metadata가 문자열인 경우 JSON으로 파싱
+            if isinstance(content_metadata_raw, str):
+                try:
+                    import json
+                    content_metadata = json.loads(content_metadata_raw)
+                    logger.debug(f"[메타데이터 조회] JSONB 문자열을 딕셔너리로 파싱: {url}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[메타데이터 조회] JSONB 파싱 실패: {url}, 오류: {e}")
+                    content_metadata = {}
+            else:
+                # 이미 딕셔너리인 경우
+                content_metadata = content_metadata_raw
+            
+            # 메타데이터 추출 (content_hash만 사용)
+            metadata = {
+                'content_hash': content_metadata.get('content_hash') if isinstance(content_metadata, dict) else None,
+                'last_check': content_metadata.get('last_check') if isinstance(content_metadata, dict) else None,
+                'update_frequency': content_metadata.get('update_frequency', '1_day') if isinstance(content_metadata, dict) else '1_day'
+            }
+            logger.debug(f"[메타데이터 조회] JSONB 필드에서 발견: {url}, 해시: {metadata.get('content_hash', 'None')}")
+            return metadata
+        
+        # content_metadata가 없는 경우 None 반환
+        logger.debug(f"[메타데이터 조회] content_metadata 없음: {url}")
+        return None
+            
+    except Exception as e:
+        logger.error(f"[메타데이터 조회 오류] {url}: {e}")
+        return None
+    finally:
+        if 'conn' in locals():
+            await return_connection(conn, dbname)
+
+
+async def update_last_check_time(url: str, table_name: str, dbname: str):
+    """
+    URL의 마지막 확인 시간 업데이트 (content_metadata 필드에만)
+    """
+    try:
+        from db.db_operations import execute_query
+        
+        # content_metadata 필드에서 last_check만 업데이트
+        query = """
+            UPDATE {table_name}
+            SET content_metadata = jsonb_set(
+                COALESCE(content_metadata, '{{}}'::jsonb),
+                '{{last_check}}',
+                to_jsonb(NOW()::timestamp with time zone)
+            )
+            WHERE content = $1
+        """.format(table_name=table_name)
+        
+        await execute_query(query, (url,), dbname=dbname)
+        
+        logger.info(f"⏰ [변경감지] content_metadata에 last_check 시간 업데이트: {url}")
+        
+    except Exception as e:
+        logger.error(f"[변경감지] last_check 시간 업데이트 실패: {url}: {e}")
+
+
+async def should_check_url_changes(url: str, table_name: str, dbname: str, force_check: bool = False) -> bool:
+    """
+    URL 변경감지 수행 여부 판단 (업데이트 주기 기반)
+    
+    Args:
+        url: 확인할 URL
+        table_name: 테이블명
+        dbname: 데이터베이스명
+        force_check: 강제 확인 여부 (테스트용)
+    """
+    try:
+        # 강제 확인 모드
+        if force_check:
+            logger.info(f"🔀 [변경감지 강제 실행] URL: {url}")
+            return True
+        
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+        
+        # content_metadata JSONB 필드에서 확인 (우선)
+        query_jsonb = """
+            SELECT content_metadata
+            FROM {table_name}
+            WHERE content = $1
+            AND content_metadata IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        """.format(table_name=table_name)
+        
+        result_jsonb = await conn.fetchrow(query_jsonb, url)
+        
+        if result_jsonb and result_jsonb['content_metadata']:
+            content_metadata_raw = result_jsonb['content_metadata']
+            
+            # content_metadata가 문자열인 경우 JSON으로 파싱
+            if isinstance(content_metadata_raw, str):
+                try:
+                    import json
+                    content_metadata = json.loads(content_metadata_raw)
+                    logger.debug(f"[변경감지 확인] JSONB 문자열을 딕셔너리로 파싱: {url}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[변경감지 확인] JSONB 파싱 실패: {url}, 오류: {e}")
+                    content_metadata = {}
+            else:
+                # 이미 딕셔너리인 경우
+                content_metadata = content_metadata_raw
+            
+            # 메타데이터 추출 (안전하게)
+            if isinstance(content_metadata, dict):
+                last_check_str = content_metadata.get('last_check')
+                update_frequency = content_metadata.get('update_frequency', '1_day')
+                
+                if not last_check_str:
+                    logger.info(f"🆕 [변경감지 필요] JSONB에서 최초 확인: {url}")
+                    return True
+                
+                # last_check 문자열을 datetime으로 파싱
+                try:
+                    from datetime import datetime
+                    last_check = datetime.fromisoformat(last_check_str.replace('Z', '+00:00') if last_check_str.endswith('Z') else last_check_str)
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"[변경감지] last_check 파싱 실패: {last_check_str}: {e}")
+                    logger.info(f"🆕 [변경감지 필요] last_check 파싱 실패로 재확인: {url}")
+                    return True
+        else:
+            # content_metadata가 없는 경우 최초 확인으로 처리
+            logger.info(f"🆕 [변경감지 필요] content_metadata 없음, 최초 확인: {url}")
+            return True
+        
+        # 업데이트 주기 확인
+        if not last_check:
+            logger.info(f"🆕 [변경감지 필요] 최초 확인 또는 기록 없음: {url}")
+            return True
+        
+        frequency = update_frequency or '1_day'
+        
+        # 업데이트 주기에 따른 다음 확인 시간 계산
+        frequency_hours = {
+            '1_hour': 1,
+            '1_day': 24,
+            '1_week': 168,
+            '1_month': 720
+        }
+        
+        check_interval_hours = frequency_hours.get(frequency, 24)
+        next_check_time = last_check + timedelta(hours=check_interval_hours)
+        
+        should_check = datetime.now() >= next_check_time
+        
+        if should_check:
+            logger.info(f"⏰ [변경감지 필요] 업데이트 주기 도달: {url} (마지막 확인: {last_check}, 주기: {frequency})")
+        else:
+            logger.info(f"⏸️ [변경감지 생략] 업데이트 주기 미도달: {url} (다음 확인 시간: {next_check_time})")
+        
+        return should_check
+        
+    except Exception as e:
+        logger.error(f"❌ [변경감지 필요 여부 확인 오류] {url}: {e}")
+        return True  # 오류 시 안전하게 확인 수행
+    finally:
+        if 'conn' in locals():
+            await return_connection(conn, dbname)
+
+
+# ✅ 배치 임베딩 및 품질 평가 시스템
+async def batch_embeddings(texts: List[str]) -> List[List[float]]:
+    """배치 임베딩으로 API 호출 최적화"""
+    try:
+        logger.info(f"[배치 임베딩] {len(texts)}개 텍스트 처리 시작")
+
+        # OpenAI 배치 임베딩 활용
+        embeddings = await embedding_model.aembed_documents(texts)
+
+        logger.info(f"[배치 임베딩 성공] {len(embeddings)}개 임베딩 생성")
+        return embeddings
+
+    except Exception as e:
+        logger.error(f"[배치 임베딩 오류] {e}")
+        # 폴백: 개별 임베딩
+        embeddings = []
+        for i, text in enumerate(texts):
+            try:
+                embedding = await embedding_model.aembed_query(text)
+                embeddings.append(embedding)
+                logger.debug(f"[폴백 임베딩] {i+1}/{len(texts)} 완료")
+            except Exception as fallback_error:
+                logger.error(f"[개별 임베딩 실패] {i+1}: {fallback_error}")
+                embeddings.append(None)
+        return embeddings
+
+
+def assess_content_quality(text: str, title: str = "", url: str = "") -> float:
+    """콘텐츠 품질 평가 (항상 1.0 반환 - 품질 평가 비활성화)"""
+    return 1.0
+
+
+async def bulk_insert_data(table_name: str, data_list: List[Dict], dbname: str):
+    """대용량 데이터 벌크 삽입"""
+    if not data_list:
+        return
+
+    try:
+        logger.info(f"[벌크 삽입 시작] {len(data_list)}개 레코드, 테이블: {table_name}")
+
+        # 데이터 배치별로 나누어 삽입
+        for i in range(0, len(data_list), DB_BULK_SIZE):
+            batch = data_list[i:i + DB_BULK_SIZE]
+
+            # 벌크 삽입 실행
+            await _execute_bulk_insert(table_name, batch, dbname)
+
+            logger.info(f"[벌크 삽입 진행] {min(i + DB_BULK_SIZE, len(data_list))}/{len(data_list)} 완료")
+
+        logger.info(f"[벌크 삽입 완료] 총 {len(data_list)}개 레코드 저장")
+
+    except Exception as e:
+        logger.error(f"[벌크 삽입 실패] {e}")
+        raise
+
+
+async def save_url_metadata(url: str, metadata: dict, table_name: str, dbname: str):
+    """
+    URL의 메타데이터 저장 (변경감지용 필드) - 모든 청크에 저장
+    """
+    try:
+        logger.info(f"[메타데이터 저장 시도] URL: {url}, 메타데이터: {metadata}")
+        
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+        
+        # 기존 데이터가 있는지 먼저 확인 (모든 청크)
+        check_query = """
+            SELECT COUNT(*) as count FROM {table_name}
+            WHERE content = $1
+        """.format(table_name=table_name)
+        
+        count_result = await conn.fetchrow(check_query, url)
+        existing_count = count_result['count'] if count_result else 0
+        
+        logger.info(f"[메타데이터 저장] 기존 데이터 확인: {url}, 청크 개수: {existing_count}")
+        
+        if existing_count > 0:
+            # 웹사이트 중복 크롤링 방지를 위한 변경감지 메타데이터 업데이트
+            update_query = """
+                UPDATE {table_name}
+                SET content_metadata = jsonb_build_object(
+                    'content_hash', $1,
+                    'last_check', NOW(),
+                    'update_frequency', $2
+                )
+                WHERE content = $3
+            """.format(table_name=table_name)
+            
+            result = await conn.execute(
+                update_query,
+                metadata.get('content_hash'),
+                metadata.get('update_frequency', '1_day'),
+                url
+            )
+            
+            logger.info(f"[메타데이터 저장 성공] 중복 크롤링 방지용 변경감지 메타데이터 업데이트 완료: {url}, 업데이트된 행 수: {result}")
+            return True
+        else:
+            logger.warning(f"[메타데이터 저장 실패] 기존 데이터 없음: {url} (청크 데이터가 아직 저장되지 않음)")
+            return False
+        
+    except Exception as e:
+        logger.error(f"[메타데이터 저장 오류] URL: {url}, 오류: {e}")
+        import traceback
+        logger.error(f"[메타데이터 저장 오류 상세] {traceback.format_exc()}")
+        return False
+    finally:
+        if 'conn' in locals():
+            await return_connection(conn, dbname)
+
+
+async def save_url_metadata_immediately(url: str, metadata: dict, table_name: str, dbname: str):
+    """
+    URL의 메타데이터 즉시 저장 (변경감지용 필드) - 모든 청크에 저장
+    """
+    try:
+        logger.info(f"[메타데이터 즉시 저장] URL: {url}, 메타데이터: {metadata}")
+        
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+        
+        # 기존 데이터가 있는지 먼저 확인 (모든 청크)
+        check_query = """
+            SELECT COUNT(*) as count FROM {table_name}
+            WHERE content = $1
+        """.format(table_name=table_name)
+        
+        count_result = await conn.fetchrow(check_query, url)
+        existing_count = count_result['count'] if count_result else 0
+        
+        logger.info(f"[메타데이터 즉시 저장] 기존 데이터 확인: {url}, 청크 개수: {existing_count}")
+        
+        if existing_count > 0:
+            # 웹사이트 중복 크롤링 방지를 위한 변경감지 메타데이터 업데이트
+            update_query = """
+                UPDATE {table_name}
+                SET content_metadata = jsonb_build_object(
+                    'content_hash', $1,
+                    'last_check', NOW(),
+                    'update_frequency', $2
+                )
+                WHERE content = $3
+            """.format(table_name=table_name)
+            
+            result = await conn.execute(
+                update_query,
+                metadata.get('content_hash'),
+                metadata.get('update_frequency', '1_day'),
+                url
+            )
+            
+            logger.info(f"[메타데이터 즉시 저장 성공] 중복 크롤링 방지용 변경감지 메타데이터 업데이트 완료: {url}, 업데이트된 행 수: {result}")
+            return True
+        else:
+            logger.warning(f"[메타데이터 즉시 저장] 기존 데이터 없음: {url} (청크 데이터가 아직 저장되지 않음)")
+            return False
+        
+    except Exception as e:
+        logger.error(f"[메타데이터 즉시 저장 오류] URL: {url}, 오류: {e}")
+        import traceback
+        logger.error(f"[메타데이터 즉시 저장 오류 상세] {traceback.format_exc()}")
+        return False
+    finally:
+        if 'conn' in locals():
+            await return_connection(conn, dbname)
+
+
+async def upsert_data_by_content_and_chunk_old(table_name: str, data: Dict, dbname: str):
+    """
+    [구버전] 크롤링 모드에서 content + chunk_num 복합키를 기준으로 upsert (update or insert) 수행
+    1. 먼저 content + chunk_num 기준으로 update 시도
+    2. 업데이트된 행이 없으면 insert 수행
+    """
+    conn = None
+    try:
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+        
+        # ✅ 디버깅: 전달받은 데이터 구조 로깅
+        logger.debug(f"[UPSERT] 전달받은 데이터: {data}")
+        logger.debug(f"[UPSERT] 데이터 키들: {list(data.keys())}")
+        logger.debug(f"[UPSERT] 데이터 값들: {list(data.values())}")
+        logger.debug(f"[UPSERT] 데이터 타입들: {dict(zip(data.keys(), [type(v).__name__ for v in data.values()]))}")
+        
+        # content_metadata JSONB 필드 활용
+        if 'content_metadata' in data:
+            logger.debug(f"[UPSERT] content_metadata 필드 발견: {data['content_metadata']}")
+        else:
+            logger.debug(f"[UPSERT] content_metadata 필드 없음, 개별 필드로 처리")
+        
+        # 데이터베이스 스키마 확인 (디버깅용)
+        try:
+            schema_query = f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}' ORDER BY ordinal_position"
+            schema_result = await conn.fetch(schema_query)
+            logger.debug(f"[UPSERT] 테이블 스키마: {table_name}")
+            for col in schema_result:
+                logger.debug(f"  - {col['column_name']}: {col['data_type']}")
+        except Exception as e:
+            logger.warning(f"[UPSERT] 스키마 조회 실패: {e}")
+
+        # 1. content + chunk_num 기준으로 기존 데이터 존재 여부 확인 및 update 시도
+        content_value = data.get('content')
+        chunk_num_value = data.get('chunk_num')
+        
+        if not content_value or chunk_num_value is None:
+            logger.warning(f"[UPSERT] content 또는 chunk_num 값이 없어 일반 insert로 진행: content={content_value}, chunk_num={chunk_num_value}")
+            from db.db_operations import insert_data
+            await insert_data(table_name, data, dbname)
+            return
+
+        # UPDATE용 쿼리 생성 (content, chunk_num 제외한 모든 필드 업데이트)
+        update_fields = [key for key in data.keys() if key not in ['content', 'chunk_num']]
+        if not update_fields:
+            logger.warning("[UPSERT] 업데이트할 필드가 없어 skip")
+            return
+
+        # 동적 UPDATE 쿼리 생성
+        set_clause = ', '.join([f"{field} = ${i+1}" for i, field in enumerate(update_fields)])
+        update_query = f"""
+            UPDATE {table_name} 
+            SET {set_clause}, created_at = NOW()
+            WHERE content = ${len(update_fields) + 1} AND chunk_num = ${len(update_fields) + 2}
+        """
+
+        # UPDATE 실행 (데이터 타입 변환 및 검증)
+        update_values = []
+        for field in update_fields:
+            value = data.get(field)
+            
+            # 필드별 타입 변환 (데이터베이스 스키마 기반)
+            if field == 'chunk_num':
+                # chunk_num은 varchar(50) 타입이므로 문자열로 유지
+                if value is not None:
+                    value = str(value)
+                else:
+                    value = None
+            elif field in ['etag', 'last_modified', 'content_hash', 'update_frequency', 'subject', 'title', 'memo', 'page_snippet', 'favicon_url']:
+                # 문자열 필드: None이 아닌 경우 문자열로 변환
+                if value is not None:
+                    value = str(value)
+                else:
+                    value = None
+            elif field in ['content_metadata']:
+                # JSONB 필드: 이미 JSON 문자열이거나 딕셔너리인 경우 처리
+                if value is not None:
+                    if isinstance(value, dict):
+                        try:
+                            import json
+                            value = json.dumps(value, ensure_ascii=False)
+                            logger.debug(f"[UPSERT UPDATE] content_metadata 딕셔너리를 JSON으로 변환: {len(value)} chars")
+                        except Exception as e:
+                            logger.warning(f"[UPSERT UPDATE] content_metadata JSON 변환 실패: {e}")
+                            value = None
+                    elif isinstance(value, str):
+                        # 이미 문자열인 경우 그대로 사용
+                        value = value
+                    else:
+                        logger.warning(f"[UPSERT UPDATE] content_metadata 예상치 못한 타입: {type(value)}")
+                        value = None
+                else:
+                    value = None
+            elif field in ['content_length']:
+                # 정수 필드: None이 아닌 경우 정수로 변환
+                if value is not None:
+                    try:
+                        value = int(value)
+                    except (ValueError, TypeError):
+                        logger.warning(f"[UPSERT] UPDATE {field} 변환 실패: {value}, None으로 설정")
+                        value = None
+                else:
+                    value = None
+            # elif field in ['embedding']:
+            #     # 벡터 필드: 리스트인 경우 그대로 사용, 아니면 None
+            #     if not isinstance(value, list):
+            #         logger.warning(f"[UPSERT] UPDATE embedding 타입 오류: {type(value)}, None으로 설정")
+            #         value = None
+            
+            update_values.append(value)
+        
+        # chunk_num과 content 추가 (chunk_num은 varchar(50) 타입이므로 문자열로 유지)
+        chunk_num_str = str(chunk_num_value) if chunk_num_value is not None else None
+        update_values.extend([content_value, chunk_num_str])
+        
+        # 디버깅을 위한 값 로깅
+        logger.debug(f"[UPSERT] UPDATE 값들: {dict(zip(update_fields + ['content', 'chunk_num'], update_values))}")
+        logger.debug(f"[UPSERT] UPDATE 값 타입들: {dict(zip(update_fields + ['content', 'chunk_num'], [type(v).__name__ for v in update_values]))}")
+        
+        result = await conn.execute(update_query, *update_values)
+        
+        # UPDATE된 행의 개수 확인
+        if result.split()[-1] != '0':  # PostgreSQL의 경우 "UPDATE n" 형태로 반환
+            logger.debug(f"[UPSERT] UPDATE 성공: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+            return
+        
+        # 2. UPDATE가 실패한 경우 INSERT 수행
+        logger.debug(f"[UPSERT] 기존 데이터 없음, INSERT 수행: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+        
+        # INSERT용 쿼리 생성 (데이터베이스에 실제 존재하는 컬럼만 사용)
+        # 데이터베이스 스키마 확인
+        try:
+            # PostgreSQL 전용 스키마 조회 (더 정확함)
+            schema_query = """
+                SELECT attname as column_name 
+                FROM pg_attribute 
+                WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = %s)
+                AND attnum > 0 
+                AND NOT attisdropped
+                ORDER BY attnum
+            """
+            schema_result = await conn.fetch(schema_query, table_name)
+            existing_columns = [col['column_name'] for col in schema_result]
+            logger.info(f"[UPSERT] 데이터베이스 스키마 컬럼: {existing_columns}")
+            
+            # 데이터베이스에 존재하는 컬럼만 필터링
+            available_columns = [col for col in data.keys() if col in existing_columns]
+            missing_columns = [col for col in data.keys() if col not in existing_columns]
+            
+            if missing_columns:
+                logger.warning(f"[UPSERT] 데이터베이스에 존재하지 않는 컬럼 제거: {missing_columns}")
+            
+            logger.info(f"[UPSERT] 사용 가능한 컬럼: {available_columns}")
+            columns = available_columns
+        except Exception as e:
+            logger.warning(f"[UPSERT] 스키마 조회 실패, 모든 컬럼 사용: {e}")
+            columns = list(data.keys())
+        
+        # 컬럼이 비어있으면 INSERT 시도하지 않음
+        if not columns:
+            logger.error(f"[UPSERT] 사용 가능한 컬럼이 없음")
+            logger.error(f"[UPSERT] 전달된 데이터 컬럼: {list(data.keys())}")
+            logger.error(f"[UPSERT] 데이터베이스 스키마 컬럼: {existing_columns}")
+            logger.error(f"[UPSERT] 테이블명: {table_name}")
+            raise ValueError(f"사용 가능한 컬럼이 없습니다. 데이터베이스 스키마와 전달된 데이터의 컬럼명이 일치하지 않습니다.")
+        
+        placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
+        
+        insert_query = f"""
+            INSERT INTO {table_name} ({', '.join(columns)})
+            VALUES ({placeholders})
+        """
+        
+        logger.info(f"[UPSERT] INSERT 쿼리: {insert_query}")
+        logger.info(f"[UPSERT] INSERT 컬럼: {columns}")
+        logger.info(f"[UPSERT] INSERT 플레이스홀더: {placeholders}")
+        
+        # INSERT 실행 (데이터 타입 변환 및 검증) - 사용 가능한 컬럼만
+        insert_values = []
+        for col in columns:  # data.keys() 대신 columns 사용
+            value = data.get(col)
+            
+            # 필드별 타입 변환 (데이터베이스 스키마 기반)
+            if col == 'chunk_num':
+                # chunk_num은 varchar(50) 타입이므로 문자열로 유지
+                if value is not None:
+                    value = str(value)
+                else:
+                    value = None
+            elif col in ['etag', 'last_modified', 'content_hash', 'update_frequency', 'subject', 'title', 'memo', 'page_snippet', 'favicon_url']:
+                # 문자열 필드: None이 아닌 경우 문자열로 변환
+                if value is not None:
+                    value = str(value)
+                else:
+                    value = None
+            elif col in ['content_metadata']:
+                # JSONB 필드: 이미 JSON 문자열이거나 딕셔너리인 경우 처리
+                if value is not None:
+                    if isinstance(value, dict):
+                        try:
+                            import json
+                            value = json.dumps(value, ensure_ascii=False)
+                            logger.debug(f"[UPSERT] content_metadata 딕셔너리를 JSON으로 변환: {len(value)} chars")
+                        except Exception as e:
+                            logger.warning(f"[UPSERT] content_metadata JSON 변환 실패: {e}")
+                            value = None
+                    elif isinstance(value, str):
+                        # 이미 문자열인 경우 그대로 사용
+                        value = value
+                    else:
+                        logger.warning(f"[UPSERT] content_metadata 예상치 못한 타입: {type(value)}")
+                        value = None
+                else:
+                    value = None
+            elif col in ['content_length']:
+                # 정수 필드: None이 아닌 경우 정수로 변환
+                if value is not None:
+                    try:
+                        value = int(value)
+                    except (ValueError, TypeError):
+                        logger.warning(f"[UPSERT] {col} 변환 실패: {value}, None으로 설정")
+                        value = None
+                else:
+                    value = None
+            elif col in ['embedding']:
+                # 벡터 필드: 다른 배치 로직에서 처리되므로 그대로 사용
+                value = value
+            
+            insert_values.append(value)
+        
+        # 디버깅을 위한 값 로깅
+        logger.info(f"[UPSERT] INSERT 컬럼: {columns}")
+        # logger.info(f"[UPSERT] INSERT 값들: {dict(zip(columns, insert_values))}")
+        logger.info(f"[UPSERT] INSERT 값 타입들: {dict(zip(columns, [type(v).__name__ for v in insert_values]))}")
+        logger.info(f"[UPSERT] INSERT 쿼리 파라미터 개수: {len(insert_values)}")
+        logger.info(f"[UPSERT] INSERT 플레이스홀더 개수: {placeholders.count('$')}")
+        logger.info(f"[UPSERT] INSERT 쿼리: {insert_query}")
+        
+        await conn.execute(insert_query, *insert_values)
+        
+        logger.debug(f"[UPSERT] INSERT 성공: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+
+    except Exception as e:
+        logger.error(f"[UPSERT 실패] {e}")
+        raise
+    finally:
+        if conn:
+            await return_connection(conn, dbname)
+
+
+async def upsert_data_by_content_and_chunk(table_name: str, data: Dict, dbname: str):
+    """
+    content와 chunk_num을 기준으로 데이터를 upsert하는 함수 (db_operations.py 방식 사용)
+    """
+    try:
+        from db.db_operations import execute_query, insert_data_with_metadata, update_data_with_metadata
+        
+        # content와 chunk_num 값 추출 및 타입 정규화
+        content_value = data.get('content')
+        chunk_num_value = data.get('chunk_num')
+        
+        if not content_value or chunk_num_value is None:
+            raise ValueError("content와 chunk_num은 필수 필드입니다.")
+        
+        # chunk_num을 문자열로 정규화 (DB 컬럼이 VARCHAR 타입)
+        chunk_num_str = str(chunk_num_value) if chunk_num_value is not None else "0"
+        
+        # 기존 데이터 확인 (content와 chunk_num 기준)
+        check_query = """
+            SELECT COUNT(*) as count FROM {table_name}
+            WHERE content = $1 AND chunk_num = $2
+        """.format(table_name=table_name)
+        
+        count_result = await execute_query(check_query, (content_value, chunk_num_str), fetch=True, dbname=dbname)
+        existing_count = count_result[0]['count'] if count_result else 0
+        
+        logger.debug(f"[UPSERT] 기존 데이터 확인: content={content_value[:50]}..., chunk_num={chunk_num_value}, 개수: {existing_count}")
+        
+        if existing_count > 0:
+            # UPDATE 실행 (기존 데이터가 있는 경우)
+            logger.debug(f"[UPSERT] 기존 데이터 발견, UPDATE 수행: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+            
+            # UPDATE용 데이터 준비 (content, chunk_num 제외)
+            update_data_dict = {k: v for k, v in data.items() if k not in ['content', 'chunk_num']}
+            
+            # UPDATE 실행 (JSONB 필드 자동 처리) - chunk_num 문자열 타입 사용
+            conditions = {'content': content_value, 'chunk_num': chunk_num_str}
+            await update_data_with_metadata(table_name, update_data_dict, conditions, dbname)
+            
+            logger.debug(f"[UPSERT] UPDATE 성공: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+        else:
+            # INSERT 실행 (기존 데이터가 없는 경우)
+            logger.debug(f"[UPSERT] 기존 데이터 없음, INSERT 수행: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+            
+            # INSERT용 데이터 준비 - chunk_num 타입 정규화
+            insert_data_dict = data.copy()
+            insert_data_dict['chunk_num'] = chunk_num_str  # 문자열 타입으로 통일
+            
+            # INSERT 실행 (JSONB 필드 자동 처리)
+            await insert_data_with_metadata(table_name, insert_data_dict, dbname)
+            
+            logger.debug(f"[UPSERT] INSERT 성공: content={content_value[:50]}..., chunk_num={chunk_num_value}")
+
+    except Exception as e:
+        logger.error(f"[UPSERT] {e}")
+        raise
+
+
+async def _execute_bulk_insert(table_name: str, batch_data: List[Dict], dbname: str):
+    """실제 벌크 삽입 실행"""
+    if not batch_data:
+        return
+
+    # 동적 쿼리 생성 (created_at 필드 추가)
+    columns = list(batch_data[0].keys())
+    columns.append('created_at')
+
+    placeholders = ', '.join([f'${i+1}' for i in range(len(columns) - 1)]) + ', NOW()'
+    insert_query = f"""
+        INSERT INTO {table_name} ({', '.join(columns)})
+        VALUES ({placeholders})
+    """
+
+    # 벌크 삽입 실행
+    conn = None
+    try:
+        from db.db_config import connect_db, return_connection
+        conn = await connect_db(dbname)
+
+        async with conn.transaction():
+            for item in batch_data:
+                # created_at 제외한 값들만 전달 (NOW()는 쿼리에서 처리)
+                row_values = [item.get(col) for col in columns[:-1]]
+                await conn.execute(insert_query, *row_values)
+
+        logger.debug(f"[벌크 삽입 성공] {len(batch_data)}개 레코드 삽입 완료")
+
+    except Exception as e:
+        logger.error(f"[벌크 삽입 쿼리 실패] {e}")
+        raise
+    finally:
+        if conn:
+            await return_connection(conn, dbname)
+
+
+# ✅ 사이트맵 활용 시스템
+async def discover_sitemap_urls(base_url: str) -> List[str]:
+    """사이트맵에서 URL 발견"""
+    discovered_urls = []
+    sitemap_urls = [
+        urljoin(base_url, "/sitemap.xml"),
+        urljoin(base_url, "/sitemap_index.xml"),
+        urljoin(base_url, "/robots.txt")
+    ]
+
+    logger.info(f"[사이트맵 탐색] {base_url}")
+
+    timeout_settings = aiohttp.ClientTimeout(total=15, connect=5)
+
+    # ✅ DH_KEY_TOO_SMALL 해결을 위한 SSL 컨텍스트 생성
+    ssl_context = ssl.create_default_context()
+    ssl_context.set_ciphers("DEFAULT@SECLEVEL=0")  # DH 키 크기 제한 해제
+    ssl_context.check_hostname = False  # 호스트명 검증 비활성화
+    ssl_context.verify_mode = ssl.CERT_NONE  # 인증서 검증 비활성화
+    try:
+        ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT  # 레거시 서버 연결 허용
+    except AttributeError:
+        pass
+
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout_settings) as session:
+        for sitemap_url in sitemap_urls:
+            try:
+                async with session.get(sitemap_url) as response:
+                    if response.status == 200:
+                        content = await response.text()
+
+                        if sitemap_url.endswith("robots.txt"):
+                            # robots.txt에서 Sitemap 추출
+                            for line in content.split('\n'):
+                                if line.strip().lower().startswith('sitemap:'):
+                                    actual_sitemap = line.split(':', 1)[1].strip()
+                                    urls = await parse_sitemap_content(session, actual_sitemap)
+                                    discovered_urls.extend(urls)
+                        else:
+                            urls = await parse_sitemap_xml(content)
+                            discovered_urls.extend(urls)
+
+            except Exception as e:
+                logger.debug(f"[사이트맵 오류] {sitemap_url}: {e}")
+
+    # 중복 제거 및 미디어 파일 필터링
+    unique_urls = []
+    seen_urls = set()
+    
+    for url in discovered_urls:
+        # 정규화하여 중복 및 노이즈 제거
+        norm = normalize_url(url)
+        if norm not in seen_urls and not is_downloadable_file(norm):
+            unique_urls.append(norm)
+            seen_urls.add(norm)
+    
+    logger.info(f"[사이트맵 발견] {len(unique_urls)}개 URL 발견 (다운로드 가능한 파일 제외)")
+
+    return unique_urls
+
+
+async def parse_sitemap_xml(xml_content: str) -> List[str]:
+    """XML 사이트맵 파싱"""
+    try:
+        root = ET.fromstring(xml_content)
+        urls = []
+
+        # sitemap.xml 형식
+        for url_elem in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}url'):
+            loc_elem = url_elem.find('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+            if loc_elem is not None and loc_elem.text:
+                urls.append(normalize_url(loc_elem.text.strip()))
+
+        return urls
+
+    except Exception as e:
+        logger.debug(f"[사이트맵 파싱 실패] {e}")
+        return []
+
+
+async def parse_sitemap_content(session: aiohttp.ClientSession, sitemap_url: str) -> List[str]:
+    """사이트맵 URL에서 콘텐츠 파싱"""
+    try:
+        async with session.get(sitemap_url) as response:
+            if response.status == 200:
+                content = await response.text()
+                urls = await parse_sitemap_xml(content)
+                # 정규화하여 반환
+                return [normalize_url(u) for u in urls]
+    except Exception as e:
+        logger.debug(f"[사이트맵 콘텐츠 파싱 실패] {sitemap_url}: {e}")
+
+    return []
+
+
+def prioritize_urls(urls: List[str], base_url: str = "") -> List[str]:
+    """URL 우선순위 정렬 (중요한 페이지부터)"""
+
+    def calculate_priority(url: str) -> int:
+        """URL 중요도 점수 계산"""
+        score = 0
+        path = urlparse(url).path.lower()
+
+        # 깊이 기반 점수 (얕을수록 높음)
+        depth = len([p for p in path.split('/') if p])
+        score += max(0, 10 - depth * 2)
+
+        # 키워드 기반 점수
+        high_priority_keywords = ['index', 'main', 'home', 'about', 'news', 'blog', 'article', 'content', 'post']
+        low_priority_keywords = ['login', 'register', 'contact', 'search', 'tag', 'category', 'admin']
+
+        for keyword in high_priority_keywords:
+            if keyword in path:
+                score += 5
+
+        for keyword in low_priority_keywords:
+            if keyword in path:
+                score -= 3
+
+        # 파일 확장자 기반
+        if path.endswith(('.html', '.htm', '/', '')):
+            score += 3
+        elif path.endswith(('.pdf', '.doc', '.docx')):
+            score += 1
+        elif path.endswith(('.jpg', '.png', '.gif', '.css', '.js', '.ico')):
+            score -= 10
+
+        return max(0, score)
+
+    # 우선순위 정렬
+    prioritized = sorted(urls, key=calculate_priority, reverse=True)
+    logger.info(f"[URL 우선순위 정렬] {len(prioritized)}개 URL 정렬 완료")
+
+    return prioritized
+
+
+async def extract_content_from_url(url: str, table_name: str = None, dbname: str = None, enable_change_detection: bool = True, crawl_mode: str = None) -> Dict[str, str]:
+    """URL에서 콘텐츠를 추출하는 스마트 하이브리드 함수 (변경감지 포함)"""
+    logger.debug(f"[콘텐츠 추출 시작] URL: {url}")
+
+    try:
+        # URL 정규화
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        # ✅ 변경감지 로직 (table_name과 dbname이 제공된 경우)
+        if enable_change_detection and table_name and dbname:
+            # 환경변수로 강제 실행 옵션 확인 (테스트용)
+            force_check = os.getenv('FORCE_CHANGE_DETECTION', 'false').lower() == 'true'
+            
+            # 업데이트 주기 확인
+            should_check = await should_check_url_changes(url, table_name, dbname, force_check=force_check)
+            if should_check:
+                # 3단계 변경감지 수행
+                change_result = await check_url_changes(url, table_name, dbname)
+                
+                if change_result['status'] == 'NO_CHANGE':
+                    logger.info(f"[변경감지] 콘텐츠 변경 없음, 기존 데이터 유지: {url}")
+                    return {'status': 'NO_CHANGE', 'reason': change_result['reason']}
+                elif change_result['status'] == 'LIKELY_NO_CHANGE':
+                    logger.info(f"[변경감지] 콘텐츠 변경 없을 가능성 높음, 기존 데이터 유지: {url}")
+                    return {'status': 'NO_CHANGE', 'reason': change_result['reason']}
+                elif change_result['status'] == 'CHANGED':
+                    logger.info(f"[변경감지] 콘텐츠 변경 감지, 새로 학습 진행: {url}")
+                    # 콘텐츠 해시에서 이미 HTML을 가져온 경우 재사용
+                    if change_result.get('html_content'):
+                        # 크롤링 모드에 따른 HTML 파싱 함수 선택
+                        if crawl_mode == "crawling":
+                            result = parse_html_content_for_crawling_mode(change_result['html_content'], url)
+                            logger.info(f"[크롤링모드 변경감지 파싱] URL: {url}")
+                        else:
+                            result = parse_html_content(change_result['html_content'], url)
+                        if result:
+                            # 메타데이터 즉시 저장 (content_hash만)
+                            metadata = {'content_hash': change_result.get('current_hash')}
+                            await save_url_metadata_immediately(url, metadata, table_name, dbname)
+                            return result
+                elif change_result['status'] == 'NEW_URL':
+                    logger.info(f"[변경감지] 신규 URL, 새로 학습 진행: {url}")
+                    # 신규 URL은 아래 일반 처리 로직에서 메타데이터 수집
+                else:
+                    logger.warning(f"[변경감지] 오류 발생, 일반 처리로 진행: {url} - {change_result.get('message', '')}")
+            else:
+                logger.debug(f"[변경감지] 업데이트 주기 미도달, 기존 데이터 유지: {url}")
+                return {'status': 'NO_CHANGE', 'reason': '업데이트 주기 미도달'}
+
+        # ✅ 정부 사이트 감지
+        # ✅ 정부/공공기관 사이트 및 Playwright 우선 사이트 감지 (childfund.or.kr 포함)
+        is_government_site = any(gov_domain in url.lower() for gov_domain in [
+            'go.kr', 'gov.kr', 'mois.go.kr', 'sd.go.kr', 'korea.kr', 'childfund.or.kr'
+        ])
+
+        # ✅ 메타데이터 수집을 위해 변경감지 활성화 여부 전달
+        collect_metadata = enable_change_detection and table_name and dbname
+        
+        if is_government_site:
+            # 정부 사이트는 Playwright 우선 사용
+            logger.debug(f"[정부 사이트 감지] Playwright 사용: {url}")
+            result = await extract_with_playwright(url, collect_metadata=collect_metadata, crawl_mode=crawl_mode)
+        else:
+            # 일반 사이트는 HTTP 우선, 실패시 Playwright
+            try:
+                result = await extract_with_http(url, collect_metadata=collect_metadata, crawl_mode=crawl_mode)
+                if result and result.get("content") and len(result["content"]) > 100:
+                    logger.debug(f"[HTTP 추출 성공] URL: {url}")
+                else:
+                    logger.debug(f"[HTTP 추출 부족] Playwright로 전환: {url}")
+                    result = await extract_with_playwright(url, collect_metadata=collect_metadata, crawl_mode=crawl_mode)
+            except Exception as e:
+                logger.debug(f"[HTTP 추출 실패] Playwright로 전환: {url}: {e}")
+                result = await extract_with_playwright(url, collect_metadata=collect_metadata, crawl_mode=crawl_mode)
+
+        # ✅ 메타데이터는 청크 저장 시 포함되므로 별도 저장 불필요
+        if enable_change_detection and table_name and dbname and result and result.get('_metadata'):
+            try:
+                logger.info(f"[메타데이터 준비 완료] URL: {url}, 청크 저장 시 포함됩니다")
+                
+                # 결과에서 메타데이터 제거하지 않음 (청크 처리에서 사용)
+                # del result['_metadata']  # 주석 처리
+                
+            except Exception as e:
+                logger.warning(f"[메타데이터 처리 실패] URL: {url}, 오류: {e}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"[콘텐츠 추출 전체 실패] URL: {url}: {e}")
+        return None
+
+
+async def extract_with_http(url: str, collect_metadata: bool = True, crawl_mode: str = None) -> Dict[str, str]:
+    """HTTP 방식으로 콘텐츠 추출 (메타데이터 수집 포함)"""
+    
+    # URL 확장자로 XML/JSON 필터링
+    url_lower = url.lower()
+    if any(url_lower.endswith(ext) for ext in ['.xml', '.json', '.rss', '.atom']):
+        logger.info(f"[HTTP 추출 제외] XML/JSON 확장자 스킵: {url}")
+        return None
+    
+    headers = {
+        "User-Agent": get_random_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    }
+
+    timeout_settings = aiohttp.ClientTimeout(total=30, connect=8, sock_read=20)
+
+    async with aiohttp.ClientSession(timeout=timeout_settings, headers=headers) as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                # Content-Type 확인하여 XML/JSON 페이지 필터링
+                content_type = response.headers.get('Content-Type', '').lower()
+                if any(excluded_type in content_type for excluded_type in ['application/json', 'application/xml', 'text/xml', 'application/rss+xml', 'application/atom+xml']):
+                    logger.info(f"[크롤링 제외] XML/JSON 페이지 스킵: {url}, Content-Type: {content_type}")
+                    return None
+                
+                try:
+                    html_content = await response.text()
+                except UnicodeDecodeError:
+                    html_content = await response.text(errors='ignore')
+
+                # 크롤링 모드에 따른 HTML 파싱 함수 선택
+                if crawl_mode == "crawling":
+                    result = parse_html_content_for_crawling_mode(html_content, url)
+                    logger.info(f"[크롤링모드 HTTP 파싱] URL: {url}")
+                else:
+                    result = parse_html_content(html_content, url)
+                
+                # 메타데이터 수집 (신규 URL 처리용)
+                if collect_metadata and result:
+                    metadata = {
+                        'content_length': response.headers.get('Content-Length'),
+                        'content_hash': hashlib.sha256(extract_main_content(html_content).encode('utf-8')).hexdigest()
+                    }
+                    result['_metadata'] = metadata
+                    logger.info(f"[HTTP 메타데이터 수집] URL: {url}")
+                    logger.info(f"   - Content-Length: {metadata.get('content_length', 'None')}")
+                    logger.info(f"   - Content-Hash: {metadata.get('content_hash')}")
+                
+                return result
+            else:
+                return None
+
+
+async def extract_with_playwright(url: str, collect_metadata: bool = True, crawl_mode: str = None) -> Dict[str, str]:
+    """Playwright 방식으로 콘텐츠 추출 (메타데이터 수집 포함)"""
+    try:
+        html_content = await fetch_page_with_timeout(url, 0, timeout=60)
+        if html_content:
+            # 크롤링 모드에 따른 HTML 파싱 함수 선택 (리다이렉트된 URL 반영)
+            final_url = url  # 기본값
+            if crawl_mode == "crawling":
+                result = parse_html_content_for_crawling_mode(html_content, url)
+                logger.info(f"[크롤링모드 Playwright 파싱] URL: {url}")
+            else:
+                result = parse_html_content(html_content, url)
+                
+            # 결과에 최종 URL 정보 추가 (필요시 활용 가능)
+            if result and isinstance(result, dict):
+                result['_final_url'] = url
+            
+            # 메타데이터 수집 (신규 URL 처리용) - Playwright는 HTTP 헤더 정보 없이 해시만 계산
+            if collect_metadata and result:
+                metadata = {
+                    'etag': None,  # Playwright에서는 HTTP 헤더 정보 수집 불가
+                    'last_modified': None,
+                    'content_length': None,
+                    'content_hash': hashlib.sha256(extract_main_content(html_content).encode('utf-8')).hexdigest()
+                }
+                result['_metadata'] = metadata
+                logger.info(f"[Playwright 메타데이터 수집] URL: {url}")
+                logger.info(f"   - Content-Hash: {metadata.get('content_hash')}")
+                logger.info(f"   - HTTP 헤더 정보: Playwright에서는 수집 불가")
+            
+            return result
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"[Playwright 추출 실패] URL: {url}: {e}")
+        return None
+
+
+def extract_subject_for_crawling_mode(soup: BeautifulSoup, url: str) -> str:
+    """크롤링 모드 전용 3단계 게시물 제목(subject) 추출 함수
+    1단계: h1~h8 태그에서 추출
+    2단계: 대안 방법으로 추출 (og:title, article title, meta description 등)
+    3단계: title 태그에서 추출
+    """
+    logger.info(f"[크롤링 게시물제목추출 시작] URL: {url}")
+    
+    try:
+        # 1단계: h1~h8 태그에서 제목 추출 (a href 링크가 포함된 제목 제외)
+        logger.info(f"[1단계 디버깅] 전체 h 태그 검색 시작")
+        
+        # 제목 관련 class 키워드 리스트
+        subject_class_keywords = ['subject', 'sub', 'heading', '제목', 'headline', 'pg-tit', 'pg-title', 'pg-hd-tit', 'sub-tit', 'sub-title']
+        
+        # 1단계-1: 제목 관련 class를 가진 h 태그 우선 검색
+        logger.info(f"[1단계-1] 제목 클래스 h 태그 우선 검색")
+        for i in range(1, 9):
+            h_tags = soup.find_all(f"h{i}")
+            for idx, h_tag in enumerate(h_tags):
+                if h_tag:
+                    # header 태그 안에 있는지 확인
+                    is_in_header = any(parent.name == 'header' for parent in h_tag.parents)
+                    if is_in_header:
+                        logger.info(f"[1단계-1] h{i}[{idx}] header 안의 태그로 건너뜀")
+                        continue
+                    
+                    h_class = h_tag.get('class', [])
+                    h_class_str = ' '.join(h_class) if isinstance(h_class, list) else str(h_class)
+                    
+                    # class에 제목 관련 키워드가 포함되어 있는지 확인
+                    if any(keyword in h_class_str.lower() for keyword in subject_class_keywords):
+                        raw_text = h_tag.get_text(strip=True)
+                        logger.info(f"[1단계-1 디버깅] h{i}[{idx}] 제목 클래스 발견: class='{h_class_str}' | 텍스트: '{raw_text}'")
+                        
+                        if raw_text and not h_tag.find("a"):
+                            extracted_title = raw_text
+                            logger.info(f"\n = \n = \n = = = = = = = = 1단계-1 제목추출 성공] h{i} 제목클래스 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                            return extracted_title
+
+                    # id에 제목 관련 키워드가 포함되어 있는지 확인
+                    subject_id_keywords = ['title', 'subject', 'heading', 'tit', 'sub', 'head']
+                    h_id = h_tag.get('id', '')
+                    
+                    if h_id and any(keyword in h_id.lower() for keyword in subject_id_keywords):
+                        raw_text = h_tag.get_text(strip=True)
+                        logger.info(f"[1단계-1 디버깅] h{i}[{idx}] 제목 ID 발견: id='{h_id}' | 텍스트: '{raw_text}'")
+                        
+                        if raw_text and not h_tag.find("a"):
+                            extracted_title = raw_text
+                            logger.info(f"\n = \n = \n = = = = = = = = 1단계-1 제목추출 성공] h{i} 제목ID 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                            return extracted_title
+                    #p 태그의 class 키워드 확인
+                    p_tags = soup.find_all("p")
+                    for p_tag in p_tags:
+                        p_class = p_tag.get('class', [])
+                        p_class_str = ' '.join(p_class) if isinstance(p_class, list) else str(p_class)
+                        if p_class and any(keyword in p_class_str.lower() for keyword in subject_class_keywords):
+                            raw_text = p_tag.get_text(strip=True)
+                            logger.info(f"[1단계-1 디버깅] p 제목 클래스 발견: class='{p_class_str}' | 텍스트: '{raw_text}'")
+                            
+                            if raw_text and not p_tag.find("a"):
+                                extracted_title = raw_text
+                                logger.info(f"\n = \n = \n = = = = = = = = 1단계-1 제목추출 성공] p 제목클래스 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                                return extracted_title
+                                
+                
+        # 1단계-2: 일반 h 태그 검색 (header 태그 안에 있는 것은 제외)
+        logger.info(f"[1단계-2] 일반 h 태그 검색 (header 제외)")
+        for i in range(1, 9):  # h1부터 h8까지 순차적으로 모두 확인
+            h_tags = soup.find_all(f"h{i}")  # 같은 레벨의 모든 태그 확인
+            logger.info(f"[1단계-2 디버깅] h{i} 태그 발견: {len(h_tags)}개")
+            
+            for idx, h_tag in enumerate(h_tags):
+                if h_tag:
+                    # header 태그 안에 있는지 확인
+                    is_in_header = any(parent.name == 'header' for parent in h_tag.parents)
+                    if is_in_header:
+                        logger.info(f"[1단계-2] h{i}[{idx}] header 안의 태그로 건너뜀")
+                        continue
+                    
+                    raw_text = h_tag.get_text(strip=True)
+                    logger.info(f"[1단계-2 디버깅] h{i}[{idx}] HTML: {repr(str(h_tag)[:100])} | 텍스트: '{raw_text}'")
+                    
+                    if raw_text:
+                        # a 태그가 포함된 h 태그는 제외 (예: <h2><a href="#n">주요기능</a></h2>)
+                        has_link = h_tag.find("a")
+                        if has_link:
+                            logger.info(f"[1단계-2 제목추출] h{i} 태그에 링크가 포함되어 건너뜀: {raw_text[:50]}... (링크: {str(has_link)[:50]})")
+                            continue
+                            
+                        extracted_title = raw_text
+                        logger.info(f"\n = \n = \n = = = = = = = = 1단계-2 제목추출 성공] h{i} 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                        return extracted_title
+                    else:
+                        logger.info(f"[1단계-2 디버깅] h{i}[{idx}] 텍스트가 비어있음")
+        
+        logger.info(f"[1단계 디버깅] 모든 h 태그 검색 완료, 유효한 제목 없음")
+        
+        # 1단계-3: h 태그가 아닌 다른 태그 중 제목 관련 class를 가진 태그 검색
+        logger.info(f"[1단계-3] h 태그 외 제목 클래스 태그 검색")
+        for keyword in subject_class_keywords:
+            # class에 해당 키워드가 포함된 모든 태그 검색 (h 태그 제외)
+            for tag_name in ['div', 'span', 'p', 'strong', 'b', 'em', 'section']:
+                tags = soup.find_all(tag_name, class_=lambda x: x and keyword in ' '.join(x).lower() if isinstance(x, list) else keyword in str(x).lower())
+                for tag in tags:
+                    if tag:
+                        # header 태그 안에 있는지 확인
+                        is_in_header = any(parent.name == 'header' for parent in tag.parents)
+                        if is_in_header:
+                            continue
+                        
+                        raw_text = tag.get_text(strip=True)
+                        if raw_text and not tag.find("a") and len(raw_text) <= 200:  # 너무 긴 텍스트는 제외
+                            logger.info(f"[1단계-3 디버깅] {tag_name} 제목 클래스 발견: class='{tag.get('class')}' | 텍스트: '{raw_text[:50]}...'")
+                            extracted_title = raw_text
+                            logger.info(f"\n = \n = \n = = = = = = = = 1단계-3 제목추출 성공] {tag_name} 제목클래스 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                            return extracted_title
+        
+        # 2단계: 대안 방법으로 제목 추출
+        logger.info(f"[2단계 제목추출 시도] h태그에서 추출 실패, 대안 방법 시도")
+        
+        # Open Graph title
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            extracted_title = og_title.get("content").strip()
+            logger.info(f"\n = \n = \n = = = = = = = = 2단계 제목추출 성공] og:title: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+            return extracted_title
+        
+        # Twitter card title
+        twitter_title = soup.find("meta", attrs={"name": "twitter:title"})
+        if twitter_title and twitter_title.get("content"):
+            extracted_title = twitter_title.get("content").strip()
+            logger.info(f"\n = \n = \n = = = = = = = = 2단계 제목추출 성공] twitter:title: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+            return extracted_title
+        
+        # Article title
+        article = soup.find("article")
+        if article:
+            article_h1 = article.find("h1")
+            if article_h1 and article_h1.get_text(strip=True):
+                # a 태그가 포함된 h 태그는 제외
+                if not article_h1.find("a"):
+                    extracted_title = article_h1.get_text(strip=True)
+                    logger.info(f"\n = \n = \n = = = = = = = = 2단계 제목추출 성공] article h1: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                    return extracted_title
+            
+            # article 내 다른 제목 태그들 시도
+            for i in range(2, 7):  # h2~h6
+                article_h = article.find(f"h{i}")
+                if article_h and article_h.get_text(strip=True):
+                    # a 태그가 포함된 h 태그는 제외
+                    if not article_h.find("a"):
+                        extracted_title = article_h.get_text(strip=True)
+                        logger.info(f"\n = \n = \n = = = = = = = = 2단계 제목추출 성공] article h{i}: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+                        return extracted_title
+        
+        # Meta description을 제목으로 사용 (짧은 경우만)
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        if meta_desc and meta_desc.get("content"):
+            desc_content = meta_desc.get("content").strip()
+            if len(desc_content) <= 100:  # 짧은 설명만 제목으로 사용
+                logger.info(f"\n = \n = \n = = = = = = = = 2단계 제목추출 성공] meta description: {desc_content[:50]}...= = = = = = = = \n = \n = \n")
+                return desc_content
+        
+        # 3단계: title 태그에서 추출
+        logger.info(f"[3단계 제목추출 시도] 대안 방법 실패, title 태그 시도")
+        if soup.title and soup.title.string:
+            extracted_title = soup.title.string.strip()
+            logger.info(f"\n = \n = \n = = = = = = = = 3단계 제목추출 성공] title 태그: {extracted_title[:50]}...= = = = = = = = \n = \n = \n")
+            return extracted_title
+        
+        # 모든 단계 실패
+        logger.warning(f"[제목추출 실패] 모든 단계에서 제목 추출 실패: {url}")
+        return ""
+        
+    except Exception as e:
+        logger.error(f"[제목추출 오류] URL: {url}, 오류: {e}")
+        return ""
+
+
+def parse_html_content(html_content: str, url: str) -> Dict[str, str]:
+    """HTML 콘텐츠를 파싱하여 구조화된 데이터 반환"""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # 제목 추출
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+        if not title:
+            h1_tag = soup.find("h1")
+            if h1_tag:
+                title = h1_tag.get_text(strip=True)
+
+        # 본문 내용 추출
+        main_text = extract_text_from_html(html_content)
+
+        # 스니펫 추출
+        page_snippet = extract_page_snippet(soup, main_text)
+
+        # 파비콘 추출
+        favicon_url = extract_favicon_url(soup, url)
+
+        return {
+            "title": title,
+            "content": main_text,
+            "snippet": page_snippet,
+            "favicon_url": favicon_url,
+            "url": url
+        }
+
+    except Exception as e:
+        logger.error(f"[HTML 파싱 실패] URL: {url}: {e}")
+        return None
+
+
+def parse_html_content_for_crawling_mode(html_content: str, url: str) -> Dict[str, str]:
+    """크롤링 모드 전용 HTML 콘텐츠 파싱 함수 - 고급 제목 추출 포함"""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        
+
+        # 크롤링 모드 전용 3단계 게시물 제목(subject) 추출
+        subject = extract_subject_for_crawling_mode(soup, url)
+
+        # 실제 title 태그에서 웹페이지 제목 추출 (web_title용)
+        web_title = ""
+        if soup.title and soup.title.string:
+            web_title = soup.title.string.strip()
+
+        # 본문 내용 추출 (기존 로직과 동일)
+        main_text = extract_text_from_html(html_content)
+
+        # 스니펫 추출 (기존 로직과 동일)
+        page_snippet = extract_page_snippet(soup, main_text)
+
+        # 파비콘 추출 (기존 로직과 동일)
+        favicon_url = extract_favicon_url(soup, url)
+
+        return {
+            "subject": subject,
+            "web_title": web_title,  # 실제 페이지 title 태그
+            "content": main_text,
+            "snippet": page_snippet,
+            "favicon_url": favicon_url,
+            "url": url
+        }
+
+    except Exception as e:
+        logger.error(f"[크롤링모드 HTML 파싱 실패] URL: {url}: {e}")
+        return None
+
+
+# ✅ 좀비 프로세스 방지를 위한 헬퍼 함수
+async def cleanup_playwright_processes():
+    """좀비 Playwright 프로세스 정리"""
+    try:
+        import psutil
+
+        # Chromium 프로세스 찾기
+        chromium_processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.info['name'] and 'chromium' in proc.info['name'].lower():
+                    chromium_processes.append(proc)
+                elif proc.info['cmdline'] and any('chromium' in cmd.lower() for cmd in proc.info['cmdline']):
+                    chromium_processes.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if chromium_processes:
+            logger.warning(f"[좀비 프로세스 발견] {len(chromium_processes)}개의 Chromium 프로세스 정리 중...")
+            for proc in chromium_processes:
+                try:
+                    proc.terminate()
+                    await asyncio.sleep(0.1)
+                    if proc.is_running():
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            logger.info(f"[좀비 프로세스 정리 완료] {len(chromium_processes)}개 프로세스 정리됨")
+    except ImportError:
+        logger.debug("[psutil 없음] 좀비 프로세스 정리를 위해 psutil 설치 권장")
+    except Exception as e:
+        logger.warning(f"[좀비 프로세스 정리 오류] {e}")
+
+
+# ✅ Playwright 전체 타임아웃을 위한 래퍼 함수 (Config 설정 적용)
+async def fetch_page_with_timeout(url: str, retry_count: int = 0, timeout: int = None) -> str:
+    """Playwright 실행을 전체 타임아웃으로 래핑"""
+    if timeout is None:
+        timeout = Config.PLAYWRIGHT_TIMEOUT  # Config에서 기본 타임아웃 가져오기
+
+    try:
+        return await asyncio.wait_for(
+            fetch_page_with_playwright(url, retry_count),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Playwright 전체 타임아웃] URL: {url}, {timeout}초 초과")
+        # 타임아웃 발생 시 좀비 프로세스 정리
+        await cleanup_playwright_processes()
+        raise PlaywrightTimeoutError(f"Playwright 전체 타임아웃 ({timeout}초)")
+    except Exception as e:
+        logger.error(f"[Playwright 래퍼 오류] URL: {url}: {e}")
+        raise
+
+
+def extract_text_from_html(html_content):
+    """HTML에서 텍스트 추출 (완화된 기준)"""
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # 최소한의 태그만 제거 (완화된 기준)
+    for tag in [
+        "script",
+        "style",
+        "noscript",
+        "head",
+        "meta",
+        "a",
+        "iframe",
+        "footer",
+        "nav",
+        # "input",
+        "button",
+        "select",
+        # "textarea",
+        "label",
+        "legend",
+        "fieldset",
+        "option",
+        "aside"
+    ]:
+        for element in soup.find_all(tag):
+            element.decompose()
+
+    # 숨겨진 요소들 제거 (display:none, visibility:hidden) [[memory:6053568]]
+    for element in soup.find_all(style=lambda value: value and (
+        'display:none' in value.replace(' ', '') or 
+        'display: none' in value or
+        'visibility:hidden' in value.replace(' ', '') or
+        'visibility: hidden' in value
+    )):
+        element.decompose()
+
+    # 팝업/모달 관련 요소 제거 [[memory:6053568]]
+    popup_classes = [
+        "popup", "modal", "overlay", "terms_ft_pop", "popup_content",
+        "PrtcPolicy", "infoPolicy", "sitemap", "layer_popup"
+    ]
+    for cls in popup_classes:
+        for element in soup.find_all(class_=lambda x: x and (cls in str(x))):
+            element.decompose()
+
+    # 불필요한 div 제거 (예: 광고, 네비게이션)
+    remove_classes = ["menu", "footer", "header", "top_menu_layer", "navigation", "nav-menu"]
+    for cls in remove_classes:
+        for element in soup.find_all("div", class_=cls):
+            element.decompose()
+
+    # 주석 제거
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    def recursive_extract(element):
+        texts = []
+        if isinstance(element, NavigableString):
+            text = element.strip()
+            if text:
+                texts.append(text)
+        elif isinstance(element, Tag):
+            for child in element.children:
+                texts.extend(recursive_extract(child))
+        return texts
+
+    all_texts = recursive_extract(soup)
+    
+    # 중복 라인 제거 (완화된 기준)
+    unique_texts = []
+    seen_lines = set()
+    
+    for text in all_texts:
+        cleaned_text = text.strip()
+        if cleaned_text and cleaned_text not in seen_lines:
+            unique_texts.append(text)
+            seen_lines.add(cleaned_text)
+    
+    result = "\n".join(unique_texts)
+    
+    # 최종 정제: 연속된 줄바꿈 정리
+    import re
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    
+    return result
+
+
+def extract_tables_from_html(html_content):
+    """HTML에서 테이블 데이터 추출"""
+    soup = BeautifulSoup(html_content, "html.parser")
+    tables_data = []
+
+    for table in soup.find_all("table"):
+        table_data = []
+        for row in table.find_all("tr"):
+            row_data = []
+            for cell in row.find_all(["td", "th"]):
+                row_data.append(cell.get_text(strip=True))
+            if row_data:
+                table_data.append("| " + " | ".join(row_data) + " |")
+        if table_data:
+            tables_data.append("\n".join(table_data))
+
+    return "\n\n".join(tables_data)
+
+
+def is_downloadable_file(url: str) -> bool:
+    """URL이 다운로드 가능한 파일(미디어, 문서, 실행파일 등)인지 확인"""
+    import re
+    
+    # 다운로드 가능한 파일 확장자 패턴
+    downloadable_extensions = [
+        # 이미지 파일
+        r'\.(jpg|jpeg|png|gif|bmp|tiff|tif|webp|svg|ico|raw|cr2|nef|arw)$',
+        # 비디오 파일
+        r'\.(mp4|avi|mov|wmv|flv|webm|mkv|m4v|3gp|ogv|mts|m2ts|ts|vob|asf|rm|rmvb)$',
+        # 오디오 파일
+        r'\.(mp3|wav|flac|aac|ogg|wma|m4a|opus|aiff|au|mid|midi)$',
+        # 문서 파일
+        r'\.(pdf|hwp|hwpx|doc|docx|ppt|pptx|xls|xlsx|txt|rtf|csv|odt|ods|odp)$',
+        # 디자인/그래픽 파일
+        r'\.(psd|ai|eps|indd|sketch|fig|xd|cdr|dwg|dxf|blend|max|3ds|obj|fbx|dae)$',
+        # 압축 파일
+        r'\.(zip|rar|7z|tar|gz|bz2|lzma|xz|ace|arj|cab|iso|dmg|pkg)$',
+        # 실행 파일
+        r'\.(exe|msi|dmg|pkg|deb|rpm|apk|app|bat|cmd|com|scr|vbs|js|jar|war)$',
+        # 기타 미디어/플러그인
+        r'\.(swf|fla|f4v|f4p|f4a|f4b|shockwave|quicktime|realmedia)$',
+        # 데이터베이스 파일
+        r'\.(db|sqlite|mdb|accdb|dbf|odb|sql)$',
+        # 백업 파일
+        r'\.(bak|backup|old|tmp|temp|log|cache)$',
+        # 설정 파일
+        r'\.(ini|cfg|conf|config|xml|json|yaml|yml|toml)$',
+        # 소스 코드 파일 (웹페이지가 아닌 개발 파일만)
+        r'\.(c|cpp|h|java|py|js|scss|less|sql|pl|rb|go|rs|swift|kt|ts|jsx|tsx|vue|svelte)$'
+    ]
+    
+    url_lower = url.lower()
+    
+    # 확장자 패턴 확인
+    for pattern in downloadable_extensions:
+        if re.search(pattern, url_lower):
+            return True
+    
+    # 다운로드 관련 경로 패턴 확인 (강화)
+    download_paths = [
+        '/download/', '/downloads/', '/file/download/', '/files/', '/uploads/', '/attachments/',
+        '/media/', '/assets/', '/static/'
+    ]
+    
+    # URL 경로에 download 단어가 포함된 경우
+    download_keywords = ['download', 'attachment', 'file']
+    
+    for path in download_paths:
+        if path in url_lower:
+            return True
+            
+    # URL에 다운로드 관련 키워드가 포함된 경우 
+    for keyword in download_keywords:
+        if keyword in url_lower:
+            return True
+    
+    return False
+
+
+def get_domain_links(base_url, html_content):
+    """같은 도메인의 링크 추출 (미디어 파일 제외)"""
+    soup = BeautifulSoup(html_content, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    links = set()
+
+    for link in soup.find_all("a", href=True):
+        url = urljoin(base_url, link["href"])
+        # 정규화하여 중복/노이즈를 최소화
+        url = normalize_url(url)
+        
+        # 같은 도메인이고 다운로드 가능한 파일이 아닌 경우만 추가
+        if urlparse(url).netloc == base_domain and not is_downloadable_file(url):
+            links.add(url)
+
+    return links
+
+
+def normalize_url(url: str) -> str:
+    """URL 정규화: 스킴 보정, 호스트 소문자, 프래그먼트 제거, 불필요/중복 쿼리 제거.
+    - buffer 등 변동성 높은 파라미터 제거
+    - 동일 키가 중복되면 첫 번째만 유지
+    """
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        p = urlparse(url)
+        scheme = p.scheme or "https"
+        netloc = (p.netloc or "").lower()
+        path = p.path or "/"
+        # 프래그먼트 제거
+        fragment = ""
+        # 쿼리 정규화
+        removed_keys = {"buffer"}
+        seen_keys = set()
+        canon_pairs = []
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            if k in removed_keys:
+                continue
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            canon_pairs.append((k, v))
+        query = urlencode(canon_pairs, doseq=True)
+        return urlunparse((scheme, netloc, path, "", query, fragment))
+    except Exception:
+        return url
+
+
+from urllib.parse import urlparse
+
+def should_include_url_by_filter(url: str, url_filter: str) -> bool:
+    """
+    URL 필터 옵션에 따라 URL을 포함할지 결정
+    
+    Args:
+        url: 확인할 URL (str 또는 dict)
+        url_filter: Q(쿼리스트링만), P(패스만), B(둘다)
+    
+    Returns:
+        bool: URL을 포함할지 여부
+    """
+    # dict로 들어오는 경우 url 값만 뽑기
+    if isinstance(url, dict):
+        url = url.get("url", "")
+
+    # url_filter가 빈 문자열이면 기본 허용
+    if not url_filter:
+        return True
+        
+    if url_filter == "B":  # Both - 둘 다 수집
+        return True
+    
+    parsed = urlparse(url)
+    has_query = bool(parsed.query)
+    logger.info(f"[🔍 URL 필터 상세] URL: {url} | 쿼리: '{parsed.query}' | has_query: {has_query} | 필터: {url_filter}")
+    
+    if url_filter == "Q":  # Query - 쿼리스트링만 수집
+        result = has_query
+        logger.info(f"[🔍 Q 필터 결과] URL: {url} → {result} (쿼리스트링 {'있음' if has_query else '없음'})")
+        return result
+    elif url_filter == "P":  # Path - 패스 기반만 수집
+        result = not has_query
+        logger.info(f"[🔍 P 필터 결과] URL: {url} → {result} (패스기반 {'맞음' if not has_query else '아님'})")
+        return result
+    else:
+        # 알 수 없는 필터 옵션은 기본값으로 처리
+        logger.info(f"[🔍 알 수 없는 필터] URL: {url} | 필터: {url_filter} → True (기본값)")
+        return True
+
+
+
+def extract_page_snippet(soup: BeautifulSoup, main_content_text: str, length: int = 200) -> str:
+    """HTML soup과 본문 텍스트에서 스니펫을 추출합니다.
+    먼저 'div.snippet'을 찾고, 없으면 본문 텍스트의 앞부분을 사용합니다.
+    """
+    snippet = ""
+    try:
+        snippet_div = soup.find("div", class_="snippet")
+        if snippet_div:
+            snippet = snippet_div.get_text(separator=" ", strip=True)
+            if snippet:
+                logger.debug(f"Found snippet in div.snippet: {snippet[:length//2]}...")
+                # 스니펫 정제
+                snippet = clean_snippet_text(snippet, length)
+                return snippet
+    except Exception as e:
+        logger.warning(f"Error finding div.snippet: {e}")
+
+    if not snippet and main_content_text: # snippet_div가 없거나 내용이 없는 경우
+        # 스니펫 정제 후 길이 제한
+        snippet = clean_snippet_text(main_content_text, length)
+        logger.debug(f"Generated snippet from main content: {snippet[:length//2]}...")
+    return snippet
+
+
+def clean_snippet_text(text: str, max_length: int = 200) -> str:
+    """스니펫 텍스트를 정제합니다."""
+    if not text:
+        return ""
+
+    # 불필요한 문구들 제거
+    unwanted_patterns = [
+        "html", "HTML", ">", "<", "javascript:", "mailto:", "tel:",
+        "css", "CSS", "script", "SCRIPT", "style", "STYLE"
+    ]
+
+    # 줄바꿈과 탭을 공백으로 변환
+    cleaned_text = text.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ')
+
+    # 연속된 공백을 하나로 통합
+    import re
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+
+    # 불필요한 문구 제거 (단어 경계 고려)
+    for pattern in unwanted_patterns:
+        cleaned_text = re.sub(rf'\b{re.escape(pattern)}\b', '', cleaned_text, flags=re.IGNORECASE)
+
+    # 특수문자로 시작하는 부분 제거
+    cleaned_text = re.sub(r'^[^\w가-힣]*', '', cleaned_text)
+
+    # 다시 연속된 공백 정리
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+
+    # 의미있는 텍스트가 시작되는 지점 찾기
+    words = cleaned_text.split()
+    meaningful_words = []
+
+    for word in words:
+        # 3글자 이상이고 한글이나 영문이 포함된 단어부터 시작
+        if len(word) >= 2 and re.search(r'[가-힣a-zA-Z]', word):
+            meaningful_words = words[words.index(word):]
+            break
+
+    if meaningful_words:
+        result_text = ' '.join(meaningful_words)
+    else:
+        result_text = cleaned_text
+
+    # 최대 길이로 자르기
+    if len(result_text) > max_length:
+        result_text = result_text[:max_length].rsplit(' ', 1)[0] + '...'
+
+    return result_text.strip()
+
+
+def extract_favicon_url(soup: BeautifulSoup, base_url: str) -> str:
+    """HTML soup에서 파비콘 URL을 추출합니다."""
+    favicon_url = ""
+
+    try:
+        # 1. link 태그에서 icon 관련 rel 속성 찾기
+        favicon_selectors = [
+            'link[rel="icon"]',
+            'link[rel="shortcut icon"]',
+            'link[rel="apple-touch-icon"]',
+            'link[rel="apple-touch-icon-precomposed"]',
+            'link[rel*="icon"]'
+        ]
+
+        for selector in favicon_selectors:
+            favicon_link = soup.select_one(selector)
+            if favicon_link and favicon_link.get('href'):
+                favicon_url = favicon_link['href']
+                break
+
+        # 2. 파비콘을 찾지 못한 경우 기본 경로 시도
+        if not favicon_url:
+            parsed_url = urlparse(base_url)
+            default_favicon = f"{parsed_url.scheme}://{parsed_url.netloc}/favicon.ico"
+            favicon_url = default_favicon
+            logger.debug(f"Using default favicon path: {favicon_url}")
+        else:
+            # 상대 경로인 경우 절대 경로로 변환
+            if not favicon_url.startswith(('http://', 'https://')):
+                favicon_url = urljoin(base_url, favicon_url)
+            logger.debug(f"Found favicon in HTML: {favicon_url}")
+
+    except Exception as e:
+        logger.warning(f"Error extracting favicon URL: {e}")
+        # 오류 발생 시 기본 파비콘 경로 사용
+        parsed_url = urlparse(base_url)
+        favicon_url = f"{parsed_url.scheme}://{parsed_url.netloc}/favicon.ico"
+
+    return favicon_url
+
+
+def build_structured_content(soup: BeautifulSoup, current_url: str, html_content: str) -> Dict[str, str]:
+    """페이지에서 제목/본문/스니펫/파비콘을 구조화하여 반환"""
+    try:
+        # ✅ 크롤링 모드 전용 3단계 게시물 제목 추출
+        title = extract_subject_for_crawling_mode(soup, current_url)
+        
+        # 실제 title 태그에서 웹페이지 제목 추출 (web_title용)
+        web_title = ""
+        if soup.title and soup.title.string:
+            web_title = soup.title.string.strip()
+
+        # 본문: extract_text_from_html() 함수 사용 (링크 제거 포함)
+        content = ""
+        content_div = soup.find("div", class_="board_view_content")
+        if content_div:
+            # 특정 컨테이너가 있으면 해당 부분의 HTML로 extract_text_from_html 호출
+            content = extract_text_from_html(str(content_div))
+        
+        if not content and html_content:
+            # 전체 HTML에서 텍스트 추출 (이미 링크 제거 로직 포함)
+            content = extract_text_from_html(html_content)
+
+        # 스니펫/파비콘
+        snippet = extract_page_snippet(soup, content)
+        favicon_url = extract_favicon_url(soup, current_url)
+
+        return {
+            "title": title or "",
+            "web_title": web_title or "",  # 실제 페이지 title 태그
+            "content": content or "",
+            "snippet": snippet or "",
+            "favicon_url": favicon_url or "",
+        }
+    except Exception:
+        return {"title": "", "content": "", "snippet": "", "favicon_url": ""}
+
+
+class TLSAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False):
+        """SSL 검증을 완전히 비활성화한 urllib3 PoolManager 생성."""
+        # SSL 검증 완전 비활성화 - SSL 컨텍스트 없이 생성
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            ssl_version=ssl.PROTOCOL_TLS,
+            cert_reqs='CERT_NONE',  # 인증서 검증 비활성화
+            ca_certs=None,          # CA 인증서 사용 안함
+            assert_hostname=False,  # 호스트명 검증 비활성화
+            # ssl_context 완전 제거
+        )
+
+
+def get_random_user_agent():
+    """정부 사이트 및 일반 사이트 호환성을 위한 다양한 User-Agent 목록"""
+    user_agents = [
+        # Windows Chrome (최신 버전들)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+
+        # Windows Firefox (최신 버전들)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0",
+
+        # Windows Edge (최신 버전들)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+
+        # macOS Safari (최신 버전들)
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+
+        # macOS Chrome
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+
+        # 한국 정부 사이트 호환성을 위한 IE 스타일 (일부 정부 사이트에서 여전히 필요)
+        "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+        "Mozilla/5.0 (compatible; MSIE 11.0; Windows NT 10.0; WOW64; Trident/7.0)",
+
+        # 모바일 시뮬레이션 (일부 사이트에서 더 관대할 수 있음)
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+
+        # 구버전 브라우저 (일부 레거시 시스템 호환)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    ]
+    return random.choice(user_agents)
+
+
+def get_government_user_agent():
+    """정부 사이트 특화 User-Agent (보다 안전한 옵션들)"""
+    gov_user_agents = [
+        # 한국 정부 사이트에서 잘 동작하는 것으로 알려진 User-Agent들
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+        "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+        "Mozilla/5.0 (compatible; MSIE 11.0; Windows NT 10.0; WOW64; Trident/7.0)",
+    ]
+    return random.choice(gov_user_agents)
+
+
+# ✅ 새로 추가된 병렬 처리 헬퍼 함수들
+async def process_single_chunk_async(
+    chunk: str,
+    chunk_idx: int,
+    subject: str,
+    source_url: str,
+    title: str,
+    table_name: str,
+    dbname: str,
+    memo: str,
+    page_snippet: str,
+    favicon_url: str,
+    job_id: str,
+    job_manager: AsyncJobManager,
+    job_progress_manager: AsyncJobProgress = None,
+    chunk_progress: float = 0.0,
+    is_crawling_mode: bool = False,
+    web_title: str = ""
+):
+    """개별 청크를 비동기로 처리 (임베딩 + 저장 + 실시간 진행률 업데이트)"""
+    try:
+        # ✅ 청크 처리 전 취소 상태 확인
+        status = await job_manager.get_job_status(job_id)
+        if status == "cancel":
+            logger.info(f"[작업 취소] job_id: {job_id}")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"[작업 취소 완료] 모든 URL 처리 태스크 정리됨: job_id={job_id}")
+
+                url_result = await completed_task
+                if url_result:
+                    # 원래 인덱스 찾기
+                    task_index = task_to_index.get(id(completed_task))
+                    if task_index is not None:
+                        # 올바른 order 설정 (1부터 시작)
+                        url_result["order"] = task_index + 1
+                        url_task_results[task_index] = url_result
+                    
+                    source_url = url_result["url"]
+                    processed_urls[source_url] = url_result
+                    total_chunks_processed += url_result["chunks"]
+                    completed_count += 1
+
+                    # 실시간 진행률 업데이트
+                    progress = min(int((completed_count / total_pages) * 95), 95)
+
+                    # ✅ 개별 URL 처리 시 최소한의 정보만 전송 (중복 제거)
+                    await send_message_to_socket(
+                        job_id,
+                        {
+                            "type": "progress",
+                            "status": "processing",
+                            "progress": progress,
+                            "processed_url": {
+                                "url": url_result["url"],
+                                "chunks": url_result["chunks"],
+                                "order": url_result["order"],
+                                "processing_time": url_result["processing_time"],
+                                "favicon_url": url_result["favicon_url"],
+                                "source_size": url_result["source_size"],
+                                "web_title": url_result.get("title", "")
+                            },
+                            "current_url": completed_count,
+                            "total_urls": total_pages,
+                            "total_chunks_processed": total_chunks_processed,
+                            "timestamp": time.time(),
+                            "chunk_hash": url_result["chunk_hash"],
+                        },
+                        job_manager,
+                    )
+
+            except Exception as e:
+                logger.error(f"개별 URL 처리 중 오류: {e}")
+
+        # 6. 완료 처리
+        total_processing_time = round(time.time() - start_time, 2)
+
+        # ✅ 단일 URL과 동일한 형태로 chunk_count, use_source, source_size, web_title, chunk_hash 배열 생성
+        chunk_count_list = []
+        use_source_list = []
+        source_size_list = []  # URL 용량 정보 수집
+        web_title_list = []  # 각 URL의 제목 수집
+        chunk_hash_list = []  # 각 URL의 해시값 수집
+        use_source = {}
+
+        # 변경 없음 결과를 제외하고 새로 작업한 URL만 필터링
+        filtered_urls = {}
+        for source_url, url_result in processed_urls.items():
+            if isinstance(url_result, dict) and url_result.get('change_status') != 'no_change':
+                # 실제로 쳋킹, 임베딩, DB insert가 실행된 URL만 포함
+                if url_result.get('chunks', 0) > 0:  # 청크가 생성된 경우만 포함
+                    filtered_urls[source_url] = url_result
+                    logger.info(f"[사용자 응답 포함] {source_url} - 청크: {url_result.get('chunks', 0)}")
+                else:
+                    logger.info(f"[사용자 응답 제외] {source_url} - 청크 생성 없음")
+            else:
+                logger.info(f"[사용자 응답 제외] {source_url} - 변경 없음")
+        
+        logger.info(f"[사용자 응답] 전체 URL: {len(processed_urls)}개, 사용자에게 전달: {len(filtered_urls)}개")
+
+        # 필터링된 URL만 사용하여 정렬 (order 기준)
+        sorted_urls = sorted(filtered_urls.items(), key=lambda x: x[1].get("order", 0))
+
+        for source_url, url_result in sorted_urls:
+            # chunk_count 배열에 추가
+            chunk_count_list.append(url_result.get("chunks", 0))
+
+            # use_source 배열에 URL 추가
+            use_source_list.append(source_url)
+
+            # source_size 배열에 용량 정보 추가 (리스트에서 첫 번째 값 추출)
+            source_size = url_result.get("source_size", [0])
+            if isinstance(source_size, list) and len(source_size) > 0:
+                source_size_list.append(source_size[0])
+            else:
+                source_size_list.append(0)
+            
+            # web_title 배열에 제목 추가
+            web_title_list.append(url_result.get("title", ""))
+            
+            # chunk_hash 배열에 해시값 추가
+            chunk_hash_list.append(url_result.get("chunk_hash", ""))
+
+            # 기존 use_source 딕셔너리 형태도 유지 (하위 호환성)
+            use_source[source_url] = {
+                # "title": url_result.get("title", ""),  # 주석 처리
+                "chunks": url_result.get("chunks", 0),
+                # "snippet": url_result.get("snippet", ""),  # 주석 처리
+                "favicon_url": url_result.get("favicon_url", ""),
+                "processing_time": url_result.get("processing_time", 0),
+                "order": url_result.get("order", 0)
+            }
+
+        # ✅ 변경감지 결과별 집계
+        no_change_count = 0
+        new_or_changed_count = 0
+        logger.info(f"[변경감지 집계 시작] 총 URL 수: {len(processed_urls)}")
+        
+        for i, url_result in enumerate(processed_urls):
+            if url_result and isinstance(url_result, dict):
+                change_status = url_result.get('change_status', 'new_or_changed')
+                url = url_result.get('url', f'URL_{i}')
+                logger.info(f"[변경감지 집계] {i+1}/{len(processed_urls)}: {url} - 상태: {change_status}")
+                
+                if change_status == 'no_change':
+                    no_change_count += 1
+                else:
+                    new_or_changed_count += 1
+            elif url_result and isinstance(url_result, str):
+                # 문자열인 경우 URL로 간주하고 "변경 없음"으로 처리 (대부분 스킵된 URL)
+                logger.info(f"[변경감지 집계] {i+1}/{len(processed_urls)}: {url_result} - 상태: 문자열 (스킵된 URL, no_change로 처리)")
+                no_change_count += 1
+            else:
+                logger.warning(f"[변경감지 집계] 잘못된 결과: {url_result}")
+        
+        logger.info(f"[변경감지 집계 완료] 변경 없음: {no_change_count}개, 새로 학습: {new_or_changed_count}개")
+        
+        # ✅ 최종 로깅 메시지 (요청된 형식)
+        logger.info(f"📊 [최종 결과] 수집 URL : {len(processed_urls)}개, 변경 사항 없음 : {no_change_count}개, 변경 감지 - 신규 학습: {new_or_changed_count}개")
+        
+        logger.info(
+            f"[병렬 크롤링 작업 완료] 총 처리된 URL 수: {len(processed_urls)}, "
+            f"변경 없음: {no_change_count}개, 새로 학습: {new_or_changed_count}개, "
+            f"총 청크: {total_chunks_processed}, 처리 시간: {total_processing_time}초"
+        )
+
+        # ✅ 완료된 URL 리스트 전송 (최적화된 데이터 구조) - 변경 없음 결과 제외
+        await send_message_to_socket(
+            job_id,
+            {
+                "type": "progress",
+                "status": "info",
+                "message": "completed url list",
+                "progress": 95,
+                "completed_urls": use_source_list,
+                "chunk_count": chunk_count_list,
+                "source_size": source_size_list,
+                "total_processed_urls": len(filtered_urls),  # 사용자에게 전달된 URL 수
+                "total_chunks": total_chunks_processed,
+                "processing_time": total_processing_time,
+                "no_change_count": no_change_count,  # 변경 없음 개수 정보 추가
+                # "total_crawled_urls": len(processed_urls),  # 전체 크롤링 URL 수
+                "total_crawled_urls": original_count,  # 전체 크롤링 URL 수
+                "chunk_hash": chunk_hash_list,  # 각 URL의 해시값 추가
+                "timestamp": time.time(),
+            },
+            job_manager,
+        )
+
+        return {
+            "total_processed_urls": len(filtered_urls),  # 사용자에게 전달된 URL 수
+            "total_chunks": total_chunks_processed,
+            "chunk_count": chunk_count_list,
+            "use_source": use_source_list,
+            "source_size": source_size_list,
+            "web_title": web_title_list,
+            "chunk_hash": chunk_hash_list,  # 각 URL의 해시값 추가
+            "processing_time": total_processing_time,
+            # ✅ 변경감지 집계 정보 추가
+            "no_change_count": no_change_count,
+            "new_or_changed_count": new_or_changed_count,
+            # "total_crawled_urls": len(processed_urls),  # 전체 크롤링 URL 수
+            "total_crawled_urls": original_count,  # 전체 크롤링 URL 수
+            # "use_source_dict": use_source,    # 불필요한 중복 제거
+            # "processed_urls": processed_urls, # 불필요한 중복 제거           
+        }
+
+    except Exception as e:
+        error_message = f"병렬 크롤링 중 오류 발생: {str(e)}"
+        logger.error(f"[병렬 크롤링 오류] {error_message}", exc_info=True)
+        await send_message_to_socket(
+            job_id,
+            {
+                "type": "error",
+                "status": "error",
+                "message": error_message,
+                "timestamp": time.time(),
+            },
+            job_manager,
+        )
+        raise
+
+
+# ✅ 기존 순차 처리 함수는 백업으로 유지 (필요시 사용)
+async def crawl_and_process_url_sequential(
+    start_url: str,
+    table_name: str,
+    dbname: str,
+    job_id: str,
+    each_progress: float,
+    job_manager: AsyncJobManager,
+    job_progress_manager: AsyncJobProgress,
+    max_depth: int,
+    memo: str = "",
+    max_tasks: int = 20,
+) -> dict:
+    """기존 순차 처리 방식 (백업용)"""
+    # 기존 crawl_and_process_url 로직 그대로 유지
+    # (기존 코드를 여기에 복사하되, 함수명만 변경)
+    pass  # 실제 구현은 기존 코드 참조
+
+
+# ✅ 개선된 타임아웃 및 에러 처리가 적용된 URL 콘텐츠 가져오기 함수
+async def fetch_url_content(session, url):
+    """개선된 타임아웃 및 에러 처리가 적용된 URL 콘텐츠 가져오기 함수 (메타데이터 포함)"""
+    # URL 스키마가 없는 경우 'https://' 추가
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    
+    # URL 확장자로 XML/JSON 필터링
+    url_lower = url.lower()
+    if any(url_lower.endswith(ext) for ext in ['.xml', '.json', '.rss', '.atom']):
+        logging.info(f"[크롤링 제외] XML/JSON 확장자 스킵: {url}")
+        return None
+
+    # ✅ 정부 사이트 감지 (크롤링용)
+    is_government_site = any(gov_domain in url.lower() for gov_domain in [
+        'go.kr', 'gov.kr', 'mois.go.kr', 'sd.go.kr', 'korea.kr', 'childfund.or.kr',
+        'kdi.re.kr', 'kostat.go.kr', 'nia.or.kr', 'nipa.kr', 'government.', 'public.'
+    ])
+    
+    if is_government_site:
+        # 정부 사이트는 Playwright 사용
+        logging.info(f"[크롤링 정부 사이트 감지] Playwright 사용: {url}")
+        try:
+            html_content = await fetch_page_with_timeout(url, 0, timeout=60)
+            if html_content:
+                return {
+                    'html': html_content,
+                    'headers': {}
+                }
+            else:
+                logging.warning(f"[크롤링 Playwright 실패] URL: {url}")
+                return None
+        except Exception as e:
+            logging.error(f"[크롤링 Playwright 오류] URL: {url}, 오류: {e}")
+            # Playwright 실패 시 HTTP 폴백
+            logging.info(f"[크롤링 HTTP 폴백] Playwright 실패로 HTTP 방식 시도: {url}")
+
+    max_retries = 2  # 크롤링에서는 2번만 재시도 (성능 고려)
+
+    for retry_count in range(max_retries):
+        try:
+
+            # ✅ 개선된 헤더 (정부 사이트 호환성 향상)
+            headers = {
+                "User-Agent": get_random_user_agent(),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate",  # brotli 제외
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
+            }
+
+            # 재시도 시 약간의 딜레이
+            if retry_count > 0:
+                await asyncio.sleep(retry_count * 0.5)  # 0.5초, 1초 딜레이
+
+            logging.debug(f"Fetching URL with improved headers: {url} (시도 {retry_count + 1}/{max_retries})")
+
+            # ✅ DH_KEY_TOO_SMALL 해결을 위한 SSL 컨텍스트 생성
+            ssl_context = ssl.create_default_context()
+            ssl_context.set_ciphers("DEFAULT@SECLEVEL=0")  # DH 키 크기 제한 해제
+            ssl_context.check_hostname = False  # 호스트명 검증 비활성화
+            ssl_context.verify_mode = ssl.CERT_NONE  # 인증서 검증 비활성화
+            try:
+                ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT  # 레거시 서버 연결 허용
+            except AttributeError:
+                pass
+
+            # ✅ 개선된 타임아웃 설정 (크롤링용 - 더 짧게)
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=45, connect=8, sock_read=25),  # 45초 총 타임아웃
+                ssl=ssl_context
+            ) as response:
+                if response.status == 200:
+                    # Content-Type 확인하여 XML/JSON 페이지 필터링
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if any(excluded_type in content_type for excluded_type in ['application/json', 'application/xml', 'text/xml', 'application/rss+xml', 'application/atom+xml']):
+                        logging.info(f"[크롤링 제외] XML/JSON 페이지 스킵: {url}, Content-Type: {content_type}")
+                        return None
+                    
+                    # ✅ HTTP 헤더 정보 수집 (변경감지용)
+                    response_headers = {
+                        'content_length': response.headers.get('Content-Length'),
+                    }
+                    
+                    # ✅ Content-Type과 Content-Disposition으로 다운로드 파일 감지
+                    content_type = response.headers.get('content-type', '').lower()
+                    content_disposition = response.headers.get('content-disposition', '').lower()
+                    
+                    # 다운로드 파일 타입 확인
+                    download_types = [
+                        'application/pdf', 'application/zip', 'application/octet-stream',
+                        'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+                        'application/vnd.openxmlformats', 'application/x-hwp', 'application/haansofthwp',
+                        'image/', 'video/', 'audio/', 'application/x-'
+                    ]
+                    
+                    # Content-Disposition에 attachment가 있으면 다운로드 파일
+                    if 'attachment' in content_disposition:
+                        logging.info(f"[다운로드 파일 감지] Content-Disposition: {url}")
+                        return None
+                        
+                    # Content-Type이 다운로드 파일 타입이면 제외
+                    for download_type in download_types:
+                        if download_type in content_type:
+                            logging.info(f"[다운로드 파일 감지] Content-Type {content_type}: {url}")
+                            return None
+                    
+                    logging.debug(f"Successfully fetched URL: {url}")
+
+                    # ✅ 인코딩 오류 처리가 포함된 텍스트 추출
+                    try:
+                        html_content = await response.text()
+                        # HTML과 헤더 정보를 함께 반환
+                        return {
+                            'html': html_content,
+                            'headers': response_headers
+                        }
+                    except UnicodeDecodeError:
+                        # UTF-8 디코딩 실패 시 오류를 무시하고 강제 디코딩
+                        logging.warning(f"[크롤링 인코딩 오류 무시] URL: {url}, 일부 문자가 손실될 수 있음")
+                        html_content = await response.text(errors='ignore')
+                        return {
+                            'html': html_content,
+                            'headers': response_headers
+                        }
+                else:
+                    logging.warning(f"HTTP Error: {url} returned status {response.status} (시도 {retry_count + 1}/{max_retries})")
+                    if retry_count < max_retries - 1:
+                        continue  # 다음 재시도로
+                    else:
+                        return None
+
+        except asyncio.TimeoutError as e:
+            logging.warning(f"Timeout error for {url} (시도 {retry_count + 1}/{max_retries}): {e}")
+            if retry_count < max_retries - 1:
+                continue  # 다음 재시도로
+            else:
+                logging.error(f"All retry attempts failed due to timeout: {url}")
+                return None
+
+        except aiohttp.ClientError as e:
+            logging.warning(f"Network error for {url} (시도 {retry_count + 1}/{max_retries}): {e}")
+            if retry_count < max_retries - 1:
+                continue  # 다음 재시도로
+            else:
+                logging.error(f"All retry attempts failed due to network error: {url}")
+                return None
+
+        except Exception as e:
+            logging.warning(f"Exception for {url} (시도 {retry_count + 1}/{max_retries}): {e}")
+            if retry_count < max_retries - 1:
+                continue  # 다음 재시도로
+            else:
+                logging.error(f"All retry attempts failed due to exception: {url}")
+                return None
+
+    return None
+
+
+async def crawl_page_worker(
+    queue, session, domain, max_depth, visited, results, base_path
+):
+    while True:
+        try:
+            current_url, depth = await queue.get()
+            # URL 정규화로 비교/중복 제거 일관성 확보
+            current_url = normalize_url(current_url)
+            # URL 정규화로 비교/중복 제거 일관성 확보
+            current_url = normalize_url(current_url)
+
+            # URL 검증 로직 수정
+            parsed_current = urlparse(current_url)
+            if parsed_current.netloc != domain:
+                queue.task_done()
+                continue
+
+            if current_url in visited or depth > max_depth:
+                queue.task_done()
+                continue
+
+            visited.add(current_url)
+            logging.info(f"[{depth}] Crawling: {current_url}")
+
+            url_result = await fetch_url_content(session, current_url)
+            if not url_result:
+                queue.task_done()
+                continue
+
+            html = url_result['html']
+            headers = url_result['headers']
+            soup = BeautifulSoup(html, "lxml")
+
+            # ✅ 크롤링 모드 전용 3단계 게시물 제목 추출
+            title = extract_subject_for_crawling_mode(soup, current_url)
+            logging.debug(f"[크롤링 워커] 최종 추출된 게시물 제목: {title}")
+
+            # 본문 내용 추출 로직
+            content = ""
+            # 1. board_view_content 클래스를 가진 div를 찾음
+            content_div = soup.find("div", class_="board_view_content")
+            if content_div:
+                content = content_div.get_text(separator=" ", strip=True)
+                logging.debug(f"Found content in div.board_view_content")
+            # 2. 없으면 body 태그의 텍스트를 가져옴
+            if not content:
+                body_tag = soup.body
+                if body_tag:
+                    content = body_tag.get_text(separator=" ", strip=True)
+                    logging.debug(f"Using body content")
+
+            if not content:
+                logging.error(f"No content found in URL: {current_url}")
+                queue.task_done()
+                continue
+
+            # 스니펫 추출 (개선된 로직 호출)
+            page_snippet = extract_page_snippet(soup, content)
+
+            # 파비콘 URL 추출
+            favicon_url = extract_favicon_url(soup, current_url)
+
+            results.append({
+                "source": current_url,
+                "title": title,
+                "content": content,
+                "snippet": page_snippet,
+                "favicon_url": favicon_url,
+                "source_size": [len(content)],  # 리스트로 통일
+                "headers": headers  # HTTP 헤더 정보 추가
+            })
+            logging.debug(f"Added result for URL: {current_url}")
+
+            # 링크 추출 로직 개선
+            for link in soup.find_all(["a", "link"], href=True):
+                href = link.get("href", "").strip()
+                if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                    continue
+
+                # 상대 경로를 절대 경로로 변환 후 정규화
+                next_url = urljoin(current_url, href)
+                next_url = normalize_url(next_url)
+                parsed_next = urlparse(next_url)
+
+                # CSS 파일 제외
+                if (
+                    next_url.endswith(".css")
+                    or "/css/" in next_url
+                    or "?ver=" in next_url
+                ):
+                    logging.debug(f"Skipping CSS file: {next_url}")
+                    continue
+
+                # 다운로드 가능한 파일 제외
+                if is_downloadable_file(next_url):
+                    logging.debug(f"Skipping downloadable file: {next_url}")
+                    continue
+
+                # 같은 도메인이고 base_path 아래의 링크만 처리
+                if (
+                    parsed_next.netloc == domain
+                    and not next_url in visited
+                    and parsed_next.path.startswith(base_path)
+                ):
+
+                    logging.debug(f"Adding new URL: {next_url} at depth {depth + 1}")
+                    await queue.put((next_url, depth + 1))
+
+            queue.task_done()
+            await asyncio.sleep(0.5)  # 딜레이 감소
+
+        except Exception as e:
+            logging.error(f"Error in worker: {e}")
+            queue.task_done()
+
+
+async def crawl_website(start_url, max_depth: int, max_tasks=10, job_id=None, job_manager=None, max_crawl_urls=100, url_filter: str = None):
+    """크롤링 중 실시간 카운트만 표시하고 완료 메시지 없음 (개선된 연결 설정)"""
+    logging.info(
+        f"[크롤링 시작] URL: {start_url}, max_depth: {max_depth}, max_tasks: {max_tasks}, url_filter: {url_filter}"
+    )
+    # 시작 URL 정규화
+    start_url = normalize_url(start_url)
+    parsed_url = urlparse(start_url)
+    # 스킴이 없는 경우 기본 https 사용
+    scheme = parsed_url.scheme or "https"
+    domain = parsed_url.netloc
+    base_path = parsed_url.path
+
+    # ✅ 하위 경로 제한: 입력된 URL의 하위 경로만 크롤링
+    logger.info(f"[하위 경로 제한] 도메인: {domain}, 기본 경로: {base_path}")
+
+    visited = set()
+    enqueued = set()
+    failures = {}
+    results = []
+    queue = asyncio.Queue()
+
+    # ✅ 시드 확장: 루트와 상위 경로까지 초기 시드로 투입
+    def _dir_path(path: str) -> str:
+        # 파일로 보이면 상위 디렉토리로 조정
+        if path and not path.endswith('/'):
+            if '/' in path:
+                return path.rsplit('/', 1)[0] + '/'
+            return '/'
+        return path or '/'
+
+    dir_path = _dir_path(base_path)
+    parts = [p for p in dir_path.strip('/').split('/') if p]
+    prefixes = ['/']
+    acc = ''
+    for p in parts:
+        acc += '/' + p
+        if not acc.endswith('/'):
+            acc += '/'
+        prefixes.append(acc)
+
+    # 탐색 범위와 수집 범위를 분리
+    # 탐색 범위: 최상위 하위 디렉토리 (예: /surakhyu/) - 링크 발견을 위해 넓게
+    # 수집 범위: 입력 URL 경로 (예: /surakhyu/web/main/main/) - 실제 결과에 포함할 범위
+    crawl_allowed_path = prefixes[1] if len(prefixes) > 1 else base_path  # 탐색용 (넓게)
+    collect_base_path = base_path if base_path.endswith('/') else base_path + '/'  # 수집용 (좁게)
+    logger.info(f"[경로 설정] 탐색 범위: {crawl_allowed_path}, 수집 범위: {collect_base_path}")
+
+    seed_set = set()
+    # 루트→상위 경로→기준 경로→사용자 입력 URL 순으로 enqueue
+    for pref in prefixes:
+        seed_url = f"{scheme}://{domain}{pref}"
+        if seed_url not in seed_set:
+            await queue.put((seed_url, 0))
+            seed_set.add(seed_url)
+    if not start_url.startswith(('http://', 'https://')):
+        start_seed = f"https://{start_url}"
+    else:
+        start_seed = start_url
+    if start_seed not in seed_set:
+        await queue.put((start_seed, 0))
+        seed_set.add(start_seed)
+
+    # ✅ 크롤링 시작 메시지 (한 번만)
+    if job_id and job_manager:
+        await send_message_to_socket(
+            job_id,
+            {
+                "type": "crawl_status",
+                "status": "crawling",
+                "message": "페이지 수집을 시작합니다",
+                "timestamp": time.time(),
+            },
+            job_manager,
+        )
+
+    # ✅ DH_KEY_TOO_SMALL 해결을 위한 SSL 컨텍스트 생성 (크롤링 호환성 극대화)
+    ssl_context = ssl.create_default_context()
+    ssl_context.set_ciphers("DEFAULT@SECLEVEL=0")  # DH 키 크기 제한 해제
+    ssl_context.check_hostname = False  # 호스트명 검증 비활성화
+    ssl_context.verify_mode = ssl.CERT_NONE  # 인증서 검증 비활성화
+    try:
+        ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT  # 레거시 서버 연결 허용
+    except AttributeError:
+        pass
+
+    # ✅ 강력한 SSL 검증 비활성화된 커넥터 설정 (크롤링용)
+    connector = aiohttp.TCPConnector(
+        ssl=ssl_context,  # SSL 컨텍스트 사용 (ssl=False 대신)
+        force_close=True,  # 연결 재사용 방지 (SSL 문제 회피)
+        limit=200,  # 크롤링용 더 많은 연결 허용
+        limit_per_host=20,  # 호스트당 연결 수 증가
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        enable_cleanup_closed=True,
+    )
+    
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=45, connect=8, sock_read=25)  # 크롤링용 타임아웃
+    ) as session:
+        tasks = []
+        # 시드로 인해 실제 깊이가 1~2단계 증가할 수 있으므로 내부 max_depth 소폭 보정
+        internal_max_depth = max_depth + max(0, len(prefixes) - 1)
+        for i in range(max_tasks):
+            task = asyncio.create_task(
+                crawl_page_worker_with_count(
+                    queue, session, domain, internal_max_depth, visited, results, 
+                    crawl_allowed_path, collect_base_path, enqueued, failures, 
+                    job_id, job_manager, max_crawl_urls, url_filter
+                )
+            )
+            tasks.append(task)
+
+        await queue.join()
+        logging.info("모든 크롤링 태스크 완료")
+
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ✅ 완료 메시지 제거 - 바로 처리 단계로 넘어감
+    # 로그에만 기록
+    logging.info(f"크롤링 완료: 총 {len(results)}개 페이지 수집")
+
+    return results
+
+
+# ✅ 실시간 카운트 기능이 추가된 워커 함수
+async def crawl_page_worker_with_count(
+    queue, session, domain, max_depth, visited, results, 
+    crawl_allowed_path, collect_base_path, enqueued, failures, 
+    job_id=None, job_manager=None, max_crawl_urls=100, url_filter: str = None
+):
+    logging.info(f"[워커 시작] url_filter: {url_filter}")
+    
+    async def check_cancel():
+        """취소 상태 체크 헬퍼 함수"""
+        if job_id and job_manager:
+            try:
+                status = await job_manager.get_job_status(job_id)
+                if status == "cancel":
+                    logger.info(f"[작업 취소] job_id: {job_id}")
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    logger.info(f"[작업 취소 완료] 모든 URL 처리 태스크 정리됨: job_id={job_id}")
+
+                url_result = await completed_task
+                if url_result:
+                    # 원래 인덱스 찾기
+                    task_index = task_to_index.get(id(completed_task))
+                    if task_index is not None:
+                        # 올바른 order 설정 (1부터 시작)
+                        url_result["order"] = task_index + 1
+                        url_task_results[task_index] = url_result
+                    
+                    source_url = url_result["url"]
+                    processed_urls[source_url] = url_result
+                    total_chunks_processed += url_result["chunks"]
+                    completed_count += 1
+
+                    # 실시간 진행률 업데이트
+                    progress = min(int((completed_count / total_pages) * 95), 95)
+
+                    # ✅ crawl_count 메시지로 개별 파일 처리 완료 알림
+                    await send_message_to_socket(
+                        job_id,
+                        {
+                            "type": "crawl_count",
+                            "count": completed_count,
+                            "current_url": url_result["url"],
+                            "timestamp": time.time(),
+                        },
+                        job_manager,
+                    )
+
+                    # ✅ 추가 진행률 정보도 함께 전송
+                    await send_message_to_socket(
+                        job_id,
+                        {
+                            "type": "progress",
+                            "status": "processing",
+                            "progress": progress,
+                            "processed_url": {
+                                "url": url_result["url"],
+                                "chunks": url_result["chunks"],
+                                "order": url_result["order"],
+                                "processing_time": url_result["processing_time"],
+                                "favicon_url": url_result["favicon_url"],
+                                "source_size": url_result["source_size"],
+                                "web_title": url_result.get("title", "")
+                            },
+                            "current_url": completed_count,
+                            "total_urls": total_pages,
+                            "total_chunks_processed": total_chunks_processed,
+                            "timestamp": time.time(),
+                            "chunk_hash": url_result["chunk_hash"],
+                        },
+                        job_manager,
+                    )
+
+            except Exception as e:
+                logger.error(f"403 폴백 개별 URL 처리 중 오류: {e}")
+
+        # 완료 처리
+        total_processing_time = round(time.time() - start_time, 2)
+
+        # 결과 정리
+        chunk_count_list = []
+        use_source_list = []
+        source_size_list = []
+        web_title_list = []
+        chunk_hash_list = []
+        use_source = {}
+
+        # URL을 순서대로 정렬 (order 기준)
+        sorted_urls = sorted(processed_urls.items(), key=lambda x: x[1].get("order", 0))
+
+        for source_url, url_result in sorted_urls:
+            chunk_count_list.append(url_result.get("chunks", 0))
+            use_source_list.append(source_url)
+            source_size = url_result.get("source_size", [0])
+            if isinstance(source_size, list) and len(source_size) > 0:
+                source_size_list.append(source_size[0])
+            else:
+                source_size_list.append(0)
+            web_title_list.append(url_result.get("title", ""))
+            chunk_hash_list.append(url_result.get("chunk_hash", ""))
+            use_source[source_url] = {
+                "chunks": url_result.get("chunks", 0),
+                "favicon_url": url_result.get("favicon_url", ""),
+                "processing_time": url_result.get("processing_time", 0),
+                "order": url_result.get("order", 0)
+            }
+
+        # ✅ 403 폴백 처리에서는 변경감지가 적용되지 않으므로 모든 URL을 신규 학습으로 처리
+        logger.info(f"📊 [최종 결과] 수집 URL : {len(processed_urls)}개, 변경 사항 없음 : 0개, 변경 감지 - 신규 학습: {len(processed_urls)}개")
+        
+        logger.info(
+            f"[403 폴백 크롤링 작업 완료] 총 처리된 URL 수: {len(processed_urls)}, "
+            f"총 청크: {total_chunks_processed}, 처리 시간: {total_processing_time}초"
+        )
+
+        # 완료된 URL 리스트 전송
+        await send_message_to_socket(
+            job_id,
+            {
+                "type": "progress",
+                "status": "info",
+                "message": "403 폴백 처리 완료",
+                "progress": 95,
+                "completed_urls": use_source_list,
+                "chunk_count": chunk_count_list,
+                "source_size": source_size_list,
+                "total_processed_urls": len(processed_urls),
+                "total_chunks": total_chunks_processed,
+                "processing_time": total_processing_time,
+                "timestamp": time.time(),
+                "chunk_hash": chunk_hash_list,
+            },
+            job_manager,
+        )
+
+        return {
+            "total_processed_urls": len(processed_urls),
+            "total_chunks": total_chunks_processed,
+            "chunk_count": chunk_count_list,
+            "use_source": use_source_list,
+            "source_size": source_size_list,
+            "web_title": web_title_list,
+            "processing_time": total_processing_time,
+            "chunk_hash": chunk_hash_list,
+        }
+
+    except Exception as e:
+        error_message = f"403 폴백 결과 처리 중 오류 발생: {str(e)}"
+        logger.error(f"[403 폴백 결과 처리 오류] {error_message}", exc_info=True)
+        await send_message_to_socket(
+            job_id,
+            {
+                "type": "error",
+                "status": "error",
+                "message": error_message,
+                "current_url": original_url,
+                "timestamp": time.time(),
+                "chunk_hash": [],
+            },
+            job_manager,
+        )
+        raise

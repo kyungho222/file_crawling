@@ -1,0 +1,67 @@
+services:
+  summarizer:
+    callback_url: http://summarizer-service/api/batch-result
+    default_model: gpt-4.1
+    default_type: responses
+
+  translator:
+    callback_url: http://translator-service/api/batch-result
+    default_model: gpt-4.1-mini
+    default_type: chat
+
+  test_service:
+    callback_url: https://dev.chatbaram.com:9300/test/get/batches
+    default_model: gpt-4.1
+    default_type: responses
+
+  ai_news_embedding:
+    callback_url: https://dev.chatbaram.com:7000/api/ai_news/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  ai_pro_wiki_crawling_embedding:
+    callback_url: https://dev.chatbaram.com:19191/api/wiki/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  ai_pro_crawling_embedding:
+    callback_url: https://dev.chatbaram.com:19100/api/crawling/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  ai_video_crawling_embedding:
+    callback_url: https://api-aipro.chatbaram.com/ai-video/AI_video/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  ai_video_chatty_crawling_embedding:
+    callback_url: https://api-aipro.chatbaram.com/chatty/ai-video/AI_video/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+    
+  ai_pro_filecrawler_embedding:
+    callback_url: https://api-aipro.chatbaram.com/api-aipro/f1/Ai_Pro_filecrawler/backend/filecrawler/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  ai_pro_crawling_CHATTY_embedding:
+    callback_url: http://192.168.1.14:29000/api/crawling/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding
+
+  kipris_patent_embedding:
+    callback_url: https://api-aipro.chatbaram.com/url-scout/api/kipris/patent/embedding-batch/callback
+    default_model: text-embedding-3-small
+    default_type: embedding
+
+  ai_pro_filecrawler_embedding_dev:
+    callback_url: https://api-aipro.chatbaram.com/api-aipro/f1_dev//api/Ai_Pro_filecrawle/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding    
+
+  ai_pro_filecrawler_embedding_prod:
+    callback_url: https://api-aipro.chatbaram.com/api-aipro/f1/api/Ai_Pro_filecrawler/embedding-batch/callback
+    default_model: text-embedding-ada-002
+    default_type: embedding 
+
+

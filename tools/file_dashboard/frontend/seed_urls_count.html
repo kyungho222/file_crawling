@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seed URLs Count</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #647083;
+      --line: #d8dee8;
+      --accent: #1266d6;
+      --accent-dark: #0d4ea6;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Noto Sans KR", sans-serif;
+      letter-spacing: 0;
+    }
+    main {
+      width: min(920px, calc(100vw - 32px));
+      margin: 32px auto;
+    }
+    h1 {
+      margin: 0 0 18px;
+      font-size: 24px;
+      line-height: 1.25;
+      font-weight: 700;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .field.full { grid-column: 1 / -1; }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    input {
+      width: 100%;
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      background: #fff;
+    }
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(18, 102, 214, 0.12);
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    button {
+      height: 40px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 16px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); }
+    button:disabled {
+      background: #8caad1;
+      cursor: progress;
+    }
+    .status {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .result {
+      margin-top: 18px;
+      padding: 22px 18px;
+      background: #101820;
+      color: #fff;
+      border-radius: 8px;
+    }
+    .result-label {
+      color: #b8c4d4;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .result-number {
+      margin-top: 8px;
+      font-size: 48px;
+      line-height: 1;
+      font-weight: 800;
+      word-break: break-all;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+      color: #cbd5e1;
+      font-size: 12px;
+    }
+    .error { color: var(--danger); }
+    @media (max-width: 720px) {
+      main { width: min(100vw - 20px, 920px); margin: 18px auto; }
+      .grid { grid-template-columns: 1fr; }
+      .result-number { font-size: 38px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Seed URLs Count</h1>
+    <section class="panel">
+      <div class="grid">
+        <div class="field">
+          <label for="dbName">dbname</label>
+          <input id="dbName" autocomplete="off" placeholder="gm">
+        </div>
+        <div class="field">
+          <label for="chatBotId">chatbotid</label>
+          <input id="chatBotId" autocomplete="off" placeholder="12ab356b-8753-4bc1-aae4-5ecf8fce68ef">
+        </div>
+        <div class="field full">
+          <label for="contentsUrl">contents_url</label>
+          <input id="contentsUrl" autocomplete="off" placeholder="https://example.go.kr/...">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="countButton" type="button">Count</button>
+        <span id="status" class="status"></span>
+      </div>
+      <div class="result" aria-live="polite">
+        <div class="result-label">ASADAL_CRAWLING_EXPLORATION</div>
+        <div id="resultNumber" class="result-number">-</div>
+        <div id="meta" class="meta"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const endpoints = [
+      "/backend/seed-urls/count",
+      "/Ai_Pro_filecrawler/backend/seed-urls/count"
+    ];
+
+    function setStatus(text, isError = false) {
+      $("status").textContent = text || "";
+      $("status").classList.toggle("error", Boolean(isError));
+    }
+
+    function numberText(value) {
+      const parsed = Number(value || 0);
+      return Number.isFinite(parsed) ? parsed.toLocaleString() : String(value || 0);
+    }
+
+    async function postJson(url, payload) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      try {
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = {};
+        }
+        return { res, data };
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    async function countSeedUrls() {
+      const dbName = $("dbName").value.trim();
+      const chatBotId = $("chatBotId").value.trim();
+      const contentsUrl = $("contentsUrl").value.trim();
+      if (!dbName) throw new Error("dbname is required");
+      if (!chatBotId) throw new Error("chatbotid is required");
+      if (!contentsUrl) throw new Error("contents_url is required");
+
+      const payload = {
+        db_name: dbName,
+        dbname: dbName,
+        account_name: dbName,
+        chat_bot_id: chatBotId,
+        contents_url: contentsUrl,
+        contents: [contentsUrl],
+        table: "ASADAL_CRAWLING_EXPLORATION",
+        bridge_base_url: "http://127.0.0.1:8031",
+        bridge_path: "/api/local-board-crawler/targets/preview",
+        timeout_sec: 20
+      };
+
+      let lastError = null;
+      for (const endpoint of endpoints) {
+        try {
+          const { res, data } = await postJson(endpoint, payload);
+          if (res.ok && data && data.ok) {
+            return { endpoint, data };
+          }
+          lastError = new Error((data && (data.error || data.message)) || `HTTP ${res.status}`);
+        } catch (err) {
+          lastError = err && err.name === "AbortError" ? new Error("request timed out") : err;
+        }
+      }
+      throw lastError || new Error("count failed");
+    }
+
+    $("countButton").addEventListener("click", async () => {
+      $("countButton").disabled = true;
+      $("resultNumber").textContent = "-";
+      $("meta").textContent = "";
+      setStatus("Loading...");
+      try {
+        const { endpoint, data } = await countSeedUrls();
+        $("resultNumber").textContent = numberText(data.total);
+        const remoteTotal = data.bridge_remote_total !== null && data.bridge_remote_total !== undefined ? `remote_total ${numberText(data.bridge_remote_total)}` : "";
+        const remoteCount = data.bridge_count !== null && data.bridge_count !== undefined ? `preview ${numberText(data.bridge_count)}` : "";
+        $("meta").textContent = [data.db_name || "", data.chat_bot_id || "", remoteTotal, remoteCount, endpoint].filter(Boolean).join(" / ");
+        setStatus("Done");
+      } catch (err) {
+        setStatus(err.message || String(err), true);
+      } finally {
+        $("countButton").disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

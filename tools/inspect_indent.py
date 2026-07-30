@@ -1,0 +1,1 @@
+import os\n+lines = open(os.path.join('tools','fixed_source_snippet.txt'),'r',encoding='utf-8').read().splitlines()\n+for i in range(3855,3867):\n+    line = lines[i]\n+    leading = len(line) - len(line.lstrip(' '))\n+    print(i+1, leading, repr(line))\n*** End Patch"}```json

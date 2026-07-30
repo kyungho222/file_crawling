@@ -1,0 +1,106 @@
+{
+    "gachi.chungbuk.go.kr": {
+        "title_tag": ".notice_view .tit_wrap h3, .support_main .tit_wrap h2, .support_main .tit_wrap h3",
+        "content_tag": ".content"
+    },
+    "ghss.or.kr": {
+        "title_tag": ".viewInfo .viewInfo__tit",
+        "content_tag": ".content"
+    },
+    "museum.seoul.go.kr": {
+        "title_tag": "div.article_info h3.tit_article, div.exhibit_info.info_area h3.tit, table#boardTbl caption.tit_article, h2#tit_page, caption.tit_article",
+        "content_tag": "article#content, #contents"
+    },
+    "gwangjin.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "yongin.go.kr": {
+        "title_tag": "#container article#content .article-header h1.article-subject, #container article#content .article-header h1.article_subject, #container article#content .article-header h4.article-subject, #container article#content .article-header h4.article_subject, article#content .article-header h1.article-subject, article#content .article-header h1.article_subject, article#content .article-header h4.article-subject, article#content .article-header h4.article_subject, .article-header h1.article-subject, .article-header h1.article_subject, .article-header h4.article-subject, .article-header h4.article_subject, h1.article-subject, h1.article_subject, h4.article-subject, h4.article_subject, #contents .h3_box h3, #contents .h3-box h3",
+        "content_tag": "#contents .cont_box"
+    },
+    "resve.yongin.go.kr": {
+        "title_tag": "#container .article-header .main-title, .article-header .main-title, .main-title",
+        "content_tag": ".article-area .txt, .article-content .txt"
+    },
+    "hu.or.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "publicsports.yongin.go.kr": {
+        "title_tag": "tr.p-table__subject .p-table__subject_text, .p-table__subject .p-table__subject_text, .p-table__subject_text",
+        "content_tag": ".content"
+    },
+    "songpa.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "youthcenter.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "gangnamingang.han.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "edu.ingang.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "sb.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "pyeongtaek.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "gokams.or.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "asimc.or.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "photo.hscity.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "jongno.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "council.jongno.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "hscity.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "copyright.or.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "gm.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "example.org": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "k-cohesion.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "namu.sdm.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    },
+    "chorogusan.or.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
+    }
+}

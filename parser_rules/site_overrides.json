@@ -1,0 +1,616 @@
+{
+    "sites": {
+        "anseong.go.kr": {
+            "title_selectors": [
+                "div.edu-detail-header h2.edu-title",
+                ".learning_content .bod_title .bod_subject",
+                ".learning_wrap .bod_title .bod_subject",
+                ".bod_title .bod_subject",
+                ".tourAreaViewer .desc h4 > strong",
+                ".tourAreaViewer .desc h4 strong",
+                ".tourAreaViewer h4 > strong",
+                ".tourAreaView .desc h4 > strong",
+                ".tourAreaView .desc h4 strong",
+                ".tourAreaView h4 > strong",
+                ".bod_view h4 > strong",
+                ".bod_view h4 strong",
+                ".bod_view > h4",
+                "div.bod_view > h4",
+                ".bod_view h4"
+            ]
+        },
+        "asimc.or.kr": {
+            "title_selectors": [
+                "#conts .bod_view > .subject",
+                "#conts .subject",
+                ".bod_view > .subject",
+                ".subject",
+                "#conts table.bd_detail tr th[scope='row'] + td",
+                "#conts .bd_detail tr td.tal",
+                "#conts .tbl-box td.tal",
+                "table.bd_detail tr th + td"
+            ],
+            "content_selectors": [
+                "#conts",
+                "#contents",
+                ".bod_view",
+                "table.bd_detail"
+            ]
+        },
+        "chuncheon.go.kr": {
+            "title_selectors": [
+                ".serch_result_wrap .content01_title_v p",
+                ".serch_result_wrap .content01_title_v > p",
+                ".content01_2title_box .content01_title_v p",
+                ".content01_2title_box .content01_title_v > p",
+                ".content01_title_v p",
+                ".content01_title_v > p",
+                "#print-wrap h3",
+                "#print-wrap h2",
+                "meta[property='og:title']"
+            ],
+            "content_selectors": [
+                ".serch_result_wrap",
+                ".content01_2title_box",
+                "#print-wrap"
+            ]
+        },
+        "copyright.or.kr": {
+            "title_selectors": [
+                "input#contentSubject",
+                "div.view_contents p[align='center'] strong span",
+                "div.view_contents strong span",
+                "div.view_contents strong",
+                "table.table-row"
+            ],
+            "content_selectors": [
+                "div.view_contents",
+                "table.table-row"
+            ]
+        },
+        "council.jongno.go.kr": {
+            "title_selectors": [
+                ".board_view .tit",
+                ".view_title",
+                "table.table-type1 thead th[colspan]",
+                ".chairman-detail dt strong",
+                ".chairman-detail .chairman-txt dt strong",
+                ".chairman-detail dt"
+            ],
+            "content_selectors": [
+                ".board_view .content",
+                ".board_view",
+                "table.table-type1",
+                ".chairman-detail"
+            ]
+        },
+        "dongjak.go.kr": {
+            "title_selectors": [
+                ".acview-tbox .btit",
+                ".acview-top .acview-tbox .btit",
+                "#acv-contents .btit",
+                "#contentDiv .view .table p.heading",
+                "#contentDiv .view p.heading",
+                ".nw-content-data .view .table p.heading",
+                ".view .table p.heading",
+                "#contentDiv .view.boxGray h2",
+                ".view.boxGray h2",
+                "meta[property='og:title']",
+                "meta[name='description']",
+                "meta[property='og:description']"
+            ],
+            "content_selectors": [
+                "#contentDiv",
+                "#acv-contents",
+                ".nw-content-data",
+                ".view"
+            ]
+        },
+        "edu.ingang.go.kr": {
+            "title_selectors": [
+                ".area_title",
+                "td.tit"
+            ]
+        },
+        "gangnam.go.kr": {
+            "title_selectors": [
+                "section.sub-header h2.sub-title",
+                ".depth2_content_title_wrap02 h5.editableItem[colid='MEDICAL_NM']",
+                ".boardDetailViewBox .com-post-hd-01 p.title",
+                ".com-post-hd-01 p.title",
+                ".faq_detail_wrap h5.faq_title",
+                "ul.detail_content h5.faq_title",
+                "h5.faq_title",
+                ".boardDetail-wrap .board-content-detail-info h4",
+                ".board-content.boardDetail-wrap .board-content-detail-info h4",
+                ".board-content-detail-info h4",
+                ".event-view .event-title",
+                ".event-title",
+                "#contents-wrap p.apply-title",
+                ".apply-info-cont p.apply-title",
+                "p.apply-title",
+                "h3.con-title",
+                "p.calendar_info_tit",
+                ".calendar_info .calendar_info_tit",
+                ".bbs-view .post-title h4",
+                ".bbs-view .bbs-view_head p.title",
+                ".bbs-view_head p.title",
+                "article.bbs-view header.top h3.title",
+                ".bbs-view header.top h3.title",
+                "p.title",
+                "meta[property='og:title']"
+            ],
+            "content_selectors": [
+                "#contents",
+                ".boardDetailViewBox",
+                ".bbs-view",
+                ".detail_content",
+                ".board-content-detail-info"
+            ]
+        },
+        "gm.go.kr": {
+            "title_selectors": [
+                "#sub_content_cont_rt_cont table.table_style2 tr:has(> th[scope='row']:-soup-contains('행사명'))",
+                "#sub_content_cont_rt_cont table.table_style2 tr:has(> th:-soup-contains('행사명'))",
+                "table.table_style2 tr:has(> th[scope='row']:-soup-contains('행사명'))",
+                "table.table_style2 tr:has(> th:-soup-contains('행사명'))",
+                "h5.view_title",
+                ".board_view > h5.view_title",
+                ".board_view .view_title",
+                ".subjectbox",
+                ".subject_box",
+                ".board_subject",
+                ".view_subject",
+                ".titlebox",
+                ".page-title h3",
+                ".page-title h4",
+                "#depth2-t",
+                ".depth2-t",
+                "#dept2-t",
+                ".dept2-t",
+                "#depth3-t",
+                ".depth3-t",
+                "#dept3-t",
+                ".dept3-t",
+                "#c-contents h1",
+                "#c-contents h2",
+                "#c-contents h3",
+                "#c-contents h4",
+                "meta[name='description']",
+                "meta[name='keywords']"
+            ],
+            "content_selectors": [
+                "#contents",
+                "#content",
+                "#c-contents",
+                ".contents",
+                ".content",
+                ".substance",
+                ".pri_box",
+                "main"
+            ]
+        },
+        "guro.go.kr": {
+            "title_selectors": [
+                "#contents table.p-table tr.p-table__subject .p-table__subject_text",
+                "#contents .p-table tr.p-table__subject .p-table__subject_text",
+                "#contents .p-table__subject .p-table__subject_text",
+                "#contents .p-table__subject_text",
+                "table.p-table tr.p-table__subject .p-table__subject_text",
+                ".p-table tr.p-table__subject .p-table__subject_text",
+                "tr.p-table__subject .p-table__subject_text",
+                ".p-table__subject .p-table__subject_text",
+                ".p-table__subject_text",
+                "#contents .top_button_wrap h3.h0",
+                "#contents .box_wrap .top_button_wrap h3.h0",
+                ".bbs_gallery .top_button_wrap h3.h0",
+                ".top_button_wrap h3.h0",
+                "h3.h0.title",
+                "h3.h0",
+                ".poll_view > h4",
+                ".execution_view_title .info_cts h3.title",
+                ".execution_view_title h3.title",
+                ".bbs__view .info_cts h3.title",
+                "table.p-table tr",
+                ".title",
+                "h3",
+                "h2",
+                "h1"
+            ],
+            "content_selectors": [
+                ".p-table",
+                ".bbs__view",
+                ".execution_view_title",
+                "#contents"
+            ],
+            "score": {
+                "semantic_class_or_id": 45
+            }
+        },
+        "hscity.go.kr": {
+            "title_selectors": [
+                "#sub_content .board_write.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "#sub_content .board_write tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".sub_content .board_write.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".sub_content .board_write tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "div.board_write.mt_18 table tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "div.board_write table tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".board_write.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".board_write tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "#sub_content .gallery_view.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "#sub_content .gallery_view tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".sub_content .gallery_view.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".sub_content .gallery_view tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "div.gallery_view.mt_18 table tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "div.gallery_view table tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".gallery_view.mt_18 tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                ".gallery_view tr:has(> th[scope='row']:-soup-contains('\uc81c\ubaa9'))",
+                "#sub_content .board_write.mt_18 th[scope='row'] + td",
+                "#sub_content .board_write th[scope='row'] + td",
+                ".sub_content .board_write.mt_18 th[scope='row'] + td",
+                ".sub_content .board_write th[scope='row'] + td",
+                "div.board_write.mt_18 table th[scope='row'] + td",
+                "div.board_write table th[scope='row'] + td",
+                ".board_write.mt_18 th[scope='row'] + td",
+                ".board_write th[scope='row'] + td",
+                "#sub_content .gallery_view.mt_18 th[scope='row'] + td",
+                "#sub_content .gallery_view th[scope='row'] + td",
+                ".sub_content .gallery_view.mt_18 th[scope='row'] + td",
+                ".sub_content .gallery_view th[scope='row'] + td",
+                "div.gallery_view.mt_18 table th[scope='row'] + td",
+                "div.gallery_view table th[scope='row'] + td",
+                ".gallery_view.mt_18 th[scope='row'] + td",
+                ".gallery_view th[scope='row'] + td",
+                "#sub_content .board_write.mt_18 tr",
+                "#sub_content .board_write tr",
+                ".sub_content .board_write.mt_18 tr",
+                ".sub_content .board_write tr",
+                "div.board_write.mt_18 table tr",
+                "div.board_write table tr",
+                ".board_write.mt_18 tr",
+                ".board_write tr",
+                "#sub_content .gallery_view.mt_18 tr",
+                "#sub_content .gallery_view tr",
+                ".sub_content .gallery_view.mt_18 tr",
+                ".sub_content .gallery_view tr",
+                "div.gallery_view.mt_18 table tr",
+                "div.gallery_view table tr",
+                ".gallery_view.mt_18 tr",
+                ".gallery_view tr"
+            ],
+            "content_selectors": [
+                "#sub_content .board_write",
+                ".sub_content .board_write",
+                ".board_write.mt_18",
+                ".board_write",
+                "#sub_content .gallery_view",
+                ".sub_content .gallery_view",
+                ".gallery_view.mt_18",
+                ".gallery_view",
+                "#sub_content",
+                ".sub_content"
+            ]
+        },
+        "hu.or.kr": {
+            "title_selectors": [
+                ".apv_tit_low01 .notice_c",
+                ".apv_tit_w .notice_c",
+                "span.notice_c"
+            ]
+        },
+        "identity.kisa.or.kr": {
+            "title_selectors": [
+                "table.tbl_view th.titBox",
+                "table.tbl_view caption"
+            ],
+            "content_selectors": [
+                "#content",
+                "table.tbl_view"
+            ]
+        },
+        "jongno.go.kr": {
+            "title_selectors": [
+                "#divTable .tr",
+                "div#divTable.table .tr",
+                ".content_area table.view_type01 tr",
+                ".board_view table.view_type01 tr",
+                "table.view_type01 tr",
+                ".bbs_view .subject",
+                ".board_view table.view_type01 th.notice_title h4",
+                ".board_view table.view_type01 th.first.notice_title h4",
+                "table.view_type01 th.notice_title h4",
+                "table.view_type01 h4",
+                ".board_view h4",
+                ".board_view table.view_type01 th.notice_title",
+                ".board_view table.view_type01 th.first.notice_title",
+                "table.view_type01 th.notice_title",
+                "table.view_type01 th.first.notice_title",
+                "th.notice_title"
+            ],
+            "content_selectors": [
+                ".bbs_view .cont",
+                ".board_view",
+                "#divTable",
+                "table.view_type01"
+            ]
+        },
+        "museum.seoul.go.kr": {
+            "title_selectors": [
+                "div.article_info h3.tit_article",
+                "div.exhibit_info.info_area h3.tit",
+                "table#boardTbl caption.tit_article",
+                "h2#tit_page",
+                "caption.tit_article"
+            ],
+            "content_selectors": [
+                "div.article_info",
+                "div.exhibit_info.info_area",
+                "table#boardTbl",
+                "#contents"
+            ]
+        },
+        "ne.go.kr": {
+            "title_selectors": [
+                ".conts-board .conts-board-title .tit",
+                ".conts-board-title .tit"
+            ],
+            "content_selectors": [
+                ".conts-board .conts-board-contents",
+                ".conts-board"
+            ],
+            "score": {
+                "inside_post_area": 60,
+                "semantic_class_or_id": 45
+            }
+        },
+        "pyeongtaek.go.kr": {
+            "title_selectors": [
+                "#content h3",
+                "#content h2",
+                "#content h1",
+                "#conts h3",
+                "#conts h2",
+                "#conts h1",
+                "#conts .poll_view > h4.no_bgimg.mT0",
+                "#conts .poll_view h4.no_bgimg",
+                "#conts .poll_view > h4",
+                ".poll_view > h4.no_bgimg.mT0",
+                ".poll_view h4.no_bgimg",
+                ".poll_view > h4",
+                "#detailForm .bod_view > h4",
+                "#detailForm .bod_view h4",
+                "#view_div .bod_view > h4",
+                "#view_div .bod_view h4",
+                "#conts .bod_view > h4",
+                "#conts .bod_view h4",
+                ".bod_view > h4",
+                ".bod_view h4"
+            ],
+            "content_selectors": [
+                "#detailForm",
+                "#view_div",
+                "#conts",
+                "#content",
+                ".bod_view"
+            ]
+        },
+        "sb.go.kr": {
+            "title_selectors": [
+                ".p-table__subject_text",
+                "td[colspan] .subject",
+                "td[colspan] strong",
+                "#contents .epForm.bbs.gosi.view h1",
+                "#contents .epForm.bbs.gosi.view h2",
+                "#contents .epForm.bbs.gosi.view h3",
+                "#contents .program.edu_view h3",
+                "#contents .program h3",
+                ".apply_tab .tab_list .tab_item .tab_button span",
+                "#contents h3",
+                "#contents h2",
+                "#contents h1"
+            ],
+            "content_selectors": [
+                "#contents",
+                "#contents .program.edu_view",
+                "#contents .program",
+                ".p-table"
+            ]
+        },
+        "sdm.go.kr": {
+            "title_selectors": [
+                ".search-list-view .detail-con h4.sub-h4-tit",
+                ".search-list-view h4.sub-h4-tit",
+                ".detail-con h4.sub-h4-tit",
+                ".cur-exhibit .current-box h4.current-h4",
+                ".current-box h4.current-h4",
+                "h4.current-h4",
+                ".qanda-dview thead th[scope='colgroup']",
+                "table.qanda-dview thead th[scope='colgroup']",
+                ".board-list-view h4.content-tit",
+                "table.bron h4.content-tit",
+                ".page-con .search-list-view h4",
+                ".sub-con .search-list-view h4",
+                ".search-list-view .detail-con h4",
+                ".page-con .board-list-view h4",
+                ".sub-con .board-list-view h4",
+                ".board-list-view th h4",
+                "h4.sub-h4-tit",
+                "h4.content-tit"
+            ],
+            "content_selectors": [
+                ".page-con .search-list-view",
+                ".sub-con .search-list-view",
+                ".search-list-view",
+                ".detail-con",
+                ".cur-exhibit",
+                ".current-box",
+                ".qanda-dview",
+                "table.qanda-dview",
+                ".page-con .board-list-view",
+                ".sub-con .board-list-view",
+                ".board-list-view",
+                "table.bron",
+                ".page-con",
+                ".sub-con"
+            ]
+        },
+        "namu.sdm.go.kr": {
+            "title_selectors": [
+                ".search-list-view .detail-con h4.sub-h4-tit",
+                ".search-list-view h4.sub-h4-tit",
+                ".detail-con h4.sub-h4-tit",
+                ".cur-exhibit .current-box h4.current-h4",
+                ".current-box h4.current-h4",
+                "h4.current-h4",
+                ".qanda-dview thead th[scope='colgroup']",
+                "table.qanda-dview thead th[scope='colgroup']",
+                ".board-list-view h4.content-tit",
+                "table.bron h4.content-tit",
+                ".page-con .search-list-view h4",
+                ".sub-con .search-list-view h4",
+                ".search-list-view .detail-con h4",
+                ".page-con .board-list-view h4",
+                ".sub-con .board-list-view h4",
+                ".board-list-view th h4",
+                "h4.sub-h4-tit",
+                "h4.content-tit"
+            ],
+            "content_selectors": [
+                ".page-con .search-list-view",
+                ".sub-con .search-list-view",
+                ".search-list-view",
+                ".detail-con",
+                ".cur-exhibit",
+                ".current-box",
+                ".qanda-dview",
+                "table.qanda-dview",
+                ".page-con .board-list-view",
+                ".sub-con .board-list-view",
+                ".board-list-view",
+                "table.bron",
+                ".page-con",
+                ".sub-con"
+            ]
+        },
+        "sd.go.kr": {
+            "title_selectors": [
+                "div.contract_title",
+                ".contract_program_view div.contract_title",
+                "#contents div.contract_title",
+                "table.p-table",
+                "table[data-table]",
+                "table"
+            ],
+            "content_selectors": [
+                ".contract_program_view",
+                "#contents",
+                "table.p-table"
+            ]
+        },
+        "songpa.go.kr": {
+            "title_selectors": [
+                "#contents tr.p-table__subject .p-table__subject_text",
+                "#contents .p-table__subject .p-table__subject_text",
+                "#contents .p-table__subject_text",
+                "tr.p-table__subject .p-table__subject_text",
+                ".p-table__subject_text",
+                "#board .p-table__subject .p-table__subject_text",
+                "#board .p-table__subject_text",
+                "#contents h3",
+                "#contents .title",
+                "#contents .tit",
+                "#contents h2",
+                "#contents h1",
+                ".title",
+                ".tit",
+                "h3",
+                "h2",
+                "h1"
+            ],
+            "content_selectors": [
+                "#board",
+                "#contents",
+                ".p-table__content",
+                ".p-table"
+            ]
+        },
+        "yongin.go.kr": {
+            "title_selectors": [
+                "td.title",
+                "#contentsTable .title",
+                "#contentsTable td.title",
+                ".view_bbs_top h4",
+                "#container .article-header .main-title",
+                ".article-header .main-title",
+                "p.main-title",
+                "#container article#content .article-header h1.article-subject",
+                "#container article#content .article-header h1.article_subject",
+                "#container article#content .article-header h4.article-subject",
+                "#container article#content .article-header h4.article_subject",
+                "article#content .article-header h1.article-subject",
+                "article#content .article-header h1.article_subject",
+                "article#content .article-header h4.article-subject",
+                "article#content .article-header h4.article_subject",
+                ".article-view .article-header h1.article-subject",
+                ".article-view .article-header h1.article_subject",
+                ".article-view .article-header h4.article-subject",
+                ".article-view .article-header h4.article_subject",
+                ".article-header h1.article-subject",
+                ".article-header h1.article_subject",
+                ".article-header h4.article-subject",
+                ".article-header h4.article_subject",
+                "h1.article-subject",
+                "h1.article_subject",
+                "h4.article-subject",
+                "h4.article_subject",
+                ".article-header h1",
+                ".article-header h2",
+                ".article-header h3",
+                "#contents .h3_box h3",
+                "#contents .h3-box h3",
+                "#contents .cont_box h4.tit_h4",
+                "#contents .cont_box .tit_h4",
+                "#contents .cont_box h4",
+                ".cont_box h4.tit_h4",
+                ".cont_box .tit_h4",
+                "#contents .h3_box > h3",
+                "#contents .h3-box > h3",
+                ".h3_box > h3",
+                ".h3_box h3",
+                "meta[property='og:title']"
+            ],
+            "content_selectors": [
+                "#contentsTable",
+                ".view_bbs_top",
+                ".platform-board__detail",
+                "article#content",
+                ".article-view",
+                "#contents",
+                ".cont_box"
+            ]
+        },
+        "youthcenter.go.kr": {
+            "title_selectors": [
+                "#content-detail[class*='bbs0'][class*='View'] #pstTtl",
+                "[class*='bbs0'][class*='View'] #pstTtl",
+                "h2.view-title#pstTtl",
+                "#_plcyNm",
+                "#evntNm",
+                "#evntNmTop",
+                "main#content .title-wrap h1.stitle",
+                "h1.stitle",
+                "#pstTtl",
+                ".view-title",
+                "meta[property='og:title']"
+            ],
+            "content_selectors": [
+                "main#content #content-detail[class*='bbs0'][class*='View']",
+                "#content-detail[class*='bbs0'][class*='View']",
+                "#pstCn",
+                ".conts-wrap:not(.download-list)",
+                "main#content #content-detail",
+                "#content-detail"
+            ]
+        }
+    }
+}

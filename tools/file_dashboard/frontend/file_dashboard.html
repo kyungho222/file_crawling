@@ -1,0 +1,1723 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>파일 크롤링 대시보드</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #182230;
+      --muted: #667085;
+      --line: #d0d7e2;
+      --accent: #0f766e;
+      --accent-strong: #0b5f59;
+      --danger: #b42318;
+      --warn: #b54708;
+      --good: #067647;
+      --soft: #eef4ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Malgun Gothic", sans-serif;
+      font-size: 14px;
+    }
+    header, main {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 18px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 8px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+      align-items: end;
+    }
+    .config-grid {
+      grid-template-columns: minmax(260px, 1.5fr) minmax(150px, .7fr) minmax(280px, 1fr) minmax(220px, .9fr);
+    }
+    .target-grid {
+      grid-template-columns: minmax(360px, 2fr) minmax(120px, .5fr) minmax(130px, .5fr) minmax(130px, .5fr);
+    }
+    .option-grid {
+      grid-template-columns: repeat(4, minmax(170px, 1fr));
+    }
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid #b9c2cf;
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 9px;
+      font-size: 13px;
+    }
+    input, select { height: 34px; }
+    textarea {
+      min-height: 72px;
+      padding: 8px 9px;
+      resize: vertical;
+      font-family: Consolas, monospace;
+      line-height: 1.45;
+    }
+    .check {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .check input {
+      width: 16px;
+      height: 16px;
+      padding: 0;
+    }
+    button {
+      height: 34px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+      padding: 0 12px;
+      cursor: pointer;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    button:hover { background: var(--accent-strong); }
+    button:disabled { opacity: .55; cursor: wait; }
+    button.secondary {
+      border: 1px solid #b9c2cf;
+      background: #fff;
+      color: var(--text);
+    }
+    button.secondary:hover { background: #eef2f7; }
+    button.danger { background: var(--danger); }
+    button.danger:hover { background: #8f1f17; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      background: #fbfcfe;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-height: 72px;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    .metric.good strong { color: var(--good); }
+    .metric.warn strong { color: var(--warn); }
+    .status-line {
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-width: 82px;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: #1849a9;
+      font-size: 12px;
+      font-weight: 800;
+      justify-content: center;
+    }
+    .logpanel {
+      margin-top: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .loghead {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .loghead strong {
+      font-size: 14px;
+    }
+    .loglist {
+      min-height: 240px;
+      max-height: 360px;
+      overflow: auto;
+      display: grid;
+      gap: 5px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      color: #344054;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .logline {
+      border-top: 1px solid #edf0f5;
+      padding-top: 5px;
+      overflow-wrap: anywhere;
+    }
+    .logline.error { color: var(--danger); }
+    .logline.ok { color: var(--good); }
+    .preview-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 12px;
+      margin-bottom: 12px;
+    }
+    .preview-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .preview-head strong {
+      font-size: 14px;
+    }
+    .preview-meta {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+    }
+    .preview-table-wrap {
+      overflow: auto;
+      max-height: 320px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .preview-table {
+      width: 100%;
+      min-width: 1180px;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .preview-table th,
+    .preview-table td {
+      padding: 8px 9px;
+      border-bottom: 1px solid #edf0f5;
+      text-align: left;
+      vertical-align: top;
+    }
+    .preview-table th {
+      position: sticky;
+      top: 0;
+      background: #eef2f7;
+      color: #344054;
+      z-index: 1;
+    }
+    .preview-url {
+      max-width: 320px;
+      overflow-wrap: anywhere;
+      font-family: Consolas, monospace;
+      color: #344054;
+    }
+    .progress-shell {
+      height: 10px;
+      background: #e4e7ec;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      background: var(--accent);
+      transition: width .2s ease;
+    }
+    @media (max-width: 980px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .config-grid, .target-grid, .option-grid, .metrics { grid-template-columns: 1fr; }
+      .button-row button { flex: 1 1 160px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>파일 크롤링 대시보드</h1>
+      <div class="sub">파일 크롤링 작업 시작, 진행률 확인, 중단, 파일 카테고리 미리보기 및 동기화</div>
+    </div>
+    <span id="jobPill" class="pill">작업 없음</span>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="grid config-grid">
+        <div>
+          <label for="apiBase">API 주소</label>
+          <input id="apiBase" value="https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler">
+        </div>
+        <div>
+          <label for="dbName">데이터베이스</label>
+          <input id="dbName" placeholder="dev_user">
+        </div>
+        <div>
+          <label for="chatBotId">챗봇 ID</label>
+          <input id="chatBotId" placeholder="uuid">
+        </div>
+        <div>
+          <label for="jobId">작업 ID</label>
+          <input id="jobId" placeholder="자동 생성">
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="grid target-grid">
+        <div>
+          <label for="contentsUrl">기준 URL</label>
+          <input id="contentsUrl" placeholder="https://example.go.kr/board/list.do">
+        </div>
+        <div>
+          <label for="method">수집 방식</label>
+          <select id="method">
+            <option value="period">기간 기준</option>
+            <option value="all">전체</option>
+          </select>
+        </div>
+        <div>
+          <label for="dateStart">시작일</label>
+          <input id="dateStart" type="date">
+        </div>
+        <div>
+          <label for="dateEnd">종료일</label>
+          <input id="dateEnd" type="date">
+        </div>
+      </div>
+      <div class="grid option-grid" style="margin-top:10px;">
+        <div>
+          <label for="order">URL 순서</label>
+          <select id="order">
+            <option value="forward">정방향</option>
+            <option value="reverse">역방향</option>
+            <option value="shuffle">무작위</option>
+          </select>
+        </div>
+        <div>
+          <label for="scopePath">경로 범위</label>
+          <input id="scopePath" placeholder="자동">
+        </div>
+        <div>
+          <label for="explorationLimit">DB URL 조회수</label>
+          <input id="explorationLimit" type="number" min="1" max="50000" step="1" value="10000">
+        </div>
+        <div>
+          <label for="explorationOffset">DB URL 시작 위치</label>
+          <input id="explorationOffset" type="number" min="0" max="10000000" step="1" value="0">
+        </div>
+        <label class="check"><input id="dedupe" type="checkbox" checked> 학습 완료 URL 제외</label>
+        <label class="check"><input id="directDetail" type="checkbox"> 기준 URL을 상세 페이지로 직접 처리</label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="button-row">
+        <button id="startBtn" type="button">파일 크롤링 시작</button>
+        <button id="connectBtn" type="button" class="secondary">실시간 연결</button>
+        <button id="stopBtn" type="button" class="danger">중단</button>
+        <button id="fetchExplorationBtn" type="button" class="secondary">탐색 DB URL 가져오기</button>
+        <button id="fetchNextExplorationBtn" type="button" class="secondary">다음 DB URL 묶음</button>
+        <button id="fetchPgMissingBtn" type="button" class="secondary">PG 미학습 대상 조회</button>
+        <button id="fetchAttachmentsBtn" type="button" class="secondary">첨부파일 목록 조회</button>
+        <button id="crawlExplorationBtn" type="button">전체목록 크롤링 시작</button>
+        <button id="previewCatBtn" type="button" class="secondary">카테고리 미리보기</button>
+        <button id="syncCatBtn" type="button" class="secondary">미리보기 카테고리 적용</button>
+      </div>
+      <div id="statusLine" class="status-line" style="margin-top:10px;">대기 중</div>
+      <div class="progress-shell"><div id="progressBar" class="progress-bar"></div></div>
+    </section>
+
+    <section class="metrics">
+      <div class="metric"><span>상태</span><strong id="mStatus">-</strong></div>
+      <div class="metric"><span>탐색</span><strong id="mScan">0</strong></div>
+      <div class="metric"><span>수집</span><strong id="mCollection">0</strong></div>
+      <div class="metric good"><span>저장</span><strong id="mSave">0</strong></div>
+      <div class="metric good"><span>학습</span><strong id="mStudy">0</strong></div>
+      <div class="metric warn"><span>파일</span><strong id="mFiles">0</strong></div>
+      <div class="metric warn"><span>파일중복</span><strong id="mFileDup">0</strong></div>
+    </section>
+
+    <section class="preview-panel">
+      <div class="preview-head">
+        <strong>URL별 첨부파일 / 학습여부</strong>
+        <span id="attachmentMeta" class="preview-meta">탐색 URL을 가져온 뒤 첨부파일 목록 조회를 실행하세요.</span>
+      </div>
+      <div class="preview-table-wrap">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th style="width:70px;">번호</th>
+              <th>source_url</th>
+              <th>메타데이터</th>
+              <th>첨부파일</th>
+              <th style="width:90px;">학습</th>
+              <th style="width:110px;">LEARN ID</th>
+              <th style="width:120px;">상태</th>
+            </tr>
+          </thead>
+          <tbody id="attachmentRows">
+            <tr><td colspan="7">첨부파일 목록 조회 결과가 여기에 표시됩니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="preview-panel">
+      <div class="preview-head">
+        <strong>탐색 DB type=post URL</strong>
+        <span id="explorationMeta" class="preview-meta">ASADAL_CRAWLING_EXPLORATION의 type=post URL을 표시합니다.</span>
+      </div>
+      <div class="preview-table-wrap">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th style="width:70px;">ID</th>
+              <th>URL</th>
+              <th style="width:90px;">type</th>
+              <th style="width:180px;">등록일</th>
+              <th style="width:110px;">활성</th>
+              <th style="width:130px;">병합 상태</th>
+            </tr>
+          </thead>
+          <tbody id="explorationRows">
+            <tr><td colspan="6">탐색 DB URL 가져오기를 실행하면 결과가 표시됩니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="preview-panel">
+      <div class="preview-head">
+        <strong>URL 매칭 카테고리 미리보기</strong>
+        <span id="categoryPreviewMeta" class="preview-meta">기준 URL에 매칭되는 파일 카테고리만 표시합니다.</span>
+      </div>
+      <div class="preview-table-wrap">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th style="width:70px;">ID</th>
+              <th>파일명</th>
+              <th>원본페이지(source)</th>
+              <th>원본 카테고리</th>
+              <th>파일학습 카테고리(적용 예정)</th>
+              <th style="width:90px;">적용</th>
+              <th>사유</th>
+            </tr>
+          </thead>
+          <tbody id="categoryPreviewRows">
+            <tr><td colspan="7">카테고리 미리보기를 실행하면 결과가 표시됩니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="logpanel">
+      <div class="loghead">
+        <strong>크롤링 로그</strong>
+        <button id="clearLogBtn" type="button" class="secondary">로그 지우기</button>
+      </div>
+      <div id="log" class="loglist">
+        <div class="status-line">아직 로그가 없습니다.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    let eventSource = null;
+    let statusPollTimer = null;
+    let activeJobId = "";
+    let logLines = [];
+    let explorationRows = [];
+    let attachmentPosts = [];
+    let categoryPreviewRows = [];
+    let lastAttachmentLearningDebugKey = "";
+    let runtimeFileDuplicateReuseCount = 0;
+    let runtimeFileDuplicateReuseSamples = [];
+    let lastMetricValues = {
+      scan: 0,
+      collection: 0,
+      save: 0,
+      study: 0,
+      files: 0,
+      fileDup: 0
+    };
+    let metricTotals = {
+      scan: 0,
+      collection: 0,
+      save: 0,
+      study: 0,
+      files: 0,
+      fileDup: 0
+    };
+    let metricJobSnapshots = {};
+
+    function now() {
+      return new Date().toLocaleTimeString("ko-KR", { hour12: false });
+    }
+
+    function log(message, data, kind = "") {
+      const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
+      logLines.unshift({ text: `${now()} ${message}${suffix}`, kind });
+      logLines = logLines.slice(0, 80);
+      $("log").innerHTML = logLines
+        .map(item => `<div class="logline ${item.kind || ""}">${escapeHtml(item.text)}</div>`)
+        .join("") || '<div class="status-line">아직 로그가 없습니다.</div>';
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function apiBase() {
+      return $("apiBase").value.trim().replace(/\/+$/, "");
+    }
+
+    function dbUrlLimit() {
+      const parsed = Number.parseInt($("explorationLimit").value, 10);
+      if (!Number.isFinite(parsed)) return 10000;
+      return Math.max(1, Math.min(50000, parsed));
+    }
+
+    function dbUrlOffset() {
+      const parsed = Number.parseInt($("explorationOffset").value, 10);
+      if (!Number.isFinite(parsed)) return 0;
+      return Math.max(0, Math.min(10000000, parsed));
+    }
+
+    function useDateFilter() {
+      return $("method").value !== "all";
+    }
+
+    function applyDateFilterPayload(target) {
+      if (!useDateFilter()) return target;
+      const start = $("dateStart").value;
+      const end = $("dateEnd").value;
+      if (start && end) {
+        target.start_urls_target_date = [start, end];
+        target.target_date = [start, end];
+      }
+      return target;
+    }
+
+    function restoreSavedInputs() {
+      ["dbName", "chatBotId", "apiBase", "contentsUrl", "explorationLimit", "explorationOffset"].forEach(id => {
+        try {
+          const saved = localStorage.getItem(`fileDashboard:${id}`);
+          if (saved !== null && saved !== "") $(id).value = saved;
+        } catch (_) {}
+      });
+    }
+
+    function saveInputs() {
+      ["dbName", "chatBotId", "apiBase", "contentsUrl", "explorationLimit", "explorationOffset"].forEach(id => {
+        try {
+          localStorage.setItem(`fileDashboard:${id}`, $(id).value.trim());
+        } catch (_) {}
+      });
+    }
+
+    async function readJsonResponse(res) {
+      const text = await res.text();
+      if (!text) return {};
+      try { return JSON.parse(text); }
+      catch (_) { return { raw: text }; }
+    }
+
+    async function postJson(path, body) {
+      const res = await fetch(`${apiBase()}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {})
+      });
+      return { res, data: await readJsonResponse(res) };
+    }
+
+    function stopStatusPolling() {
+      if (statusPollTimer) {
+        clearInterval(statusPollTimer);
+        statusPollTimer = null;
+      }
+    }
+
+    function makeJobId() {
+      const rand = typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      return `file-dashboard-${rand}`;
+    }
+
+    function todayInputValue() {
+      const d = new Date();
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      return `${yyyy}-${mm}-${dd}`;
+    }
+
+    function hostOf(rawUrl) {
+      try { return new URL(rawUrl).host; }
+      catch (_) { return ""; }
+    }
+
+    function normalizeUrlForMatch(value) {
+      const text = String(value || "").trim();
+      if (!text) return "";
+      try {
+        const url = new URL(text);
+        const host = url.host.toLowerCase().replace(/^www\./, "");
+        const path = url.pathname.replace(/\/+$/, "") || "/";
+        const params = Array.from(url.searchParams.entries())
+          .filter(([key]) => String(key || "").trim())
+          .map(([key, val]) => [String(key).toLowerCase(), String(val).toLowerCase()]);
+        params.sort((a, b) => `${a[0]}=${a[1]}`.localeCompare(`${b[0]}=${b[1]}`));
+        const search = params.length
+          ? `?${params.map(([key, val]) => `${encodeURIComponent(key)}=${encodeURIComponent(val)}`).join("&")}`
+          : "";
+        return `${host}${path}${search}`.toLowerCase();
+      } catch (_) {
+        return text.replace(/^https?:\/\//i, "").replace(/^www\./i, "").replace(/\/+$/, "").toLowerCase();
+      }
+    }
+
+    function urlMatchVariants(value) {
+      const normalized = normalizeUrlForMatch(value);
+      if (!normalized) return [];
+      const variants = new Set([normalized]);
+      try {
+        const url = new URL(String(value || "").trim());
+        const host = url.host.toLowerCase().replace(/^www\./, "");
+        const path = url.pathname.replace(/\/+$/, "") || "/";
+        const params = new URLSearchParams(url.search);
+        ["pageIndex", "page", "pageNo", "pageUnit"].forEach(key => params.delete(key));
+        const sorted = Array.from(params.entries())
+          .map(([key, val]) => [String(key).toLowerCase(), String(val).toLowerCase()])
+          .sort((a, b) => `${a[0]}=${a[1]}`.localeCompare(`${b[0]}=${b[1]}`));
+        variants.add(`${host}${path}`);
+        if (sorted.length) {
+          variants.add(`${host}${path}?${sorted.map(([key, val]) => `${encodeURIComponent(key)}=${encodeURIComponent(val)}`).join("&")}`);
+        }
+        const keyParams = ["nttid", "ntt_id", "bbsno", "bbsid", "menuid", "menuno", "q_bbscttsn", "q_bbscode", "seq", "idx", "article_no"];
+        const lowered = new Map(Array.from(url.searchParams.entries()).map(([key, val]) => [String(key).toLowerCase(), String(val).toLowerCase()]));
+        keyParams.forEach(key => {
+          if (lowered.get(key)) variants.add(`${host}${path}?${key}=${encodeURIComponent(lowered.get(key))}`);
+        });
+      } catch (_) {}
+      return Array.from(variants).filter(Boolean);
+    }
+
+    function rowUrlCandidates(row) {
+      return [
+        row.source_url,
+        row.pg_source_url,
+        row.content
+      ].filter(value => String(value || "").trim());
+    }
+
+    function rowMatchesTargetUrl(row, targetUrl) {
+      const targetVariants = urlMatchVariants(targetUrl);
+      if (!targetVariants.length) return false;
+      return rowUrlCandidates(row).some(value => {
+        const rowVariants = urlMatchVariants(value);
+        return rowVariants.some(rowValue =>
+          targetVariants.some(target =>
+            rowValue === target || rowValue.includes(target) || target.includes(rowValue)
+          )
+        );
+      });
+    }
+
+    function buildPayload(options = {}) {
+      const dbName = $("dbName").value.trim();
+      const chatBotId = $("chatBotId").value.trim();
+      const contentsUrl = String(options.contentsUrl || $("contentsUrl").value || "").trim();
+      if (!dbName) throw new Error("데이터베이스를 입력하세요.");
+      if (!chatBotId) throw new Error("챗봇 ID를 입력하세요.");
+      if (!contentsUrl) throw new Error("기준 URL을 입력하세요.");
+
+      const jobId = String(options.jobId || $("jobId").value.trim() || makeJobId()).trim();
+      if (!options.keepJobInput) $("jobId").value = jobId;
+      const payload = {
+        job_id: jobId,
+        db_name: dbName,
+        dbname: dbName,
+        account_name: dbName,
+        chat_bot_id: chatBotId,
+        colle: "file",
+        ui_colle: "file",
+        content_type: "file",
+        crawl_mode: "crawling",
+        method: $("method").value,
+        contents: [contentsUrl],
+        contents_url: contentsUrl,
+        target_domains: hostOf(contentsUrl) ? [hostOf(contentsUrl)] : undefined,
+        start_urls_order: $("order").value,
+        learn_list_duplicate_exclude_enabled: $("dedupe").checked,
+        file_dashboard: true,
+        enable_learning: true
+      };
+      const scopePath = $("scopePath").value.trim();
+      if (scopePath) payload.scope_path_prefix = scopePath;
+      applyDateFilterPayload(payload);
+      if ($("directDetail").checked) {
+        payload.probe_direct_detail = true;
+        payload.file_probe_direct_detail = true;
+        payload.start_urls_override = [{ url: contentsUrl, type: "post", source: "file_dashboard_single" }];
+        payload.start_urls_override_source = "file_dashboard_single";
+        payload.pre_explored_start_urls_count = 1;
+        payload.exploration_display_count_fixed = true;
+        payload.exploration_display_max_count = 1;
+      }
+      return payload;
+    }
+
+    function setStatus(text) {
+      $("statusLine").textContent = text;
+    }
+
+    function setJob(jobId) {
+      activeJobId = jobId || "";
+      $("jobPill").textContent = activeJobId || "작업 없음";
+    }
+
+    function numberValue(value) {
+      const n = Number(value || 0);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function emptyMetricValues() {
+      return {
+        scan: 0,
+        collection: 0,
+        save: 0,
+        study: 0,
+        files: 0,
+        fileDup: 0
+      };
+    }
+
+    function resetMetricValues() {
+      lastMetricValues = emptyMetricValues();
+      metricTotals = emptyMetricValues();
+      metricJobSnapshots = {};
+      runtimeFileDuplicateReuseCount = 0;
+      runtimeFileDuplicateReuseSamples = [];
+      lastAttachmentLearningDebugKey = "";
+      $("mScan").textContent = "0";
+      $("mCollection").textContent = "0";
+      $("mSave").textContent = "0";
+      $("mStudy").textContent = "0";
+      $("mFiles").textContent = "0";
+      $("mFileDup").textContent = "0";
+      $("progressBar").style.width = "0%";
+    }
+
+    function metricCount(data, keys) {
+      for (const key of keys || []) {
+        if (hasCount(data, key)) return numberValue(data[key]);
+      }
+      return null;
+    }
+
+    function applyCumulativeMetric(jobId, key, rawValue) {
+      if (rawValue === null || rawValue === undefined) return metricTotals[key] || 0;
+      const stableJobId = jobId || activeJobId || "default";
+      const snapshot = metricJobSnapshots[stableJobId] || emptyMetricValues();
+      const previous = numberValue(snapshot[key]);
+      const next = numberValue(rawValue);
+      if (next > previous) {
+        metricTotals[key] = numberValue(metricTotals[key]) + (next - previous);
+        snapshot[key] = next;
+        metricJobSnapshots[stableJobId] = snapshot;
+      }
+      return metricTotals[key] || 0;
+    }
+
+    function statusText(value) {
+      const key = String(value || "").trim().toLowerCase();
+      const labels = {
+        accepted: "접수됨",
+        start: "시작",
+        starting: "시작 중",
+        running: "진행 중",
+        completed: "완료",
+        complete: "완료",
+        cancelled: "취소됨",
+        canceled: "취소됨",
+        stop: "중단",
+        stopped: "중단됨",
+        error: "오류",
+        failed: "실패",
+        fail: "실패",
+        exploring: "탐색 중",
+        workflow_completed: "작업 완료"
+      };
+      return labels[key] || value || "-";
+    }
+
+    function updateMetrics(data, { jobId = activeJobId } = {}) {
+      const status = data.status || data.event || "-";
+      const scan = applyCumulativeMetric(jobId, "scan", metricCount(data, ["scan_count", "total_count"]));
+      const collection = applyCumulativeMetric(jobId, "collection", metricCount(data, ["collection_count"]));
+      const save = applyCumulativeMetric(jobId, "save", metricCount(data, ["save_count", "save_done_count"]));
+      const study = applyCumulativeMetric(jobId, "study", metricCount(data, ["study_count", "study_success_count"]));
+      const files = applyCumulativeMetric(jobId, "files", metricCount(data, [
+        "file_attachment_enqueued_count",
+        "file_attachment_found_count",
+        "file_attachment_candidate_count",
+        "attachment_count"
+      ]));
+      const fileDup = applyCumulativeMetric(jobId, "fileDup", metricCount(data, [
+        "file_duplicate_reuse_learned_count",
+        "reused_learned_count"
+      ]));
+      if (fileDup > runtimeFileDuplicateReuseCount) runtimeFileDuplicateReuseCount = fileDup;
+      lastMetricValues = {
+        scan,
+        collection,
+        save,
+        study,
+        files,
+        fileDup: Math.max(fileDup, runtimeFileDuplicateReuseCount)
+      };
+      $("mStatus").textContent = statusText(status);
+      $("mScan").textContent = scan.toLocaleString();
+      $("mCollection").textContent = collection.toLocaleString();
+      $("mSave").textContent = save.toLocaleString();
+      $("mStudy").textContent = study.toLocaleString();
+      $("mFiles").textContent = files.toLocaleString();
+      $("mFileDup").textContent = lastMetricValues.fileDup.toLocaleString();
+      const denom = Math.max(scan, 1);
+      const pct = Math.max(0, Math.min(100, Math.round((Math.max(collection, save, study) / denom) * 100)));
+      $("progressBar").style.width = `${pct}%`;
+    }
+
+    function closeSse() {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+    }
+
+    function statusPayloadFromSnapshot(data) {
+      return {
+        ...(data.history || {}),
+        ...(data.memory_state || {}),
+        ...(data.stats || {}),
+        status: data.history?.status || data.workflow?.final_status || data.memory_state?.status || (data.running ? "running" : "completed")
+      };
+    }
+
+    function hasCount(data, key) {
+      return Object.prototype.hasOwnProperty.call(data || {}, key) && data[key] !== null && data[key] !== undefined && data[key] !== "";
+    }
+
+    function countValue(data, primary, fallback) {
+      if (hasCount(data, primary)) return numberValue(data[primary]);
+      if (hasCount(data, fallback)) return numberValue(data[fallback]);
+      return 0;
+    }
+
+    function firstValue(data, keys, fallback = "") {
+      for (const key of keys || []) {
+        if (hasCount(data, key)) return data[key];
+      }
+      return fallback;
+    }
+
+    function normalizeAttachmentUrlKey(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      try {
+        const u = new URL(raw, window.location.href);
+        u.hash = "";
+        const entries = Array.from(u.searchParams.entries())
+          .map(([key, val]) => [String(key).toLowerCase(), String(val).toLowerCase()])
+          .sort((a, b) => `${a[0]}=${a[1]}`.localeCompare(`${b[0]}=${b[1]}`));
+        const search = entries.length
+          ? `?${entries.map(([key, val]) => `${encodeURIComponent(key)}=${encodeURIComponent(val)}`).join("&")}`
+          : "";
+        return `${u.protocol}//${u.host.toLowerCase()}${u.pathname}${search}`.toLowerCase();
+      } catch (_) {
+        return raw.toLowerCase();
+      }
+    }
+
+    function duplicateSampleForAttachment(item) {
+      const itemKey = normalizeAttachmentUrlKey(item?.href || item?.url || "");
+      if (!itemKey) return null;
+      for (const sample of runtimeFileDuplicateReuseSamples || []) {
+        const sampleKey = normalizeAttachmentUrlKey(sample?.url || sample?.href || "");
+        if (sampleKey && sampleKey === itemKey) return sample;
+      }
+      return null;
+    }
+
+    function isDocumentAttachment(item) {
+      const raw = [
+        item?.name,
+        item?.title,
+        item?.text,
+        item?.href,
+        item?.url
+      ].map(value => String(value || "").toLowerCase()).join(" ");
+      return /\.(pdf|hwp|hwpx|xls|xlsx|csv|doc|docx|ppt|pptx|txt|zip|rar|7z)(?:$|[?#\s&])/i.test(raw)
+        || /nd_filedownload\.do|filedown|filedownload|downloadbbsfile|atchfile|atchmnflno|q_fileid|q_filesn/i.test(raw);
+    }
+
+    function countDocumentAttachments(posts) {
+      let total = 0;
+      for (const post of posts || []) {
+        const attachments = Array.isArray(post?.attachments) ? post.attachments : [];
+        total += attachments.filter(isDocumentAttachment).length;
+      }
+      return total;
+    }
+
+    function debugAttachmentLearningGap(payload, { jobId = activeJobId, running = false, source = "status" } = {}) {
+      const found = countValue(payload, "file_attachment_found_count", "attachment_count");
+      const candidates = countValue(payload, "file_attachment_candidate_count", "file_attachment_raw_count");
+      const enqueued = countValue(payload, "file_attachment_enqueued_count", "attachment_count");
+      const save = countValue(payload, "save_count", "save_done_count");
+      const studySuccess = countValue(payload, "study_success_count", "study_count");
+      const studyDone = countValue(payload, "study_done_count", "study_count");
+      const studySkipped = numberValue(payload.study_skipped_count);
+      const studyFailed = numberValue(payload.study_failed_count);
+      const downloadSkipped = numberValue(payload.file_download_skipped_count);
+      const duplicateReuse = numberValue(payload.file_duplicate_reuse_learned_count || 0);
+      const attachmentTotal = Math.max(found, candidates, enqueued);
+      const saveGap = attachmentTotal > 0 && save < attachmentTotal;
+      const studyGap = save > 0 && studySuccess < save;
+      const finalGap = !running && attachmentTotal > 0 && (saveGap || studyGap || studySkipped || studyFailed || downloadSkipped);
+      const liveGap = running && attachmentTotal > 0 && (downloadSkipped || studySkipped || studyFailed);
+      if (!finalGap && !liveGap) return;
+
+      const debug = {
+        job_id: jobId,
+        source,
+        running,
+        attachment_total: attachmentTotal,
+        attachment_found: found,
+        attachment_candidates: candidates,
+        attachment_enqueued: enqueued,
+        save,
+        study_success: studySuccess,
+        study_done: studyDone,
+        study_skipped: studySkipped,
+        study_failed: studyFailed,
+        download_skipped: downloadSkipped,
+        file_duplicate_reuse_learned: duplicateReuse,
+        enable_db_save: firstValue(payload, ["enable_db_save"], ""),
+        file_pipeline_skip_learning: firstValue(payload, ["file_pipeline_skip_learning"], ""),
+        study_skip_reason: firstValue(payload, ["study_skip_reason", "file_study_skip_reason"], ""),
+        study_skip_detail: firstValue(payload, ["study_skip_detail", "file_study_skip_detail"], ""),
+        study_fail_reason: firstValue(payload, ["study_fail_reason", "file_study_fail_reason"], ""),
+        study_fail_detail: firstValue(payload, ["study_fail_detail", "file_study_fail_detail"], ""),
+        study_skip_samples: firstValue(payload, ["study_skip_samples"], []),
+        study_issue_samples: firstValue(payload, ["study_issue_samples"], []),
+        file_download_skipped_samples: firstValue(payload, ["file_download_skipped_samples"], [])
+      };
+      const duplicateSamples = [
+        ...(Array.isArray(debug.study_skip_samples) ? debug.study_skip_samples : []),
+        ...(Array.isArray(debug.study_issue_samples) ? debug.study_issue_samples : [])
+      ].filter(sample => String(sample?.reason || "").includes("duplicate"));
+      if (duplicateReuse > 0 || duplicateSamples.length) {
+        runtimeFileDuplicateReuseCount = Math.max(
+          runtimeFileDuplicateReuseCount,
+          duplicateReuse,
+          duplicateSamples.length
+        );
+        const merged = [...runtimeFileDuplicateReuseSamples, ...duplicateSamples];
+        const seen = new Set();
+        runtimeFileDuplicateReuseSamples = merged.filter(sample => {
+          const sampleKey = normalizeAttachmentUrlKey(sample?.url || sample?.href || "") || JSON.stringify(sample);
+          if (seen.has(sampleKey)) return false;
+          seen.add(sampleKey);
+          return true;
+        }).slice(-20);
+        lastMetricValues.fileDup = Math.max(lastMetricValues.fileDup, runtimeFileDuplicateReuseCount);
+        metricTotals.fileDup = Math.max(metricTotals.fileDup, lastMetricValues.fileDup);
+        $("mFileDup").textContent = lastMetricValues.fileDup.toLocaleString();
+      }
+      const key = JSON.stringify({
+        job_id: jobId,
+        running,
+        attachment_total: attachmentTotal,
+        save,
+        study_success: studySuccess,
+        study_skipped: studySkipped,
+        study_failed: studyFailed,
+        download_skipped: downloadSkipped,
+        duplicate_reuse: duplicateReuse,
+        study_skip_reason: debug.study_skip_reason,
+        study_fail_reason: debug.study_fail_reason
+      });
+      if (key === lastAttachmentLearningDebugKey) return;
+      lastAttachmentLearningDebugKey = key;
+      log("attachment save/study gap debug", debug, finalGap ? "error" : "warn");
+    }
+
+    async function pollCrawlStatusOnce(jobId = activeJobId) {
+      if (!jobId) return;
+      const { res, data } = await postJson("/backend/file-dashboard/crawl-status", { job_id: jobId });
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const payload = statusPayloadFromSnapshot(data);
+      updateMetrics(payload, { jobId });
+      debugAttachmentLearningGap(payload, { jobId, running: Boolean(data.running), source: "poll" });
+      log("status poll", {
+        job_id: jobId,
+        running: data.running,
+        status: payload.status,
+        scan: countValue(payload, "scan_count", "total_count"),
+        save: countValue(payload, "save_count", "save_done_count"),
+        study: countValue(payload, "study_success_count", "study_count"),
+        study_skipped: numberValue(payload.study_skipped_count),
+        study_failed: numberValue(payload.study_failed_count),
+        study_skip_reason: firstValue(payload, ["study_skip_reason", "file_study_skip_reason"], ""),
+        study_fail_reason: firstValue(payload, ["study_fail_reason", "file_study_fail_reason"], ""),
+        file_pipeline_skip_learning: firstValue(payload, ["file_pipeline_skip_learning"], "")
+      }, data.running ? "" : "ok");
+      if (!data.running) {
+        stopStatusPolling();
+        setStatus(`polling finished: ${statusText(payload.status)}`);
+        if (explorationRows.length || $("contentsUrl").value.trim()) {
+          fetchAttachmentLists().catch(err => {
+            log("final attachment refresh failed", { error: err.message || String(err) }, "error");
+          });
+        }
+      }
+    }
+
+    function startStatusPolling(jobId = activeJobId) {
+      if (!jobId) throw new Error("job_id is required for status polling");
+      stopStatusPolling();
+      setStatus(`HTTP status polling: ${jobId}`);
+      log("HTTP polling start", { job_id: jobId });
+      pollCrawlStatusOnce(jobId).catch(err => {
+        log("status poll failed", { error: err.message || String(err) }, "error");
+      });
+      statusPollTimer = setInterval(() => {
+        pollCrawlStatusOnce(jobId).catch(err => {
+          log("status poll failed", { error: err.message || String(err) }, "error");
+        });
+      }, 4000);
+    }
+
+    function connectSse(jobId = activeJobId) {
+      const dbName = $("dbName").value.trim();
+      if (!jobId) throw new Error("작업 ID가 없습니다.");
+      if (!dbName) throw new Error("데이터베이스를 입력하세요.");
+      stopStatusPolling();
+      closeSse();
+      const url = `${apiBase()}/c1/crawl_sse/${encodeURIComponent(dbName)}/${encodeURIComponent(jobId)}`;
+      eventSource = new EventSource(url);
+      setStatus(`실시간 연결 중: ${jobId}`);
+      log("실시간 연결", { url });
+      eventSource.onmessage = event => {
+        let data = {};
+        try { data = JSON.parse(event.data || "{}"); }
+        catch (_) { data = { raw: event.data }; }
+        updateMetrics(data, { jobId });
+        debugAttachmentLearningGap(data, { jobId, running: true, source: "sse" });
+        const terminal = ["completed", "cancelled", "error", "stop", "stopped"].includes(String(data.status || "").toLowerCase())
+          || data.event === "workflow_completed";
+        log("실시간 메시지", data, terminal ? "ok" : "");
+        if (terminal) {
+          setStatus(`종료: ${statusText(data.status || data.event)}`);
+          closeSse();
+        }
+      };
+      eventSource.onerror = () => {
+        setStatus("SSE blocked or failed. Switched to HTTP polling.");
+        log("SSE blocked; switched to HTTP polling", undefined, "error");
+        closeSse();
+        try { startStatusPolling(jobId); } catch (_) {}
+      };
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function startFileCrawlPayload(payload) {
+      const { res, data } = await postJson("/backend/session/start", payload);
+      if (!res.ok || !["accepted", "start", "completed"].includes(String(data.status || "").toLowerCase())) {
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      }
+      return { res, data };
+    }
+
+    async function waitForFileCrawlJob(jobId) {
+      while (true) {
+        const { res, data } = await postJson("/backend/file-dashboard/crawl-status", { job_id: jobId });
+        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        const payload = statusPayloadFromSnapshot(data);
+        updateMetrics(payload, { jobId });
+        debugAttachmentLearningGap(payload, { jobId, running: Boolean(data.running), source: "list-poll" });
+        log("list item status poll", {
+          job_id: jobId,
+          running: data.running,
+          status: payload.status,
+          scan: countValue(payload, "scan_count", "total_count"),
+          save: countValue(payload, "save_count", "save_done_count"),
+          study: countValue(payload, "study_success_count", "study_count"),
+          study_skipped: numberValue(payload.study_skipped_count),
+          study_failed: numberValue(payload.study_failed_count),
+          study_skip_reason: firstValue(payload, ["study_skip_reason", "file_study_skip_reason"], ""),
+          study_fail_reason: firstValue(payload, ["study_fail_reason", "file_study_fail_reason"], "")
+        }, data.running ? "" : "ok");
+        if (!data.running) return payload;
+        await sleep(4000);
+      }
+    }
+
+    async function startCrawl() {
+      try {
+        const payload = buildPayload();
+        resetMetricValues();
+        setJob(payload.job_id);
+        setStatus("파일 크롤링 시작 요청 중");
+        log("시작 요청", {
+          job_id: payload.job_id,
+          db_name: payload.db_name,
+          contents_url: payload.contents_url,
+          direct: Boolean(payload.probe_direct_detail)
+        });
+        const { res, data } = await startFileCrawlPayload(payload);
+        log("시작 응답", data, res.ok ? "ok" : "error");
+        if (!res.ok || !["accepted", "start", "completed"].includes(String(data.status || "").toLowerCase())) {
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        }
+        setStatus(`작업 등록됨: ${data.job_id || payload.job_id}`);
+        startStatusPolling(data.job_id || payload.job_id);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        log("시작 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    async function stopCrawl() {
+      try {
+        const jobId = activeJobId || $("jobId").value.trim();
+        if (!jobId) throw new Error("중단할 작업 ID가 없습니다.");
+        setStatus("중단 요청 중");
+        const { res, data } = await postJson(`/c1/crawl_stop/${encodeURIComponent(jobId)}`, {});
+        log("중단 응답", data, res.ok ? "ok" : "error");
+        if (!res.ok) throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        setStatus(`중단 요청 완료: ${jobId}`);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        log("중단 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    async function categoryAction(path, label) {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        const { res, data } = await postJson(path, {
+          db_name: dbName,
+          dbname: dbName,
+          account_name: dbName,
+          chat_bot_id: chatBotId,
+          access_url: $("contentsUrl").value.trim()
+        });
+        log(label, data, res.ok ? "ok" : "error");
+        if (!res.ok) throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        setStatus(`${label} 완료`);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        log(`${label} 실패`, { error: err.message || String(err) }, "error");
+      }
+    }
+
+    function renderExplorationRows(rows, metaText) {
+      $("explorationMeta").textContent = metaText;
+      if (!rows.length) {
+        $("explorationRows").innerHTML = '<tr><td colspan="6">조회된 type=post URL이 없습니다.</td></tr>';
+        return;
+      }
+      $("explorationRows").innerHTML = rows.map(row => {
+        const regDate = row.reg_date || row.created_at || row.updated_at || "-";
+        const active = row.is_active === undefined || row.is_active === null ? "-" : (Number(row.is_active) ? "예" : "아니오");
+        return `
+          <tr>
+            <td>${escapeHtml(row.id || "")}</td>
+            <td class="preview-url">${escapeHtml(row.url || "")}</td>
+            <td>${escapeHtml(row.type || "")}</td>
+            <td>${escapeHtml(regDate)}</td>
+            <td>${escapeHtml(active)}</td>
+            <td>${escapeHtml(row.merge_status || "-")}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function formatCategoryCodeName(code, name) {
+      const cleanCode = String(code || "").trim();
+      const cleanName = String(name || "").trim();
+      if (!cleanCode) return "";
+      return cleanName ? `${cleanCode} (${cleanName})` : cleanCode;
+    }
+
+    function formatCategoryPair(code1, code2, name1, name2, emptyText = "-") {
+      return [
+        formatCategoryCodeName(code1, name1),
+        formatCategoryCodeName(code2, name2)
+      ].filter(Boolean).join(" / ") || emptyText;
+    }
+
+    async function fetchExplorationPosts() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        const limit = dbUrlLimit();
+        const offset = dbUrlOffset();
+        if (!dbName) throw new Error("데이터베이스를 입력하세요.");
+        setStatus(`탐색 DB type=post URL 조회 중: ${offset.toLocaleString()}번부터 최대 ${limit.toLocaleString()}개`);
+        renderExplorationRows([], "조회 중입니다.");
+        const { res, data } = await postJson("/backend/file-dashboard/exploration-posts", {
+          db_name: dbName,
+          dbname: dbName,
+          account_name: dbName,
+          chat_bot_id: chatBotId,
+          method: $("method").value,
+          ...applyDateFilterPayload({}),
+          limit,
+          db_url_limit: limit,
+          offset
+        });
+        log("탐색 DB URL 조회 응답", {
+          status: data.status,
+          total: data.total,
+          returned: data.returned,
+          limit: data.limit,
+          offset: data.offset,
+          date_filter: data.date_filter,
+          table: data.table
+        }, res.ok ? "ok" : "error");
+        if (!res.ok || String(data.status || "").toLowerCase() !== "success") {
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        }
+        attachmentPosts = [];
+        explorationRows = Array.isArray(data.rows) ? data.rows : [];
+        if (!$("contentsUrl").value.trim() && explorationRows[0]?.url) {
+          $("contentsUrl").value = explorationRows[0].url;
+        }
+        renderExplorationRows(
+          explorationRows,
+          `전체 ${Number(data.total || 0).toLocaleString()}개 중 ${Number(data.offset || 0).toLocaleString()}번부터 ${explorationRows.length.toLocaleString()}개 표시`
+        );
+        setStatus(`탐색 DB URL 조회 완료: ${Number(data.offset || 0).toLocaleString()}번부터 ${explorationRows.length.toLocaleString()}개`);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        renderExplorationRows([], "조회 실패");
+        log("탐색 DB URL 조회 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    async function fetchNextExplorationPosts() {
+      const nextOffset = dbUrlOffset() + dbUrlLimit();
+      $("explorationOffset").value = String(nextOffset);
+      saveInputs();
+      await fetchExplorationPosts();
+    }
+
+    async function fetchPgMissingTargets() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        const targetUrl = $("contentsUrl").value.trim();
+        const limit = dbUrlLimit();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        if (!targetUrl) throw new Error("기준 URL을 입력하세요.");
+        setStatus(`PG 미학습 크롤링 대상 조회 중: 최대 ${limit.toLocaleString()}개`);
+        renderExplorationRows([], "PG 미학습 크롤링 대상 조회 중입니다.");
+        const body = {
+          db_name: dbName,
+          dbname: dbName,
+          account_name: dbName,
+          chat_bot_id: chatBotId,
+          contents: [targetUrl],
+          contents_url: targetUrl,
+          access_url: targetUrl,
+          content_relearn_limit: limit,
+          content_relearn_only_missing_pg: true,
+          content_relearn_match_pg_content_metadata: true
+        };
+        applyDateFilterPayload(body);
+        const { res, data } = await postJson("/backend/file-dashboard/pg-missing-targets", body);
+        log("PG 미학습 대상 조회 응답", {
+          status: data.status,
+          returned: data.returned,
+          raw_count: data.raw_count,
+          duplicate_removed: data.duplicate_removed,
+          table: data.table,
+          pg_filter: data.pg_filter,
+          filter_source: data.filter_source
+        }, res.ok ? "ok" : "error");
+        if (!res.ok || String(data.status || "").toLowerCase() !== "success") {
+          throw new Error(data.error || data.reason || `HTTP ${res.status}`);
+        }
+        attachmentPosts = [];
+        explorationRows = (Array.isArray(data.rows) ? data.rows : [])
+          .map(row => ({
+            ...row,
+            id: row.learn_list_id || row.id || "",
+            url: row.url || row.content_value || row.content || "",
+            type: row.type || "partial_content_relearn",
+            is_active: 1,
+            merge_status: "pg_missing"
+          }))
+          .filter(row => row.url);
+        renderExplorationRows(
+          explorationRows,
+          `PG 미학습 순수 크롤링 대상 ${explorationRows.length.toLocaleString()}개 / 중복 제거 ${Number(data.duplicate_removed || 0).toLocaleString()}개`
+        );
+        setStatus(`PG 미학습 크롤링 대상 조회 완료: ${explorationRows.length.toLocaleString()}개`);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        explorationRows = [];
+        renderExplorationRows([], "PG 미학습 크롤링 대상 조회 실패");
+        log("PG 미학습 대상 조회 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    function compactMetadata(post, item) {
+      const metadata = item?.content_metadata || post?.content_metadata || {};
+      if (metadata && Object.keys(metadata).length) {
+        return JSON.stringify(metadata, null, 2);
+      }
+      const sourceUrl = item?.href || item?.url || post?.source_url || post?.url || "";
+      const dateValue = post?.reg_date || new Date().toISOString().slice(0, 19).replace("T", " ");
+      const fallback = {
+        source_url: sourceUrl,
+        created_at: dateValue,
+        updated_at: dateValue,
+        content_created_at: dateValue,
+        content_updated_at: dateValue,
+        date_rerank_target: true,
+        source_category: "file",
+        update_frequency: "1_day"
+      };
+      return JSON.stringify(fallback, null, 2);
+    }
+
+    function renderAttachmentPosts(posts, metaText) {
+      $("attachmentMeta").textContent = metaText;
+      const lines = [];
+      for (const post of posts || []) {
+        const attachments = Array.isArray(post.attachments) ? post.attachments : [];
+        const sourceUrl = post.source_url || post.url || "";
+        if (!attachments.length) {
+          const metadataText = compactMetadata(post, null);
+          lines.push(`
+            <tr>
+              <td>-</td>
+              <td class="preview-url">${escapeHtml(sourceUrl)}</td>
+              <td class="preview-url">${escapeHtml(metadataText)}</td>
+              <td>${escapeHtml(post.title || "첨부파일 없음")}</td>
+              <td>-</td>
+              <td>-</td>
+              <td>${escapeHtml(post.status || "-")}</td>
+            </tr>
+          `);
+          continue;
+        }
+        attachments.forEach(item => {
+          const metadataText = compactMetadata(post, item);
+          const fileLabel = item.name || item.title || item.text || item.href || "-";
+          const runtimeDuplicate = duplicateSampleForAttachment(item);
+          const learnedDuplicate = Boolean((item.learned && item.matched) || runtimeDuplicate);
+          const matchInfo = item.matched
+            ? `match ${Number(item.match_count || 0).toLocaleString()}${item.match_method ? ` / ${item.match_method}` : ""}`
+            : (runtimeDuplicate ? "runtime duplicate" : "no match");
+          const statusPrefix = learnedDuplicate ? "duplicate reuse" : (item.learn_status || post.status || "-");
+          const statusText = [statusPrefix, item.learn_status ? `status ${item.learn_status}` : "", matchInfo].filter(Boolean).join(" / ");
+          const learnId = item.learn_list_id || runtimeDuplicate?.learn_list_id || "";
+          lines.push(`
+            <tr>
+              <td>${escapeHtml(item.index || "")}</td>
+              <td class="preview-url">${escapeHtml(sourceUrl)}</td>
+              <td class="preview-url">${escapeHtml(metadataText)}</td>
+              <td class="preview-url">${escapeHtml(fileLabel)}${item.href ? `<br>${escapeHtml(item.href)}` : ""}</td>
+              <td>${learnedDuplicate ? "중복/Y" : (item.learned ? "Y" : "-")}</td>
+              <td>${escapeHtml(learnId)}</td>
+              <td>${escapeHtml(statusText)}</td>
+            </tr>
+          `);
+        });
+      }
+      $("attachmentRows").innerHTML = lines.join("") || '<tr><td colspan="7">첨부파일 조회 결과가 없습니다.</td></tr>';
+    }
+
+    async function fetchAttachmentLists() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        const singleUrl = $("contentsUrl").value.trim();
+        const urls = explorationRows.length
+          ? explorationRows.map(row => row.url).filter(Boolean)
+          : (singleUrl ? [singleUrl] : []);
+        if (!urls.length) throw new Error("URL을 입력하거나 먼저 탐색 DB URL 가져오기를 실행하세요.");
+        setStatus(`첨부파일 목록 조회 중: ${urls.length.toLocaleString()}개 URL`);
+        $("attachmentRows").innerHTML = '<tr><td colspan="7">첨부파일 조회 중입니다.</td></tr>';
+        const { res, data } = await postJson("/backend/file-dashboard/post-attachments", {
+          db_name: dbName,
+          dbname: dbName,
+          chat_bot_id: chatBotId,
+          urls,
+          limit: urls.length,
+          concurrency: 8,
+          probe_timeout_sec: 6,
+          probe_fetch_timeout_sec: 4,
+          disable_playwright: true,
+          fast_probe: true
+        });
+        log("첨부파일 목록 조회 응답", {
+          status: data.status,
+          count: data.count,
+          attachments: (data.posts || []).reduce((sum, post) => sum + Number(post.attachment_count || 0), 0),
+          learned: (data.posts || []).reduce((sum, post) => sum + Number(post.learned_count || 0), 0)
+        }, res.ok ? "ok" : "error");
+        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        attachmentPosts = Array.isArray(data.posts) ? data.posts : [];
+        const attachmentCount = attachmentPosts.reduce((sum, post) => sum + Number(post.attachment_count || 0), 0);
+        const documentAttachmentCount = countDocumentAttachments(attachmentPosts);
+        const learnedCount = attachmentPosts.reduce((sum, post) => sum + Number(post.learned_count || 0), 0);
+        const duplicateLearnedCount = attachmentPosts.reduce((sum, post) => {
+          const attachments = Array.isArray(post.attachments) ? post.attachments : [];
+          return sum + attachments.filter(item => item && ((item.learned && item.matched) || duplicateSampleForAttachment(item))).length;
+        }, 0);
+        const displayDocumentAttachmentCount = Math.max(documentAttachmentCount, lastMetricValues.files);
+        const displayDuplicateCount = Math.max(duplicateLearnedCount, runtimeFileDuplicateReuseCount, lastMetricValues.fileDup);
+        $("mFiles").textContent = displayDocumentAttachmentCount.toLocaleString();
+        $("mFileDup").textContent = displayDuplicateCount.toLocaleString();
+        lastMetricValues.files = displayDocumentAttachmentCount;
+        lastMetricValues.fileDup = displayDuplicateCount;
+        metricTotals.files = Math.max(metricTotals.files, displayDocumentAttachmentCount);
+        metricTotals.fileDup = Math.max(metricTotals.fileDup, displayDuplicateCount);
+        renderAttachmentPosts(
+          attachmentPosts,
+          `URL ${attachmentPosts.length.toLocaleString()}개 / 첨부 ${attachmentCount.toLocaleString()}개 / 다운로드대상 ${documentAttachmentCount.toLocaleString()}개 / 학습 ${learnedCount.toLocaleString()}개 / 파일중복 ${displayDuplicateCount.toLocaleString()}개`
+        );
+        setStatus(`첨부파일 목록 조회 완료: 첨부 ${attachmentCount.toLocaleString()}개`);
+      } catch (err) {
+        setStatus(err.message || String(err));
+        renderAttachmentPosts([], "첨부파일 목록 조회 실패");
+        log("첨부파일 목록 조회 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    function buildFileCrawlTargets() {
+      const attachmentTargets = [];
+      for (const post of attachmentPosts || []) {
+        const sourceUrl = post.source_url || post.url || "";
+        const attachments = (Array.isArray(post.attachments) ? post.attachments : [])
+          .filter(item => item && (item.href || item.url))
+          .map(item => ({
+            href: item.href || item.url || "",
+            name: item.name || item.title || item.text || "",
+            title: item.title || item.name || item.text || "",
+            content_metadata: item.content_metadata || {}
+          }));
+        if (sourceUrl && attachments.length) {
+          attachmentTargets.push({
+            url: sourceUrl,
+            type: "post",
+            source: "file_dashboard_attachments",
+            title: post.title || "",
+            reg_date: post.reg_date || "",
+            author_info: post.author_info || {},
+            attachments
+          });
+        }
+      }
+      if (attachmentTargets.length) return attachmentTargets;
+      return explorationRows
+        .map(row => ({ url: row.url, type: row.type || "post", id: row.id }))
+        .filter(row => row.url);
+    }
+
+    function buildExplorationUrlTargets() {
+      return explorationRows
+        .map(row => ({ url: row.url, type: row.type || "post", id: row.id }))
+        .filter(row => row.url);
+    }
+
+    async function crawlExplorationList() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        const baseJobId = $("jobId").value.trim() || makeJobId();
+        $("jobId").value = baseJobId;
+        const targets = buildExplorationUrlTargets();
+        if (!targets.length) throw new Error("No crawl targets loaded.");
+        resetMetricValues();
+        setStatus(`전체목록 파일 크롤링 시작 요청 중: ${targets.length.toLocaleString()}개 URL`);
+        stopStatusPolling();
+        closeSse();
+        log("exploration list crawl sequential start", {
+          base_job_id: baseJobId,
+          target_count: targets.length,
+          mode: "same_as_start_button"
+        });
+        for (let i = 0; i < targets.length; i += 1) {
+          const target = targets[i];
+          const childJobId = `${baseJobId}-${String(i + 1).padStart(3, "0")}`;
+          const payload = buildPayload({
+            contentsUrl: target.url,
+            jobId: childJobId,
+            keepJobInput: true
+          });
+          setJob(payload.job_id);
+          setStatus(`전체목록 파일 크롤링 ${i + 1}/${targets.length}: ${target.url}`);
+          log("exploration list item start request", {
+            base_job_id: baseJobId,
+            job_id: payload.job_id,
+            index: i + 1,
+            total: targets.length,
+            contents_url: payload.contents_url,
+            target_id: target.id || ""
+          });
+          const { res, data } = await startFileCrawlPayload(payload);
+          log("exploration list item start response", {
+            job_id: data.job_id || payload.job_id,
+            status: data.status,
+            index: i + 1,
+            total: targets.length
+          }, res.ok ? "ok" : "error");
+          await waitForFileCrawlJob(data.job_id || payload.job_id);
+        }
+        setJob(baseJobId);
+        setStatus(`전체목록 파일 크롤링 완료: ${targets.length.toLocaleString()}개 URL`);
+        fetchAttachmentLists().catch(err => {
+          log("final attachment refresh failed", { error: err.message || String(err) }, "error");
+        });
+      } catch (err) {
+        setStatus(err.message || String(err));
+        log("전체목록 크롤링 시작 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    function renderCategoryPreview(rows, metaText) {
+      $("categoryPreviewMeta").textContent = metaText;
+      if (!rows.length) {
+        $("categoryPreviewRows").innerHTML = '<tr><td colspan="7">기준 URL에 매칭되는 파일 카테고리가 없습니다.</td></tr>';
+        return;
+      }
+      $("categoryPreviewRows").innerHTML = rows.map(row => {
+        const sourceCate = formatCategoryPair(
+          row.source_cate1,
+          row.source_cate2,
+          row.source_cate1_name,
+          row.source_cate2_name
+        );
+        const mappedCate = formatCategoryPair(
+          row.dry_run_cate1,
+          row.dry_run_cate2,
+          row.dry_run_cate1_name,
+          row.dry_run_cate2_name,
+          ""
+        );
+        const plannedCate = mappedCate || (sourceCate !== "-" ? `${sourceCate} (매핑 없음)` : "-");
+        const source = row.source_url || row.pg_source_url || "";
+        return `
+          <tr>
+            <td>${escapeHtml(row.id || "")}</td>
+            <td>${escapeHtml(row.subject || "")}</td>
+            <td class="preview-url">${escapeHtml(source || "-")}</td>
+            <td>${escapeHtml(sourceCate)}</td>
+            <td>${escapeHtml(plannedCate)}</td>
+            <td>${row.would_update ? "예" : "아니오"}</td>
+            <td>${escapeHtml([row.reason || "", row.preview_source === "url_rows_fallback" ? "원본 URL 행이라 적용 제외" : ""].filter(Boolean).join(" / "))}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    async function previewMatchedCategories() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        const targetUrl = $("contentsUrl").value.trim();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        if (!targetUrl) throw new Error("기준 URL을 입력하세요.");
+        setStatus("URL 매칭 카테고리 미리보기 요청 중");
+        renderCategoryPreview([], "조회 중입니다.");
+        const { res, data } = await postJson("/backend/learn-list/file-category-dry-run", {
+          db_name: dbName,
+          dbname: dbName,
+          account_name: dbName,
+          chat_bot_id: chatBotId,
+          contents_url: targetUrl,
+          access_url: targetUrl,
+          limit: 5000
+        });
+        log("카테고리 미리보기 응답", {
+          status: data.status,
+          count: data.count,
+          table: data.table,
+          pg_source_url: data.pg_source_url,
+          debug_counts: data.debug_counts,
+          fallback_source_url_rows: data.fallback_source_url_rows
+        }, res.ok ? "ok" : "error");
+        if (!res.ok || String(data.status || "").toLowerCase() !== "success") {
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        }
+        const allRows = Array.isArray(data.results) ? data.results : [];
+        const matchedRows = allRows.filter(row => rowMatchesTargetUrl(row, targetUrl));
+        const displayRows = matchedRows.length
+          ? matchedRows
+          : allRows.map(row => ({ ...row, would_update: false, reason: row.reason || "url_not_matched" }));
+        categoryPreviewRows = matchedRows;
+        renderCategoryPreview(
+          displayRows,
+          matchedRows.length
+            ? `전체 ${allRows.length.toLocaleString()}개 중 기준 URL 매칭 ${matchedRows.length.toLocaleString()}개`
+            : `기준 URL 매칭 0개, 전체 ${allRows.length.toLocaleString()}개 정보를 표시합니다.`
+        );
+        setStatus(
+          matchedRows.length
+            ? `URL 매칭 카테고리 미리보기 완료: ${matchedRows.length.toLocaleString()}개`
+            : `URL 매칭 결과 없음: 전체 ${allRows.length.toLocaleString()}개 정보 표시`
+        );
+      } catch (err) {
+        setStatus(err.message || String(err));
+        categoryPreviewRows = [];
+        renderCategoryPreview([], "미리보기 실패");
+        log("카테고리 미리보기 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    async function applyPreviewCategories() {
+      try {
+        const dbName = $("dbName").value.trim();
+        const chatBotId = $("chatBotId").value.trim();
+        if (!dbName || !chatBotId) throw new Error("데이터베이스와 챗봇 ID를 입력하세요.");
+        const applicableRows = categoryPreviewRows.filter(row =>
+          row && row.would_update && String(row.dry_run_cate1 || "").trim() && String(row.dry_run_cate2 || "").trim()
+        );
+        if (!applicableRows.length) throw new Error("적용 가능한 미리보기 결과가 없습니다. 먼저 카테고리 미리보기를 실행하세요.");
+        setStatus("미리보기 카테고리 적용 중");
+        const { res, data } = await postJson("/backend/learn-list/file-category-apply-dry-run", {
+          db_name: dbName,
+          dbname: dbName,
+          account_name: dbName,
+          chat_bot_id: chatBotId,
+          results: applicableRows
+        });
+        log("미리보기 카테고리 적용 응답", {
+          status: data.status,
+          requested: data.requested,
+          updated: data.updated,
+          table: data.table
+        }, res.ok ? "ok" : "error");
+        if (!res.ok || String(data.status || "").toLowerCase() !== "success") {
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        }
+        setStatus(`미리보기 카테고리 적용 완료: ${Number(data.updated || 0).toLocaleString()}건`);
+        await previewMatchedCategories();
+      } catch (err) {
+        setStatus(err.message || String(err));
+        log("미리보기 카테고리 적용 실패", { error: err.message || String(err) }, "error");
+      }
+    }
+
+    $("startBtn").addEventListener("click", startCrawl);
+    $("connectBtn").addEventListener("click", () => {
+      try { startStatusPolling(activeJobId || $("jobId").value.trim()); }
+      catch (err) { setStatus(err.message || String(err)); }
+    });
+    $("stopBtn").addEventListener("click", stopCrawl);
+    $("fetchExplorationBtn").addEventListener("click", fetchExplorationPosts);
+    $("fetchNextExplorationBtn").addEventListener("click", fetchNextExplorationPosts);
+    $("fetchPgMissingBtn").addEventListener("click", fetchPgMissingTargets);
+    $("fetchAttachmentsBtn").addEventListener("click", fetchAttachmentLists);
+    $("crawlExplorationBtn").addEventListener("click", crawlExplorationList);
+    $("previewCatBtn").addEventListener("click", previewMatchedCategories);
+    $("syncCatBtn").addEventListener("click", applyPreviewCategories);
+    $("clearLogBtn").addEventListener("click", () => {
+      logLines = [];
+      $("log").innerHTML = '<div class="status-line">아직 로그가 없습니다.</div>';
+    });
+    ["dbName", "chatBotId", "apiBase", "contentsUrl", "explorationLimit", "explorationOffset"].forEach(id => {
+      $(id).addEventListener("input", saveInputs);
+      $(id).addEventListener("change", saveInputs);
+    });
+    window.addEventListener("beforeunload", () => {
+      stopStatusPolling();
+      closeSse();
+    });
+    restoreSavedInputs();
+    if (!$("dateEnd").value) $("dateEnd").value = todayInputValue();
+    log("대기 중");
+  </script>
+</body>
+</html>
