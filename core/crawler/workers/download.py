@@ -2048,9 +2048,23 @@ async def _sync_after_download_if_needed(file_meta: Dict, filepath: str) -> bool
                     await asyncio.sleep(verify_delay_sec)
             if last_head_exc is not None:
                 file_meta["_websync_public_url"] = expected_url
-                file_meta["_websync_public_error"] = str(last_head_exc)
+                file_meta["_websync_public_error"] = repr(last_head_exc)
+                if expected_physical_exists:
+                    logger.warning(
+                        "[Download][WebSync] public URL HEAD unconfirmed after sync; allow file_saved | attempts=%s public_url=%s expected_path=%s source_url=%s post_url=%s name=%s path=%s error_type=%s error=%r",
+                        verify_attempts,
+                        _short(expected_url, 260),
+                        _short(expected_physical_path, 260),
+                        _short(file_meta.get("url"), 200),
+                        _short(_resolve_source_page_from_file_meta(file_meta), 220),
+                        _short(file_meta.get("name") or file_meta.get("subject"), 160),
+                        _short(filepath, 240),
+                        type(last_head_exc).__name__,
+                        last_head_exc,
+                    )
+                    return True
                 logger.error(
-                    "[Download][WebSync] public URL HEAD exception; block file_saved | attempts=%s public_url=%s expected_path=%s expected_exists=%s source_url=%s post_url=%s name=%s path=%s err=%s",
+                    "[Download][WebSync] public URL HEAD exception; block file_saved | attempts=%s public_url=%s expected_path=%s expected_exists=%s source_url=%s post_url=%s name=%s path=%s error_type=%s error=%r",
                     verify_attempts,
                     _short(expected_url, 260),
                     _short(expected_physical_path, 260),
@@ -2059,7 +2073,8 @@ async def _sync_after_download_if_needed(file_meta: Dict, filepath: str) -> bool
                     _short(_resolve_source_page_from_file_meta(file_meta), 220),
                     _short(file_meta.get("name") or file_meta.get("subject"), 160),
                     _short(filepath, 240),
-                    _short(last_head_exc, 200),
+                    type(last_head_exc).__name__,
+                    last_head_exc,
                 )
                 return False
             if last_status is not None and int(last_status) >= 400:
