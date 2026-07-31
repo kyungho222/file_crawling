@@ -32,7 +32,11 @@ from config.settings import settings
 from core.crawler.queues import JobQueues
 from core.crawler.workers.scan import scan_worker
 from core.crawler.workers.collection import collection_worker
-from core.crawler.workers.download import download_worker
+from core.crawler.workers.download import (
+    cancel_download_worker_activity,
+    download_worker,
+    get_download_worker_activity_snapshot,
+)
 from utils.runtime_flags import is_no_limits_mode
 from core.crawler.workers.study import study_worker
 from core.crawler.dedup import CollectionDeduplicator
@@ -473,15 +477,15 @@ class GlobalWorkerPool:
         """등록된 crawl job_id 목록(디버깅·이중 확인용)."""
         return list(self._jobs.keys())
 
-    def worker_health_snapshot(self) -> Dict[str, int]:
-        """Expose download-worker liveness for queued file jobs."""
+    def worker_health_snapshot(self, *, job_id: Optional[str] = None) -> Dict[str, Any]:
+        """Expose download worker liveness and active item context for queue diagnosis."""
         download_tasks = [t for t in self._tasks if t.get_name().startswith("global-download-worker-")]
         return {
             "download_total": len(download_tasks),
             "download_alive": sum(1 for t in download_tasks if not t.done()),
             "download_done": sum(1 for t in download_tasks if t.done()),
+            "download_active": get_download_worker_activity_snapshot(job_id=job_id),
         }
-
     def _track_worker_task(self, task: asyncio.Task) -> None:
         self._tasks.append(task)
 
@@ -566,9 +570,16 @@ class GlobalWorkerPool:
         (외부에서 close_context_for_job_id를 반복 호출할 필요 없음)
         """
         jid = str(job_id).strip() or "unknown"
+        cancelled_downloads = await cancel_download_worker_activity(jid)
         await self.close_context_for_job_id(jid)
         self._jobs.pop(jid, None)
         self._rr.set_jobs(list(self._jobs.keys()))
+        logger.info(
+            "[FileCrawlTrace][stop_cancel_downloads] job_id=%s active_cancelled=%s remaining_jobs=%s",
+            jid,
+            cancelled_downloads,
+            len(self._jobs),
+        )
         await self._maybe_schedule_idle_shutdown()
 
     async def close_context_for_job_id(self, job_id: str) -> None:

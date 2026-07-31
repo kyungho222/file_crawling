@@ -100,6 +100,43 @@ _TRAILING_FILE_SIZE_RE = re.compile(
 )
 
 
+_DISPLAY_FILE_SIZE_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(bytes?|b|kb|kbyte|kbytes|mb|mbyte|mbytes|gb|gbyte|gbytes|tb|tbyte|tbytes)\b",
+    re.IGNORECASE,
+)
+_DISPLAY_FILE_SIZE_FACTORS = {
+    "b": 1,
+    "byte": 1,
+    "bytes": 1,
+    "kb": 1024,
+    "kbyte": 1024,
+    "kbytes": 1024,
+    "mb": 1024 ** 2,
+    "mbyte": 1024 ** 2,
+    "mbytes": 1024 ** 2,
+    "gb": 1024 ** 3,
+    "gbyte": 1024 ** 3,
+    "gbytes": 1024 ** 3,
+    "tb": 1024 ** 4,
+    "tbyte": 1024 ** 4,
+    "tbytes": 1024 ** 4,
+}
+
+
+def parse_display_file_size_bytes(value: Any) -> int | None:
+    """Parse a human-readable size embedded in an attachment label."""
+    matches = list(_DISPLAY_FILE_SIZE_RE.finditer(str(value or "")))
+    if not matches:
+        return None
+    match = matches[-1]
+    try:
+        amount = float(match.group(1).replace(",", "."))
+        factor = _DISPLAY_FILE_SIZE_FACTORS[match.group(2).lower()]
+        return max(0, int(amount * factor))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def strip_trailing_file_size(filename: str) -> str:
     text = str(filename or "").strip()
     if not text:

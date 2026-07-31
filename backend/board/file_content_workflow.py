@@ -1178,7 +1178,7 @@ class BoardContentFilePipelineMixin:
                 await pool.register_job_and_ensure_started(
                     self.job_id or "unknown", self._file_job_queues
                 )
-                health = pool.worker_health_snapshot()
+                health = pool.worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
                 if int(health.get("download_alive", 0) or 0) < 1:
                     raise RuntimeError(f"global download worker unavailable: {health}")
                 return
@@ -1199,7 +1199,7 @@ class BoardContentFilePipelineMixin:
                     await pool.register_job_and_ensure_started(
                         self.job_id or "unknown", self._file_job_queues
                     )
-                    health = pool.worker_health_snapshot()
+                    health = pool.worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
                     if int(health.get("download_alive", 0) or 0) < 1:
                         raise RuntimeError(f"global download worker unavailable: {health}")
                     return
@@ -1245,7 +1245,7 @@ class BoardContentFilePipelineMixin:
                     await pool.register_job_and_ensure_started(
                         self.job_id or "unknown", self._file_job_queues
                     )
-                    health = pool.worker_health_snapshot()
+                    health = pool.worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
                     if int(health.get("download_alive", 0) or 0) < 1:
                         raise RuntimeError(f"global download worker unavailable: {health}")
                     self._file_worker_manager = None
@@ -1469,6 +1469,107 @@ class BoardContentFilePipelineMixin:
                     queued = 0
             return queued + buffered
 
+        def _collection_queue_trace_snapshot() -> Dict[str, Any]:
+            raw_queue = getattr(collection_batch_queue, "queue", None)
+            try:
+                queue_size = int(raw_queue.qsize()) if raw_queue is not None else 0
+            except Exception:
+                queue_size = 0
+            try:
+                queue_maxsize = int(getattr(raw_queue, "maxsize", 0) or 0)
+            except Exception:
+                queue_maxsize = 0
+            try:
+                unfinished = int(getattr(raw_queue, "_unfinished_tasks", 0) or 0)
+            except Exception:
+                unfinished = 0
+            return {
+                "items": _collection_queue_stored_count(),
+                "batches": queue_size,
+                "max_batches": queue_maxsize,
+                "buffer": len(getattr(collection_batch_queue, "buffer", []) or []),
+                "unfinished": unfinished,
+                "full": bool(queue_maxsize and queue_size >= queue_maxsize),
+            }
+
+        def _collection_queue_worker_health() -> Dict[str, Any]:
+            if bool(getattr(self, "use_global_pool", False)):
+                try:
+                    from core.crawler.global_pool import get_global_worker_pool
+
+                    return get_global_worker_pool().worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
+                except Exception as exc:
+                    return {"health_error": str(exc)}
+            worker_task = getattr(self, "_file_worker_task", None)
+            return {
+                "local_worker_alive": bool(worker_task and not worker_task.done()),
+                "local_worker_done": bool(worker_task and worker_task.done()),
+            }
+
+        async def _put_collection_queue_with_trace(
+            item: Dict[str, Any],
+            *,
+            file_url: str,
+            file_name: str,
+        ) -> None:
+            before = _collection_queue_trace_snapshot()
+            started_at = time.monotonic()
+            if before["full"]:
+                logger.warning(
+                    "[파일크롤링추적][큐적재대기시작] 작업ID=%s 게시물URL=%s 파일URL=%s 파일명=%s "
+                    "사유=queue_full 큐=%s 워커=%s",
+                    effective_job_id,
+                    (post_url or "")[:220],
+                    (file_url or "")[:220],
+                    (file_name or "")[:160],
+                    before,
+                    _collection_queue_worker_health(),
+                )
+            async def _warn_queue_put_waiting() -> None:
+                try:
+                    await asyncio.sleep(3.0)
+                except asyncio.CancelledError:
+                    return
+                logger.warning(
+                    "[FileCrawlTrace][queue_enqueue_waiting] 작업ID=%s 게시물URL=%s 파일URL=%s 파일명=%s "
+                    "대기초=3.00 큐=%s 워커=%s",
+                    effective_job_id,
+                    (post_url or "")[:220],
+                    (file_url or "")[:220],
+                    (file_name or "")[:160],
+                    _collection_queue_trace_snapshot(),
+                    _collection_queue_worker_health(),
+                )
+
+            wait_notice_task = asyncio.create_task(
+                _warn_queue_put_waiting(),
+                name=f"file-queue-put-wait:{effective_job_id}",
+            )
+            try:
+                await collection_batch_queue.put(item)
+            finally:
+                wait_notice_task.cancel()
+                try:
+                    await wait_notice_task
+                except asyncio.CancelledError:
+                    pass
+            wait_sec = time.monotonic() - started_at
+            if before["full"] or wait_sec >= 3.0:
+                after = _collection_queue_trace_snapshot()
+                reason = "queue_full" if before["full"] else "slow_queue_put"
+                logger.warning(
+                    "[파일크롤링추적][큐적재대기완료] 작업ID=%s 게시물URL=%s 파일URL=%s 파일명=%s "
+                    "대기초=%.2f 사유=%s 이전큐=%s 이후큐=%s 워커=%s",
+                    effective_job_id,
+                    (post_url or "")[:220],
+                    (file_url or "")[:220],
+                    (file_name or "")[:160],
+                    wait_sec,
+                    reason,
+                    before,
+                    after,
+                    _collection_queue_worker_health(),
+                )
         def _current_saved_count() -> int:
             """Return the current job-local LEARN_LIST save success count."""
             try:
@@ -2172,7 +2273,20 @@ class BoardContentFilePipelineMixin:
                 pass
 
             if enqueue_lock is not None:
+                enqueue_lock_wait_started = time.monotonic()
                 async with enqueue_lock:
+                    enqueue_lock_wait_sec = time.monotonic() - enqueue_lock_wait_started
+                    if enqueue_lock_wait_sec >= 3.0:
+                        logger.warning(
+                            "[파일크롤링추적][큐적재락대기완료] 작업ID=%s 게시물URL=%s 파일URL=%s 파일명=%s "
+                            "대기초=%.2f 큐=%s",
+                            effective_job_id,
+                            (post_url or "")[:220],
+                            (file_url or "")[:220],
+                            (file_name or "")[:160],
+                            enqueue_lock_wait_sec,
+                            _collection_queue_trace_snapshot(),
+                        )
                     await self._wait_for_file_learn_backpressure(file_url=file_url)
                     if self.stop_event.is_set():
                         _track_enqueue_missing(
@@ -2192,7 +2306,7 @@ class BoardContentFilePipelineMixin:
                         (file_url_key or "")[:220],
                         _collection_queue_stored_count(),
                     )
-                    await collection_batch_queue.put(file_meta)
+                    await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
                     _log_file_url_status(
                         stage="download_enqueue",
                         status="queued",
@@ -2238,7 +2352,7 @@ class BoardContentFilePipelineMixin:
                     (file_url_key or "")[:220],
                     _collection_queue_stored_count(),
                 )
-                await collection_batch_queue.put(file_meta)
+                await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
                 _log_file_url_status(
                     stage="download_enqueue",
                     status="queued",
@@ -4057,7 +4171,7 @@ class BoardContentFilePipelineMixin:
 
     @log_calls
     async def _flush_and_drain_file_queues_best_effort(self) -> None:
-        """Flush and drain file pipeline queues best-effort before shutdown."""
+        """Discard queued and buffered file work without blocking during hard shutdown."""
         qs = getattr(self, "_file_job_queues", None)
         if not qs:
             return
@@ -4069,22 +4183,10 @@ class BoardContentFilePipelineMixin:
                 get_global_worker_pool().disable_scan(jid)
         except Exception:
             pass
-        for _flush in (
-            getattr(qs, "scan_batch_queue", None),
-            getattr(qs, "collection_batch_queue", None),
-            getattr(qs, "save_batch_queue", None),
-            getattr(qs, "study_batch_queue", None),
-        ):
-            if _flush is None:
-                continue
-            try:
-                await _flush.flush()
-            except Exception:
-                pass
         try:
             counts = await qs.drain()
-            logger.debug(
-                "[file_crawl][board][file] pipeline queues flush+drain | job_id=%s counts=%s",
+            logger.info(
+                "[FileCrawlTrace][stop_queue_drained] job_id=%s counts=%s",
                 self.job_id,
                 counts,
             )
@@ -5672,12 +5774,12 @@ class BoardContentFilePipelineMixin:
             )
 
     async def _run_file_queue_watchdog(self) -> None:
-        """Report a file queue only when its pending state stops changing."""
+        """Emit a rate-limited queue heartbeat and warn when its state stops changing."""
         try:
-            interval_sec = float(os.getenv("FILE_CRAWL_QUEUE_STALL_LOG_SEC", "60") or "60")
+            interval_sec = float(os.getenv("FILE_CRAWL_QUEUE_STALL_LOG_SEC", "10") or "10")
         except Exception:
-            interval_sec = 60.0
-        interval_sec = max(15.0, min(interval_sec, 300.0))
+            interval_sec = 10.0
+        interval_sec = max(3.0, min(interval_sec, 300.0))
         last_activity = None
         last_change_at = time.monotonic()
 
@@ -5714,6 +5816,42 @@ class BoardContentFilePipelineMixin:
                 last_change_at = time.monotonic()
                 continue
 
+            try:
+                raw_queue = getattr(getattr(queues, "collection_batch_queue", None), "queue", None)
+                queue_maxsize = int(getattr(raw_queue, "maxsize", 0) or 0)
+            except Exception:
+                queue_maxsize = 0
+            worker_health: Dict[str, Any] = {}
+            registered = None
+            if bool(getattr(self, "use_global_pool", False)):
+                try:
+                    from core.crawler.global_pool import get_global_worker_pool
+
+                    pool = get_global_worker_pool()
+                    worker_health = pool.worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
+                    registered = str(self.job_id or "unknown") in pool.registered_jobs
+                except Exception as exc:
+                    worker_health = {"health_error": str(exc)}
+            else:
+                worker_task = getattr(self, "_file_worker_task", None)
+                worker_health = {
+                    "local_worker_alive": bool(worker_task and not worker_task.done()),
+                    "local_worker_done": bool(worker_task and worker_task.done()),
+                }
+            logger.info(
+                "[FileCrawlTrace][queue_status] job_id=%s pending=%s queued=%s max_batches=%s "
+                "buffer=%s unfinished=%s saved=%s learned=%s global_registered=%s workers=%s",
+                getattr(self, "job_id", None),
+                pending,
+                snapshot.get("collection_batch_queue", 0),
+                queue_maxsize,
+                snapshot.get("collection_batch_queue_buffer", 0),
+                snapshot.get("collection_batch_queue_unfinished", 0),
+                stats.get("save_count", 0),
+                stats.get("file_study_done_count", stats.get("study_done_count", 0)),
+                registered,
+                worker_health,
+            )
             activity = (
                 int(stats.get("save_count", 0) or 0),
                 int(stats.get("file_study_done_count", stats.get("study_done_count", 0)) or 0),
@@ -5739,7 +5877,7 @@ class BoardContentFilePipelineMixin:
                     from core.crawler.global_pool import get_global_worker_pool
 
                     pool = get_global_worker_pool()
-                    worker_health = pool.worker_health_snapshot()
+                    worker_health = pool.worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
                     registered = str(self.job_id or "unknown") in pool.registered_jobs
                 except Exception as exc:
                     worker_health = {"health_error": str(exc)}
@@ -6347,7 +6485,7 @@ class BoardContentFilePipelineMixin:
                     url = (item.get("url") or "").strip()
                     reason = str(item.get("reason") or "").strip() or "unknown"
                     detail = str(item.get("detail") or item.get("content_type") or item.get("filename") or "").strip()
-                    log_download_skipped = logger.debug if reason in {"non_doc_file", "non_doc_precheck", "viewer_convert_url"} else logger.warning
+                    log_download_skipped = logger.debug if reason in {"non_doc_file", "non_doc_precheck", "non_doc_mime", "viewer_convert_url"} else logger.warning
                     log_download_skipped(
                         "[FileMultiAttachDebug][progress.download_skipped] job_id=%s item_job=%s url=%s post_url=%s reason=%s detail=%s worker=%s",
                         getattr(self, "job_id", None),
