@@ -179,7 +179,7 @@ def _default_file_pipeline_concurrency(pool_max: int) -> int:
 
 
 def _default_file_pipeline_collection_batch_size(pool_max: int) -> int:
-    return 3
+    return 1
 
 
 def _default_file_embedding_batch_size(pool_max: int) -> int:

@@ -3759,6 +3759,15 @@ async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict
 
     try:
         started = time.perf_counter()
+        logger.info(
+            "[FilePersist][insert_begin] job_id=%s db=%s chat_bot_id=%s file_url=%s source_url=%s file=%s",
+            file_info.get("job_id"),
+            db_name,
+            chat_bot_id,
+            str(file_info.get("url") or "")[:220],
+            str(file_info.get("source_url") or "")[:220],
+            str(file_info.get("name") or file_info.get("subject") or "")[:160],
+        )
         # debug checkpoints
         cp_times = {"t0": started}
         try:
@@ -3792,6 +3801,14 @@ async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict
                         orig_meta.setdefault("board_cate2_name", ref_c2_name)
                 except Exception:
                     pass
+            logger.info(
+                "[FilePersist][category_mapping_begin] job_id=%s db=%s file_url=%s cate1=%s cate2=%s",
+                file_info.get("job_id"),
+                db_name,
+                str(file_info.get("url") or "")[:220],
+                ref_c1,
+                ref_c2,
+            )
             mapped_c1, mapped_c2 = await _ensure_file_learning_category_mapping(
                 chat_bot_id=chat_bot_id,
                 db_name=db_name,
@@ -3804,6 +3821,14 @@ async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict
             if mapped_c1 or mapped_c2:
                 file_info["cate1"] = mapped_c1
                 file_info["cate2"] = mapped_c2
+            logger.info(
+                "[FilePersist][category_mapping_done] job_id=%s db=%s file_url=%s cate1=%s cate2=%s",
+                file_info.get("job_id"),
+                db_name,
+                str(file_info.get("url") or "")[:220],
+                mapped_c1,
+                mapped_c2,
+            )
             if ref_c1 or ref_c2:
                 orig_meta = file_info.get("original_meta")
                 if not isinstance(orig_meta, dict):
@@ -3836,6 +3861,17 @@ async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict
         account_id = await get_account_identifier_from_chatbot_setup(chat_bot_id, db_name)
         cp_times["t1"] = time.perf_counter()
         table_name = get_learn_list_table_name(account_id)
+        try:
+            file_info["_learn_list_table_name"] = table_name
+        except Exception:
+            pass
+        logger.info(
+            "[FilePersist][table_resolved] job_id=%s db=%s table=%s file_url=%s",
+            file_info.get("job_id"),
+            db_name,
+            table_name,
+            str(file_info.get("url") or "")[:220],
+        )
         cp_times["t2"] = time.perf_counter()
         url = file_info.get('url')
         await _maybe_apply_file_insert_backpressure(url)

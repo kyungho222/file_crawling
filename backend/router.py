@@ -1178,6 +1178,17 @@ async def stop_crawl(job_id: str):
             t.add_done_callback(lambda tt: _swallow_task_exception(tt, label="workflow.hard_stop"))
         except Exception as exc:
             pass
+        try:
+            owner_task = crawler_state.workflow_tasks.get(job_id)
+            if (
+                isinstance(owner_task, asyncio.Task)
+                and not owner_task.done()
+                and owner_task is not asyncio.current_task()
+            ):
+                owner_task.cancel()
+                logger.warning("[Stop] cancelled workflow owner task | job_id=%s", job_id)
+        except Exception as exc:
+            logger.warning("[Stop] failed to cancel workflow owner task | job_id=%s err=%s", job_id, exc)
     else:
         try:
             t = asyncio.create_task(workflow.stop(), name=f"workflow-stop-{job_id}")

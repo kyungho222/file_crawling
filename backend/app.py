@@ -426,7 +426,8 @@ async def shutdown_handler():
         pass
 
 # Setup templates
-templates = Jinja2Templates(directory=os.path.join(PROJECT_ROOT, "frontend", "templates"))
+templates_dir = os.path.join(PROJECT_ROOT, "frontend", "templates")
+templates = Jinja2Templates(directory=templates_dir)
 
 # Mount Static Files
 # NOTE: Mount static files only when the directory already exists.
@@ -570,6 +571,10 @@ async def head_uploaded_file_compat(request: Request, uuid_tail: str, file_path:
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
+    index_path = os.path.join(templates_dir, "index.html")
+    if not os.path.isfile(index_path):
+        logger.error("[Frontend] root template missing | path=%s", index_path)
+        return HTMLResponse("Frontend template is not deployed.", status_code=503)
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/monitor", response_class=HTMLResponse)

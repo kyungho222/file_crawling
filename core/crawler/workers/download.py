@@ -321,6 +321,51 @@ def _is_portal_direct_file_url(u: str) -> bool:
     )
 
 
+def _is_suwon_culture_direct_download_url(u: str) -> bool:
+    """Suwon culture files accept a direct request with the detail-page referer."""
+    try:
+        parsed = urlparse(str(u or ""))
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    return host in {"suwon.go.kr", "www.suwon.go.kr"} and path == "/component/file/nd_culturefiledownload.do"
+
+
+def _repair_suwon_component_file_download_url(u: str) -> tuple[str, bool]:
+    """Repair known extraction typos in Suwon component-file download paths."""
+
+    raw = str(u or "").strip()
+    if not raw:
+        return raw, False
+    try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host not in {"suwon.go.kr", "www.suwon.go.kr"}:
+            return raw, False
+        path = parsed.path or ""
+        repaired_path = re.sub(r"(?i)/component/fe(?=/|$)", "/component/file", path)
+        repaired_path = re.sub(
+            r"(?i)/component/file/ndiledownload\.do$",
+            "/component/file/ND_fileDownload.do",
+            repaired_path,
+        )
+        if repaired_path == path:
+            return raw, False
+        return parsed._replace(path=repaired_path).geturl(), True
+    except Exception:
+        return raw, False
+
+
+def _is_suwon_component_file_download_url(u: str) -> bool:
+    try:
+        parsed = urlparse(str(u or ""))
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    return host in {"suwon.go.kr", "www.suwon.go.kr"} and path == "/component/file/nd_filedownload.do"
+
 def _is_eminwon_filedown_url(u: str) -> bool:
     """Seoul e-minwon file download JSP; request GET is often enough after source-page cookies exist."""
     try:
@@ -3769,6 +3814,15 @@ async def download_worker(
                 file_meta["_raw_url"] = raw_url
             url = _resolve_download_url(file_meta.get('url'), source_page)
             url, missing_portal_menu_context = _repair_portal_file_down_url_context(url, source_page, file_meta)
+            url, repaired_suwon_download_url = _repair_suwon_component_file_download_url(url)
+            if repaired_suwon_download_url:
+                logger.warning(
+                    "[Download][Worker %s] repaired malformed Suwon attachment URL | raw_url=%s repaired_url=%s post_url=%s",
+                    worker_id,
+                    _short(raw_url, 220),
+                    _short(url, 220),
+                    _short(source_page, 220),
+                )
             if missing_portal_menu_context:
                 file_meta["_download_empty_reason"] = "missing_post_url_menuNo"
                 logger.warning(
@@ -3873,6 +3927,12 @@ async def download_worker(
                 per_item_pw_attempts = min(per_item_pw_attempts, 1)
                 per_item_http_retries = 1
                 per_item_http_timeout = min(per_item_http_timeout, _portal_direct_http_timeout_sec())
+            if _is_suwon_component_file_download_url(url):
+                # This endpoint is already a direct binary route. A browser retry only
+                # holds an entire download batch after an upstream 4xx/5xx response.
+                per_item_pw_attempts = 0
+                per_item_http_retries = 1
+                per_item_http_timeout = min(per_item_http_timeout, 15.0)
             if should_skip_attachment_at_scan(url, (file_meta.get("name") or "").strip()):
                 file_meta["_download_empty_reason"] = "non_doc_precheck"
                 logger.info(
@@ -3964,6 +4024,8 @@ async def download_worker(
                         prewarm_enabled = str(os.getenv("DOWNLOAD_HTTP_PREWARM_SOURCE_PAGE", "1")).strip().lower() in ("1", "true", "yes", "on")
                         if is_portal_direct_fast:
                             prewarm_enabled = str(os.getenv("DOWNLOAD_PORTAL_DIRECT_HTTP_PREWARM_SOURCE_PAGE", "0")).strip().lower() in ("1", "true", "yes", "on")
+                        if _is_suwon_culture_direct_download_url(url) or _is_suwon_component_file_download_url(url):
+                            prewarm_enabled = False
                         if source_page and prewarm_enabled:
                             await _prime_source_page_http_session(
                                 session,
@@ -3983,6 +4045,18 @@ async def download_worker(
                                     len(_cookies_from_header(jar_cookie_header)),
                                     _short(source_page, 180),
                                 )
+                        logger.debug(
+                            "[DownloadTrace][http_request] job_id=%s worker=%s attempt=%s/%s "
+                            "url=%s post_url=%s source_prewarm=%s timeout_sec=%.1f",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            attempt,
+                            per_item_http_retries,
+                            _short(url, 220),
+                            _short(source_page, 220),
+                            bool(source_page and prewarm_enabled),
+                            per_item_http_timeout,
+                        )
 
                         safe_url = url
                         try:
@@ -4705,11 +4779,18 @@ async def download_worker(
                         playwright_fallback_sem.release()
                     except Exception:
                         pass
-
-                logger.info(
-                    "[Download][Worker %s] No local file after HTTP retries and Playwright — not necessarily a server outage; see messages above | url=%s",
+                logger.warning(
+                    "[DownloadTrace][file_saved_not_emitted] job_id=%s worker=%s url=%s "
+                    "post_url=%s name=%s reason=%s last_error=%s http_attempts=%s playwright_attempts=%s",
+                    file_meta.get("job_id"),
                     worker_id,
                     _short(url, 220),
+                    _short(source_page, 220),
+                    _short(file_meta.get("name") or file_meta.get("subject"), 160),
+                    _short(file_meta.get("_download_empty_reason") or "http_and_playwright_no_file", 180),
+                    _short(last_err_msg or file_meta.get("_download_last_error") or "-", 240),
+                    per_item_http_retries,
+                    per_item_pw_attempts,
                 )
                 # 엄격 도메인 공통 실패 시 즉시 재시도 루프를 막기 위한 쿨다운.
                 if host and any(host == h or host.endswith("." + h) for h in strict_hosts) and cooldown_max_sec > 0:
@@ -4854,7 +4935,7 @@ async def download_worker(
                                     )
                                     for task in pending_tasks
                                 ][:5]
-                                logger.warning(
+                                logger.info(
                                     "[Download][Worker %s] batch still waiting | pending=%s batch_size=%s urls=%s",
                                     worker_id,
                                     len(pending_tasks),

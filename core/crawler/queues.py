@@ -37,6 +37,16 @@ def _env_batch_size(name: str, default: int) -> int:
         value = default
     return max(1, min(value, 500))
 
+
+def _collection_queue_maxsize() -> int:
+    """Keep download backpressure shallow without changing other batch queues."""
+    if os.getenv("CRAWLER_COLLECTION_QUEUE_MAXSIZE") is not None:
+        return _env_queue_maxsize("CRAWLER_COLLECTION_QUEUE_MAXSIZE", 30)
+    if os.getenv("CRAWLER_BATCH_QUEUE_MAXSIZE") is not None:
+        return _env_queue_maxsize("CRAWLER_BATCH_QUEUE_MAXSIZE", 30)
+    return 30
+
+
 _job_pause_flags: Dict[str, Dict[str, bool]] = {}
 _job_pause_events: Dict[str, asyncio.Event] = {}
 
@@ -258,7 +268,12 @@ class JobQueues:
 
     scan_queue: Any = field(default_factory=PriorityScanQueue)
     scan_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_SCAN_BATCH_SIZE", 3)))
-    collection_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 3)))
+    collection_batch_queue: BatchQueue = field(
+        default_factory=lambda: BatchQueue(
+            batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1),
+            queue_maxsize=_collection_queue_maxsize(),
+        )
+    )
     save_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_SAVE_BATCH_SIZE", 3)))
     study_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_STUDY_BATCH_SIZE", 3)))
     progress_queue: Queue = field(default_factory=lambda: Queue(maxsize=_env_queue_maxsize("CRAWLER_PROGRESS_QUEUE_MAXSIZE", 500)))
@@ -344,14 +359,17 @@ def create_job_queues(job_id: str, *, collection_batch_size: Optional[int] = Non
         파일 크롤링 등에서 batch_size=1이면 다운로드 워커가 건당 1개씩만 처리해
         전체 병렬도가 download_workers 수에 묶이므로, 기본은 파일 파이프라인에서만 상향한다.
     """
-    bs = _env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 3)
+    bs = _env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1)
     if collection_batch_size is not None:
         try:
             bs = int(collection_batch_size)
         except Exception:
-            bs = _env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 3)
+            bs = _env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1)
         bs = max(1, min(bs, 500))
-    cbq = BatchQueue(batch_size=bs) if bs > 1 else BatchQueue(batch_size=1)
+    cbq = BatchQueue(
+        batch_size=bs,
+        queue_maxsize=_collection_queue_maxsize(),
+    )
     queues = JobQueues(collection_batch_queue=cbq)
     _job_queue_registry[job_id] = queues
     logger.debug(

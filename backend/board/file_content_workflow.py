@@ -788,9 +788,9 @@ def _file_crawl_learn_completion_window_default() -> int:
 
 def _file_pipeline_collection_batch_size_default() -> int:
     try:
-        value = int(getattr(settings, "FILE_PIPELINE_COLLECTION_BATCH_SIZE", 3) or 3)
+        value = int(getattr(settings, "FILE_PIPELINE_COLLECTION_BATCH_SIZE", 1) or 1)
     except Exception:
-        value = 3
+        value = 1
     return max(1, min(value, 256))
 
 
@@ -1226,8 +1226,6 @@ class BoardContentFilePipelineMixin:
                     except Exception:
                         coll_bs = _file_pipeline_collection_batch_size_default()
                     coll_bs = max(1, min(coll_bs, 256))
-                    if coll_bs <= 1:
-                        coll_bs = None
                 self._file_job_queues = create_job_queues(queue_key, collection_batch_size=coll_bs)
             try:
                 _plc = int(
@@ -4850,6 +4848,36 @@ class BoardContentFilePipelineMixin:
         duplicate policy allows it. Otherwise extract text and run the learning
         pipeline for the pending LEARN_LIST row.
         """
+        try:
+            valid_learn_list_id = int(pre_learn_list_id or 0)
+        except Exception:
+            valid_learn_list_id = 0
+        if valid_learn_list_id <= 0:
+            logger.error(
+                "[FilePersist][learning_blocked_missing_row] job_id=%s db=%s row_id=%s post_url=%s file_url=%s file=%s",
+                getattr(self, "job_id", None),
+                getattr(self, "db_name", None),
+                pre_learn_list_id,
+                (info.get("source_page") or info.get("source_url") or "")[:220],
+                (url or "")[:220],
+                file_name,
+            )
+            try:
+                self._record_job_result_stage(
+                    url=save_key,
+                    stage="study",
+                    status="skipped",
+                    reason="missing_learn_list_row",
+                    source_url=info.get("source_page") or info.get("source_url"),
+                    file_url=url,
+                    file_name=file_name,
+                    file_path=file_path,
+                )
+            except Exception:
+                pass
+            await self._mark_study_done(url=save_key, outcome="skipped")
+            return
+
         from db.mysql_db_config import mysql_execute_query
         from db.mariadb_save_update import get_account_identifier_from_chatbot_setup, get_learn_list_table_name
 
@@ -5839,6 +5867,16 @@ class BoardContentFilePipelineMixin:
                     file_name = _resolve_downloaded_file_subject(info, file_path)
                     file_size = 0
                     path_ok = bool(file_path and os.path.isfile(file_path))
+                    logger.info(
+                        "[FilePersist][progress_received] job_id=%s db=%s post_url=%s file_url=%s file=%s path=%s path_exists=%s",
+                        getattr(self, "job_id", None),
+                        getattr(self, "db_name", None),
+                        (info.get("source_page") or info.get("source_url") or "")[:220],
+                        (url or "")[:220],
+                        file_name,
+                        (file_path or "")[:260],
+                        path_ok,
+                    )
                     if file_path and not path_ok:
                         for _retry in range(5):
                             await asyncio.sleep(0.05)
@@ -5893,6 +5931,16 @@ class BoardContentFilePipelineMixin:
                         if throttle_sec > 0:
                             await asyncio.sleep(throttle_sec)
                         pre_extracted_text = None
+                        logger.info(
+                            "[FilePersist][learn_list_ensure_begin] job_id=%s db=%s enable_db_save=%s post_url=%s file_url=%s file=%s size=%s",
+                            getattr(self, "job_id", None),
+                            getattr(self, "db_name", None),
+                            bool(getattr(self, "enable_db_save", True)),
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220],
+                            file_name,
+                            file_size,
+                        )
                         t_ll0 = time.perf_counter()
                         row_out = await self._ensure_learn_list_row_for_file_save(
                             info=info,
@@ -5908,6 +5956,16 @@ class BoardContentFilePipelineMixin:
                                 (url or "")[:160],
                             )
                         if row_out is None:
+                            logger.error(
+                                "[FilePersist][learn_list_row_missing] job_id=%s db=%s table=%s enable_db_save=%s post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None),
+                                getattr(self, "db_name", None),
+                                info.get("_learn_list_table_name") or "unresolved",
+                                bool(getattr(self, "enable_db_save", True)),
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220],
+                                file_name,
+                            )
                             _log_file_url_status(
                                 stage="learn_list_persist",
                                 status="error",
@@ -5927,12 +5985,69 @@ class BoardContentFilePipelineMixin:
                                 getattr(self, "job_id", None),
                                 (url or "")[:200],
                             )
+                            try:
+                                self._record_job_result_stage(
+                                    url=save_key,
+                                    stage="save",
+                                    status="failed",
+                                    reason="learn_list_no_row",
+                                    source_url=info.get("source_page") or info.get("source_url"),
+                                    file_url=url,
+                                    file_name=file_name,
+                                    file_path=file_path,
+                                )
+                            except Exception:
+                                pass
+                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._mark_study_done(url=save_key, outcome="skipped")
+                            if self.progress_callback:
+                                self.progress_callback(self.get_stats())
                             continue
 
                         try:
                             row_id_int = int(row_out)
                         except Exception:
                             row_id_int = 0
+                        if row_id_int <= 0:
+                            logger.error(
+                                "[FilePersist][learn_list_invalid_row_id] job_id=%s db=%s table=%s row_id=%s enable_db_save=%s post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None),
+                                getattr(self, "db_name", None),
+                                info.get("_learn_list_table_name") or "unresolved",
+                                row_out,
+                                bool(getattr(self, "enable_db_save", True)),
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220],
+                                file_name,
+                            )
+                            try:
+                                self._record_job_result_stage(
+                                    url=save_key,
+                                    stage="save",
+                                    status="failed",
+                                    reason="learn_list_invalid_row_id",
+                                    source_url=info.get("source_page") or info.get("source_url"),
+                                    file_url=url,
+                                    file_name=file_name,
+                                    file_path=file_path,
+                                )
+                            except Exception:
+                                pass
+                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._mark_study_done(url=save_key, outcome="skipped")
+                            if self.progress_callback:
+                                self.progress_callback(self.get_stats())
+                            continue
+                        logger.info(
+                            "[FilePersist][learn_list_row_ready] job_id=%s db=%s table=%s row_id=%s post_url=%s file_url=%s file=%s",
+                            getattr(self, "job_id", None),
+                            getattr(self, "db_name", None),
+                            info.get("_learn_list_table_name") or "unresolved",
+                            row_id_int,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220],
+                            file_name,
+                        )
                         if row_id_int > 0:
                             saved_ids = getattr(self, "_file_saved_learn_list_ids", None)
                             if not isinstance(saved_ids, set):
@@ -6232,12 +6347,13 @@ class BoardContentFilePipelineMixin:
                     url = (item.get("url") or "").strip()
                     reason = str(item.get("reason") or "").strip() or "unknown"
                     detail = str(item.get("detail") or item.get("content_type") or item.get("filename") or "").strip()
-                    log_download_skipped = logger.debug if reason in {"non_doc_file", "non_doc_precheck", "viewer_convert_url"} else logger.debug
+                    log_download_skipped = logger.debug if reason in {"non_doc_file", "non_doc_precheck", "viewer_convert_url"} else logger.warning
                     log_download_skipped(
-                        "[FileMultiAttachDebug][progress.download_skipped] job_id=%s item_job=%s url=%s reason=%s detail=%s worker=%s",
+                        "[FileMultiAttachDebug][progress.download_skipped] job_id=%s item_job=%s url=%s post_url=%s reason=%s detail=%s worker=%s",
                         getattr(self, "job_id", None),
                         item.get("job_id"),
                         (url or "")[:220],
+                        (item.get("source_page") or item.get("source_url") or "")[:220],
                         reason,
                         detail[:300],
                         item.get("worker_id"),

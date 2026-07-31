@@ -16,7 +16,11 @@ from backend.file.fast_attachment_extractor import (
     extract_fast_attachments,
     infer_attachment_extension,
 )
-from backend.file.file_detail_category import split_detail_cates
+from backend.file.file_detail_category import (
+    filter_unexposed_file_detail_cates,
+    normalize_file_detail_cates,
+    split_detail_cates,
+)
 from backend.file.html_encoding import decode_html_response_bytes
 from backend.shared.date_utils import parse_date
 from utils.file import strip_fallback_download_label
@@ -281,9 +285,14 @@ def normalize_fast_file_post_item(item: Any) -> Optional[FastFilePostItem]:
         or ""
     ).strip()
     if not (cate1 or cate2):
+        matched_cate1, matched_cate2 = split_detail_cates(item.get("cate_match"))
+        cate1 = cate1 or matched_cate1
+        cate2 = cate2 or matched_cate2
+    if not (cate1 or cate2):
         type_cate1, type_cate2 = split_detail_cates(item.get("type"))
         cate1 = cate1 or type_cate1
         cate2 = cate2 or type_cate2
+    cate1, cate2 = normalize_file_detail_cates(cate1, cate2)
     return FastFilePostItem(
         url=ensure_url_scheme(url),
         board_url=str(item.get("board_url") or item.get("list_url") or item.get("source_url") or "").strip(),
@@ -745,6 +754,15 @@ async def run_fast_file_attachment_front(
         os.getenv("FILE_SOURCE_URL_DUP_SKIP_ENABLED", "0"),
     )
 
+    def _workflow_stop_requested() -> bool:
+        if bool(getattr(workflow, "_hard_stop", False) or getattr(workflow, "_stop_requested", False)):
+            return True
+        stop_event = getattr(workflow, "stop_event", None)
+        try:
+            return bool(stop_event is not None and stop_event.is_set())
+        except Exception:
+            return False
+
     async def _wait_before_fetch(url: str, reason: str) -> None:
         nonlocal last_fetch_started_at
         if fetch_delay_sec <= 0:
@@ -767,6 +785,9 @@ async def run_fast_file_attachment_front(
     async def process(item: FastFilePostItem) -> None:
         async with sem:
             try:
+                if _workflow_stop_requested():
+                    logger.debug("[file-fast][stop_skip] stage=before_detail_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
+                    return
                 _log_file_url_status(
                     stage="detail_visit",
                     status="start",
@@ -809,8 +830,28 @@ async def run_fast_file_attachment_front(
                     )
                     return
                 await _wait_before_fetch(item.url, "detail")
+                if _workflow_stop_requested():
+                    logger.debug("[file-fast][stop_skip] stage=before_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
+                    return
                 html = await _fetch_with_workflow(workflow, item.url, timeout_sec)
+                if _workflow_stop_requested():
+                    logger.debug("[file-fast][stop_skip] stage=after_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
+                    return
                 if html:
+                    original_cates = (item.cate1, item.cate2)
+                    item.cate1, item.cate2 = filter_unexposed_file_detail_cates(
+                        html,
+                        item.cate1,
+                        item.cate2,
+                    )
+                    if original_cates != (item.cate1, item.cate2):
+                        logger.debug(
+                            "[file-fast][category_detail_marker_removed] job_id=%s post_url=%s before=%s after=%s",
+                            getattr(workflow, "job_id", ""),
+                            item.url,
+                            original_cates,
+                            (item.cate1, item.cate2),
+                        )
                     if not str(item.cate2 or "").strip():
                         breadcrumb_cate = ""
                         breadcrumb_tokens = []
@@ -937,6 +978,9 @@ async def run_fast_file_attachment_front(
                 total_dropped = 0
                 enqueue_reason = ""
                 if enqueue and attachments:
+                    if _workflow_stop_requested():
+                        logger.debug("[file-fast][stop_skip] stage=before_enqueue job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
+                        return
                     stats_before = getattr(workflow, "stats", None)
                     try:
                         dup_before = int((stats_before or {}).get("file_attachment_enqueue_duplicate_drop_total", 0) or 0)
@@ -950,6 +994,11 @@ async def run_fast_file_attachment_front(
                         candidate_before = int((stats_before or {}).get("file_attachment_enqueue_candidate_total", 0) or 0)
                     except Exception:
                         candidate_before = 0
+                    item.cate1, item.cate2 = filter_unexposed_file_detail_cates(
+                        html,
+                        item.cate1,
+                        item.cate2,
+                    )
                     detail_cates = (item.cate1, item.cate2) if (item.cate1 or item.cate2) else None
                     sample = [
                         {

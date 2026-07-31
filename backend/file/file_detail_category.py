@@ -1,8 +1,59 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Tuple
 
+try:
+    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore[assignment]
+
 from utils.url import canonicalize_url_for_dedup
+
+
+def normalize_file_detail_category(value: Any) -> str:
+    """Keep the meaningful detailed category and drop its display-only suffix."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    parts = re.split(r"\s*[:\uff1a]\s*", text, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip().endswith("(\uc0c1\uc138)"):
+        return parts[0].strip()
+    return text
+
+def normalize_file_detail_cates(cate1: Any, cate2: Any) -> Tuple[str, str]:
+    return normalize_file_detail_category(cate1), normalize_file_detail_category(cate2)
+
+
+def filter_unexposed_file_detail_cates(html: Any, cate1: Any, cate2: Any) -> Tuple[str, str]:
+    """Remove a synthetic detailed marker while retaining the category itself."""
+
+    normalized_cate1, normalized_cate2 = normalize_file_detail_cates(cate1, cate2)
+    detail_marker = "(\uc0c1\uc138)"
+    if detail_marker not in normalized_cate1 and detail_marker not in normalized_cate2:
+        return normalized_cate1, normalized_cate2
+
+    body_text = ""
+    if BeautifulSoup is not None and html:
+        try:
+            soup = BeautifulSoup(str(html), "html.parser")
+            for node in soup(["head", "script", "style", "noscript", "template"]):
+                node.decompose()
+            body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+        except Exception:
+            body_text = ""
+
+    def _remove_synthetic_marker(category: str) -> str:
+        if detail_marker not in category or category in body_text:
+            return category
+        return re.sub(rf"\s*{re.escape(detail_marker)}\s*", " ", category).strip()
+
+    return (
+        _remove_synthetic_marker(normalized_cate1),
+        _remove_synthetic_marker(normalized_cate2),
+    )
 
 
 def split_detail_cates(value: Any) -> Tuple[str, str]:
@@ -12,7 +63,7 @@ def split_detail_cates(value: Any) -> Tuple[str, str]:
     parts = text.split("|", 2)
     if len(parts) < 3:
         return "", ""
-    return parts[1].strip(), parts[2].strip()
+    return normalize_file_detail_cates(parts[1], parts[2])
 
 
 def resolve_file_detail_cates(
@@ -25,8 +76,7 @@ def resolve_file_detail_cates(
 ) -> Tuple[str, str]:
     """Resolve file-crawl categories without depending on board crawl results."""
 
-    resolved_cate1 = str(cate1 or "").strip()
-    resolved_cate2 = str(cate2 or "").strip()
+    resolved_cate1, resolved_cate2 = normalize_file_detail_cates(cate1, cate2)
     if resolved_cate1 or resolved_cate2:
         return resolved_cate1, resolved_cate2
 
@@ -49,8 +99,7 @@ def resolve_file_detail_cates(
             except Exception:
                 pair = None
             if pair:
-                resolved_cate1 = str(pair[0] or "").strip()
-                resolved_cate2 = str(pair[1] or "").strip()
+                resolved_cate1, resolved_cate2 = normalize_file_detail_cates(pair[0], pair[1])
                 if resolved_cate1 or resolved_cate2:
                     return resolved_cate1, resolved_cate2
 

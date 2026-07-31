@@ -35,6 +35,10 @@ from backend.board.gm_file import extract_gm_nftc_filelist_attachments
 from backend.board.yongin_board import resolve_yongin_file_download_url
 from backend.board.yongin_water_board import is_yongin_water_attachment_detail_url
 from backend.file.file_crawl_board_mixin import FileCrawlBoardMixin, ensure_file_study_stat_keys
+from backend.file.file_detail_category import (
+    filter_unexposed_file_detail_cates,
+    normalize_file_detail_cates,
+)
 from backend.file.file_detail_meta import extract_file_detail_meta_from_html
 from backend.board.chuncheon_contract import (
     is_chuncheon_contract_detail_url as _is_chuncheon_contract_detail_url,
@@ -173,17 +177,8 @@ def _compact_text(value: Any) -> str:
 
 
 def _file_crawl_fast_front_concurrency(kwargs: Dict[str, Any]) -> int:
-    raw = (
-        kwargs.get("file_crawl_front_concurrency")
-        or os.getenv("FILE_CRAWL_FAST_FRONT_CONCURRENCY")
-        or "1"
-    )
-    try:
-        value = int(raw)
-    except Exception:
-        value = 1
-    return max(1, min(value, 16))
-
+    # Keep the initial attachment extraction load bounded across all sites.
+    return 3
 
 def _file_crawl_detail_fetch_timeout_sec(kwargs: Dict[str, Any]) -> float:
     raw = (
@@ -1879,7 +1874,13 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 if not isinstance(row, dict):
                     continue
                 name = str(row.get("fileName") or row.get("name") or row.get("orgFileNm") or "").strip()
-                href = str(row.get("downloadPath") or row.get("openPath") or "").strip()
+                is_pdf = str(row.get("ext") or "").strip().lower() == "pdf"
+                href = str(
+                    (row.get("openPath") if is_pdf else row.get("downloadPath"))
+                    or row.get("downloadPath")
+                    or row.get("openPath")
+                    or ""
+                ).strip()
                 if not href:
                     continue
                 full = urljoin(base_url, href)
@@ -2369,8 +2370,10 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
 
         # File crawling no longer uses CATEGORY url_pattern/cate_match legacy resolution.
         # Direct board category values are carried forward and mapped to the File root during LEARN_LIST persistence.
-        direct_cate1 = str(getattr(it, "cate1", "") or "").strip()
-        direct_cate2 = str(getattr(it, "cate2", "") or "").strip()
+        direct_cate1, direct_cate2 = normalize_file_detail_cates(
+            getattr(it, "cate1", ""),
+            getattr(it, "cate2", ""),
+        )
         store_cate1, store_cate2 = _normalize_cate_codes_upper(direct_cate1, direct_cate2)
         if store_cate1 or store_cate2:
             logger.debug(
@@ -2596,6 +2599,21 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
         except Exception:
             return
         soup = BeautifulSoup(html, "html.parser")
+
+        original_cates = (store_cate1, store_cate2)
+        store_cate1, store_cate2 = filter_unexposed_file_detail_cates(
+            html,
+            store_cate1,
+            store_cate2,
+        )
+        if original_cates != (store_cate1, store_cate2):
+            logger.debug(
+                "[Cate][file] unexposed detail category blocked | job_id=%s post_url=%s before=%s after=%s",
+                getattr(self, "job_id", ""),
+                (url or "")[:220],
+                original_cates,
+                (store_cate1, store_cate2),
+            )
 
         reg_date_dt = self._extract_board_reg_date(soup, html=html, url=url)
 

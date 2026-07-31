@@ -148,7 +148,7 @@ def _tokens_from_title(soup) -> List[str]:
         tokens = tokens[1:]
     return tokens
 
-def extract_file_breadcrumb_tokens_from_html(html: str) -> List[str]:
+def extract_file_breadcrumb_tokens_from_html(html: str, *, include_title_fallback: bool = True) -> List[str]:
     if not html or not BeautifulSoup:
         return []
     try:
@@ -190,9 +190,10 @@ def extract_file_breadcrumb_tokens_from_html(html: str) -> List[str]:
             cleaned = _clean_breadcrumb_tokens(tokens)
             if len(cleaned) >= 2:
                 return cleaned
-        title_tokens = _tokens_from_title(soup)
-        if len(title_tokens) >= 2:
-            return title_tokens
+        if include_title_fallback:
+            title_tokens = _tokens_from_title(soup)
+            if len(title_tokens) >= 2:
+                return title_tokens
         return []
     except Exception:
         return []
