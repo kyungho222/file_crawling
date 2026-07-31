@@ -4814,21 +4814,67 @@ async def download_worker(
                     except Exception:
                         pass
 
-                    tasks = [download_item(session, item) for item in batch_items]
-                    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    task_to_index = {
+                        asyncio.create_task(download_item(session, item)): index
+                        for index, item in enumerate(batch_items)
+                    }
+                    pending_tasks = set(task_to_index)
+                    raw_results = [None] * len(batch_items)
                     results = []
                     failed_count = 0
-                    for item, result in zip(batch_items, raw_results):
-                        if isinstance(result, Exception):
-                            failed_count += 1
-                            logger.error(
-                                "[Download][Worker %s] item failed inside batch; continuing siblings | url=%s err=%s",
-                                worker_id,
-                                _short((item or {}).get("url") if isinstance(item, dict) else item, 220),
-                                result,
+                    try:
+                        while pending_tasks:
+                            completed, pending_tasks = await asyncio.wait(
+                                pending_tasks,
+                                timeout=15.0,
+                                return_when=asyncio.FIRST_COMPLETED,
                             )
-                            continue
-                        results.append(result)
+                            if not completed:
+                                pending_urls = [
+                                    _short(
+                                        ((batch_items[task_to_index[task]] or {}).get("url")
+                                        if isinstance(batch_items[task_to_index[task]], dict)
+                                        else batch_items[task_to_index[task]]),
+                                        180,
+                                    )
+                                    for task in pending_tasks
+                                ][:5]
+                                logger.warning(
+                                    "[Download][Worker %s] batch still waiting | pending=%s batch_size=%s urls=%s",
+                                    worker_id,
+                                    len(pending_tasks),
+                                    len(batch_items),
+                                    pending_urls,
+                                )
+                                continue
+                            for task in completed:
+                                item_index = task_to_index[task]
+                                item = batch_items[item_index]
+                                try:
+                                    result = task.result()
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    result = exc
+                                raw_results[item_index] = result
+                                if isinstance(result, Exception):
+                                    failed_count += 1
+                                    logger.error(
+                                        "[Download][Worker %s] item failed inside batch; continuing siblings | url=%s err=%s",
+                                        worker_id,
+                                        _short((item or {}).get("url") if isinstance(item, dict) else item, 220),
+                                        result,
+                                    )
+                                    continue
+                                results.append(result)
+                                if result and out_queue and not result.get("defer_save_batch_until_learn_list"):
+                                    await out_queue.put(result)
+                    except BaseException:
+                        for task in pending_tasks:
+                            task.cancel()
+                        if pending_tasks:
+                            await asyncio.gather(*pending_tasks, return_exceptions=True)
+                        raise
                     try:
                         ok_count = sum(1 for result in results if result)
                         empty_count = max(0, len(batch_items or []) - failed_count - ok_count)
@@ -4876,18 +4922,12 @@ async def download_worker(
                         pass
 
                     for res in results:
-                        if res and out_queue:
-                            if res.get("defer_save_batch_until_learn_list"):
-                                # 게시판 파일 파이프라인은 LEARN_LIST 반영 후 progress 루프에서 학습 처리.
-                                # save_batch_queue 삽입은 생략하므로 흐름 추적 로그만 남김.
-                                if FLOW_DEBUG:
-                                    logger.info(
-                                        "[Flow] out_queue skip (defer_save_batch_until_learn_list) | path=%s url=%s",
-                                        _short(res.get("file_path") or res.get("local_path"), 260),
-                                        _short(res.get("url"), 200),
-                                    )
-                                continue
-                            await out_queue.put(res)
+                        if res and out_queue and res.get("defer_save_batch_until_learn_list") and FLOW_DEBUG:
+                            logger.info(
+                                "[Flow] out_queue skip (defer_save_batch_until_learn_list) | path=%s url=%s",
+                                _short(res.get("file_path") or res.get("local_path"), 260),
+                                _short(res.get("url"), 200),
+                            )
                     try:
                         ok_count = sum(1 for r in results if r)
                     except Exception:

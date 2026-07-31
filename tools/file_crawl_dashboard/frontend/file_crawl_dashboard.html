@@ -1,16 +1,802 @@
 <!doctype html>
 <html lang="ko">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>파일 크롤링 테스트</title>
-<style>
-:root{--bg:#f4f7fb;--panel:#fff;--ink:#182230;--muted:#64748b;--line:#dce4ee;--teal:#087f75;--teal-soft:#dff7f1;--blue:#2563eb;--warn:#b45309;--danger:#c2410c}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px "Malgun Gothic",Arial,sans-serif}main{max-width:1440px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;align-items:start;gap:16px;margin-bottom:18px}h1{margin:0;font-size:25px}h2{margin:0;font-size:15px}.sub{color:var(--muted);margin-top:6px}.badge{border-radius:999px;padding:7px 11px;background:#e7eef9;color:#25436b;font-weight:700}.layout{display:grid;grid-template-columns:420px 1fr;gap:16px}.stack{display:grid;gap:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 8px 24px #1822300b}.fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{grid-column:1/-1}label{display:block;font-size:12px;color:var(--muted);font-weight:700;margin-bottom:5px}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 10px;color:var(--ink);font:inherit;background:#fff}textarea{min-height:88px;resize:vertical}.toggle{display:flex;align-items:center;gap:8px;font-weight:700}.toggle input{width:17px;height:17px}.modes{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.mode{border:1px solid var(--line);border-radius:12px;padding:10px;cursor:pointer}.mode input{width:auto;margin:0 6px 0 0}.mode:has(input:checked){border-color:var(--teal);background:var(--teal-soft)}button{border:0;border-radius:12px;padding:10px 14px;background:var(--teal);color:#fff;font:inherit;font-weight:800;cursor:pointer}button:hover{background:#05645d}button.secondary{background:#eef3f8;color:#1f354d}button.danger{background:var(--danger)}.actions{display:flex;gap:8px;flex-wrap:wrap}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{border:1px solid var(--line);border-radius:15px;padding:9px 12px;min-height:68px}.metric span{color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px}.stage{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stage div{border-radius:13px;background:#f6f8fb;padding:11px;border:1px solid var(--line);font-weight:800}.stage div.active{background:var(--teal-soft);border-color:var(--teal)}.payload{height:180px;overflow:auto;background:#f7fafc;border:1px solid var(--line);border-radius:15px;padding:12px;color:#223047;font:12px Consolas,monospace;white-space:pre-wrap}.log{height:300px;overflow:auto;background:#142235;border-radius:15px;padding:12px;color:#d9e7f5;font:12px Consolas,monospace;white-space:pre-wrap}.log .option{color:#9ff0d9}.log .error{color:#fca5a5}.table{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:13px}.table table{width:100%;border-collapse:collapse}.table th,.table td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.table th{background:#f6f8fb;font-size:12px;color:var(--muted)}.url{word-break:break-all}@media(max-width:900px){.layout{grid-template-columns:1fr}.metrics,.stage{grid-template-columns:repeat(2,1fr)}}
-</style></head><body><main>
-<header><div><h1>파일 크롤링 테스트</h1><div class="sub">f1_dev 서비스 연동 · 단건 및 전체 대상 · 단계별 실행</div></div><span id="job" class="badge">대기 중</span></header>
-<div class="layout"><section class="stack"><section class="panel"><h2>연결 및 대상</h2><div class="fields" style="margin-top:14px"><div><label>DB</label><input id="db" placeholder="jongno"></div><div><label>챗봇 ID</label><input id="bot" placeholder="chat_bot_id"></div><div class="wide"><label>단건 상세페이지 URL</label><textarea id="url" placeholder="https://..."></textarea></div><div><label>전체 조회 제한</label><input id="limit" type="number" value="100" min="1" max="5000"></div><div><label>URL 패턴 옵션</label><input id="pattern" placeholder="/bbs/view.do"></div><div><label>시작일 옵션</label><input id="start" type="date"></div><div><label>종료일 옵션</label><input id="end" type="date"></div></div></section>
-<section class="panel"><h2>실행 범위</h2><div class="modes" style="margin-top:14px"><label class="mode"><input type="radio" name="scope" value="single" checked>단건</label><label class="mode"><input type="radio" name="scope" value="all">전체 type=post</label></div><h2 style="margin-top:18px">실행 단계</h2><div class="modes" style="margin-top:14px"><label class="mode"><input type="radio" name="stage" value="discover" checked>탐색</label><label class="mode"><input type="radio" name="stage" value="select">탐색 + 선별</label><label class="mode"><input type="radio" name="stage" value="save">탐색 + 선별 + 저장</label><label class="mode"><input type="radio" name="stage" value="learn">탐색 + 선별 + 저장 + 학습</label></div><label class="toggle" style="margin-top:16px"><input id="dry" type="checkbox" checked>Dry-run (저장·학습 미반영)</label></section>
-<section class="panel"><div class="actions"><button id="preview">전체 대상 조회</button><button id="run">선택 단계 실행</button><button id="clear" class="secondary">로그 지우기</button></div></section></section>
-<section class="stack"><section class="metrics"><div class="metric"><span>탐색</span><strong id="scan">0</strong></div><div class="metric"><span>선별</span><strong id="select">0</strong></div><div class="metric"><span>저장</span><strong id="save">0</strong></div><div class="metric"><span>학습</span><strong id="learn">0</strong></div></section><section class="panel"><h2>단계 상태</h2><div class="stage" style="margin-top:12px"><div id="s-discover">01 탐색</div><div id="s-select">02 선별</div><div id="s-save">03 저장</div><div id="s-learn">04 학습</div></div></section><section class="panel"><h2>요청 Payload</h2><pre id="payload" class="payload" style="margin-top:12px">{}</pre></section><section class="panel"><h2>대상 미리보기</h2><div id="rows" class="table" style="margin-top:12px">조회된 대상이 없습니다.</div></section><section class="panel"><h2>상세 로그</h2><div id="log" class="log" style="margin-top:12px"></div></section></section></div></main>
-<script>
-const $=id=>document.getElementById(id);let rows=[];const today=()=>new Date().toISOString().slice(0,10);const now=()=>new Date().toLocaleTimeString('ko-KR',{hour12:false});const value=name=>document.querySelector(`input[name="${name}"]:checked`).value;function log(message,data={},kind=''){const el=document.createElement('div');el.className=kind;el.textContent=`${now()} ${message}\n${JSON.stringify(data,null,2)}`;$('log').prepend(el)}function options(){const stage=value('stage'),dry=$('dry').checked,scope=value('scope');const payload={db_name:$('db').value.trim(),chat_bot_id:$('bot').value.trim(),scope,stage,dry_run:dry,url:$('url').value.trim(),limit:Number($('limit').value||100),pattern:$('pattern').value.trim(),target_date:($('start').value?[$('start').value,$('end').value]:[])};payload.enable_db_save=!dry&&['save','learn'].includes(stage);payload.enable_learning=!dry&&stage==='learn';return payload}function renderPayload(){try { $("payload").textContent=JSON.stringify(options(),null,2) } catch(e) { $("payload").textContent=JSON.stringify({error:e.message},null,2) }}function mark(stage){['discover','select','save','learn'].forEach(id=>$('s-'+id).classList.toggle('active',id===stage))}function render(){if(!rows.length){$('rows').textContent='조회된 대상이 없습니다.';return}$('rows').innerHTML='<table><thead><tr><th>ID</th><th>URL</th><th>등록일</th></tr></thead><tbody>'+rows.slice(0,100).map(r=>`<tr><td>${r.id||'-'}</td><td class="url">${r.url||''}</td><td>${r.reg_date||r.created_at||'-'}</td></tr>`).join('')+'</tbody></table>'}async function post(path,payload){const r=await fetch('/Ai_Pro_filecrawler'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const raw=await r.text();let d={};try{d=raw?JSON.parse(raw):{}}catch(_){d={raw}};log('[응답] '+path,{status:r.status,body:d},r.ok?'option':'error');if(!r.ok)throw new Error(d.detail||d.error||raw||r.status);return d}async function preview(){const p=options();if(!p.db_name||!p.chat_bot_id)throw new Error('DB와 챗봇 ID를 입력하세요.');p.exploration_type='post';p.active_only=true;p.include_duplicates=false;p.limit=p.limit;p.method=p.target_date.length===2?'period':'all';log('[선택옵션] 전체 대상 조회',p,'option');const d=await post('/backend/file-dashboard/exploration-posts',p);rows=d.rows||[];$('scan').textContent=d.total||rows.length;render();log('대상 조회 완료',{total:d.total,returned:rows.length},'option')}async function run(){const p=options();if(p.scope==='all')await preview();else if(!p.url)throw new Error('단건 상세페이지 URL을 입력하세요.');const url=p.scope==='single'?p.url:(rows[0]||{}).url;if(!url)throw new Error('실행할 대상이 없습니다.');p.contents_url=url;p.contents=[url];p.job_id='file-test-'+crypto.randomUUID().slice(0,8);$('job').textContent=p.job_id;mark(p.stage);log('[선택옵션] 단계 실행',p,'option');$('select').textContent=p.stage==='discover'?'1':'0';$('save').textContent=p.enable_db_save?'1':'0';$('learn').textContent=p.enable_learning?'1':'0';log('실행 요청 준비',{job_id:p.job_id,stage:p.stage,target:url},'option');const result=await post('/backend/session/start',p);log('작업 시작 응답',result,'option')}['preview','run'].forEach(id=>$(id).addEventListener('click',()=>({preview,run})[id]().catch(e=>log('오류',{error:e.message},'error')));$('clear').onclick=()=>$('log').textContent='';if(!$('end').value)$('end').value=today();document.querySelectorAll('input,select,textarea').forEach(el=>el.addEventListener('input',renderPayload));document.querySelectorAll('input,select,textarea').forEach(el=>el.addEventListener('change',renderPayload));renderPayload();log('대기 중',{안내:'선택 옵션은 실행 또는 조회 직전에 상세 로그로 출력됩니다.'},'option');
-</script></body></html>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>파일 크롤링 테스트</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --ink: #182230;
+      --muted: #64748b;
+      --line: #dce4ee;
+      --teal: #087f75;
+      --teal-dark: #05645d;
+      --teal-soft: #dff7f1;
+      --blue-soft: #e7eef9;
+      --log-bg: #142235;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px "Malgun Gothic", Arial, sans-serif; }
+    main { max-width: 1440px; margin: auto; padding: 24px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    h1, h2 { margin: 0; }
+    h1 { font-size: 25px; }
+    h2 { font-size: 15px; }
+    .sub { margin-top: 6px; color: var(--muted); }
+    .badge { flex: 0 0 auto; padding: 7px 11px; border-radius: 999px; background: var(--blue-soft); color: #25436b; font-weight: 700; }
+    .layout { display: grid; grid-template-columns: minmax(320px, 420px) minmax(0, 1fr); gap: 16px; }
+    .stack { display: grid; align-content: start; gap: 16px; }
+    .panel { padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: 0 8px 24px #1822300b; }
+    .section-content { margin-top: 14px; }
+    .section-title { margin-top: 18px; }
+    .fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+    .field-group { padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; }
+    .field-group + .field-group { margin-top: 12px; }
+    .group-title { margin: 0 0 10px; color: var(--teal-dark); font-size: 12px; font-weight: 800; }
+    .field-group.optional .group-title { color: var(--muted); }
+    .wide { grid-column: 1 / -1; }
+    label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    input, textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: #ffffff; color: var(--ink); font: inherit; }
+    input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+    textarea { min-height: 88px; resize: vertical; }
+    .modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .mode { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; }
+    .mode input { width: auto; margin: 0 6px 0 0; }
+    .mode:has(input:checked) { border-color: var(--teal); background: var(--teal-soft); }
+    .toggle { display: flex; align-items: center; gap: 8px; margin: 16px 0 0; color: var(--ink); font-weight: 700; }
+    .toggle input { width: 17px; height: 17px; margin: 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    button { min-height: 40px; padding: 10px 14px; border: 0; border-radius: 6px; background: var(--teal); color: #ffffff; font: inherit; font-weight: 800; cursor: pointer; }
+    button:hover { background: var(--teal-dark); }
+    button:disabled { cursor: wait; opacity: 0.6; }
+    button.secondary { background: #eef3f8; color: #1f354d; }
+    button.danger { background: #b42318; }
+    button.danger:hover { background: #8f1b13; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { min-height: 68px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 4px; font-size: 20px; }
+    .stage { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .stage div { min-height: 42px; padding: 11px; border: 1px solid var(--line); border-radius: 6px; background: #f6f8fb; font-weight: 800; }
+    .stage div.active { border-color: var(--teal); background: var(--teal-soft); }
+    .payload, .log { overflow: auto; padding: 12px; border-radius: 6px; font: 12px Consolas, monospace; white-space: pre-wrap; }
+    .payload { height: 180px; border: 1px solid var(--line); background: #f7fafc; color: #223047; }
+    .log { height: 300px; background: var(--log-bg); color: #d9e7f5; }
+    .log .option { color: #9ff0d9; }
+    .log .error { color: #fca5a5; }
+    .table { max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+    .table table { width: 100%; border-collapse: collapse; }
+    .table th, .table td { padding: 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .table th { position: sticky; top: 0; background: #f6f8fb; color: var(--muted); font-size: 12px; }
+    .url { word-break: break-all; }
+
+    @media (max-width: 900px) {
+      main { padding: 16px; }
+      .layout { grid-template-columns: 1fr; }
+      .metrics, .stage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
+      .fields, .modes { grid-template-columns: 1fr; }
+      .wide { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>파일 크롤링 대시보드</h1>
+        <div class="sub">f1_dev 서비스 연동 · 단건 및 전체 대상 · 단계별 실행</div>
+      </div>
+      <span id="job" class="badge" aria-live="polite">대기 중</span>
+    </header>
+
+    <div class="layout">
+      <section class="stack" aria-label="실행 설정">
+        <section class="panel">
+          <h2>연결 및 대상</h2>
+          <div class="field-group section-content">
+            <div class="group-title">필수</div>
+            <div class="fields">
+              <div><label for="db">DB</label><input id="db" value="newvit" placeholder="jongno"></div>
+              <div><label for="bot">챗봇 ID</label><input id="bot" value="ad1d9dbf-5165-4ad7-af7d-bf1850e784ee" placeholder="chat_bot_id"></div>
+              <div class="wide"><label for="contentsUrl">탐색목록 기준 URL</label><textarea id="contentsUrl" placeholder="게시판 목록 URL 또는 LEARN_LIST content URL"></textarea></div>
+            </div>
+          </div>
+          <div class="field-group optional">
+            <div class="group-title">선택</div>
+            <div class="fields">
+              <div class="wide"><label for="url">단건 상세페이지 URL</label><textarea id="url" placeholder="https://..."></textarea></div>
+              <div><label for="pattern">URL 패턴 옵션</label><input id="pattern" placeholder="/bbs/view.do"></div>
+              <div><label for="start">시작일 옵션</label><input id="start" type="date"></div>
+              <div><label for="end">종료일 옵션</label><input id="end" type="date"></div>
+            </div>
+          </div>
+        </section>
+        <section class="panel">
+          <h2>실행 범위 (2단계)</h2>
+          <div class="modes section-content"><label class="mode"><input type="radio" name="scope" value="single">단건</label><label class="mode"><input type="radio" name="scope" value="all" checked>전체 type=post</label></div>
+          <h2 class="section-title">실행 단계 (3단계)</h2>
+          <div class="modes section-content"><label class="mode"><input type="radio" name="stage" value="discover" checked>탐색목록</label><label class="mode"><input type="radio" name="stage" value="select">탐색목록 + 첨부 URL 추출</label><label class="mode"><input type="radio" name="stage" value="save">탐색 + 선별 + 저장</label><label class="mode"><input type="radio" name="stage" value="learn">탐색 + 선별 + 저장 + 학습</label></div>
+          <h2 class="section-title">속도</h2>
+          <div class="modes section-content">
+            <label class="mode"><input type="radio" name="speed" value="aggressive" checked>공격형</label>
+            <label class="mode"><input type="radio" name="speed" value="stable">안정형</label>
+          </div>
+          <label class="toggle"><input id="dry" type="checkbox" checked>Dry-run (저장 및 학습 미반영)</label>
+        </section>
+        <section class="panel">
+          <div class="actions"><button id="preview" type="button">샘플링 실행 (최대 3건)</button><button id="run" type="button">선택 단계 실행</button><button id="stop" type="button" class="danger" disabled>작업 중단</button><button id="clear" type="button" class="secondary">로그 지우기</button></div>
+          <h2 class="section-title">요청 Payload</h2>
+          <pre id="payload" class="payload section-content">{}</pre>
+        </section>
+      </section>
+
+      <section class="stack" aria-label="실행 결과">
+        <section class="metrics" aria-label="처리 지표">
+          <div class="metric"><span>탐색</span><strong id="scan">0</strong></div>
+          <div class="metric"><span>선별</span><strong id="select">0</strong></div>
+          <div class="metric"><span>저장</span><strong id="save">0</strong></div>
+          <div class="metric"><span>학습</span><strong id="learn">0</strong></div>
+        </section>
+
+        <section class="panel">
+          <h2>단계 상태</h2>
+          <div class="stage section-content">
+            <div id="s-discover">01 탐색목록</div>
+            <div id="s-select">02 첨부 URL 추출</div>
+            <div id="s-save">03 저장</div>
+            <div id="s-learn">04 학습</div>
+          </div>
+        </section>
+        <section class="panel">
+          <h2 id="previewTitle">대상 미리보기 (0개)</h2>
+          <div id="rows" class="table section-content">조회된 대상이 없습니다.</div>
+        </section>
+
+        <section class="panel">
+          <h2 id="attachmentsTitle">추출 첨부 URL (0건)</h2>
+          <div id="attachments" class="table section-content">첨부 URL 추출 결과가 없습니다.</div>
+        </section>
+        <section class="panel">
+          <h2>상세 로그</h2>
+          <div id="log" class="log section-content" aria-live="polite"></div>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const API_BASE = "/Ai_Pro_filecrawler";
+    const STAGES = ["discover", "select", "save", "learn"];
+    const state = { rows: [], attachments: [], attachmentPostUrls: [] };
+    let activeRequestController = null;
+    let activeRemoteJobId = "";
+
+    function updateStopButton() {
+      const button = byId("stop");
+      if (button) button.disabled = !activeRequestController && !activeRemoteJobId;
+    }
+
+    const byId = (id) => document.getElementById(id);
+    const selected = (name) =>
+      document.querySelector(`input[name="${name}"]:checked`)?.value || "";
+    const today = () => new Date().toISOString().slice(0, 10);
+    const now = () =>
+      new Date().toLocaleTimeString("ko-KR", { hour12: false });
+
+    function appendLog(message, data = {}, kind = "") {
+      const entry = document.createElement("div");
+      entry.className = kind;
+      entry.textContent = `${now()} ${message}\n${JSON.stringify(data, null, 2)}`;
+      byId("log").prepend(entry);
+    }
+
+    function readOptions() {
+      const stage = selected("stage");
+      const dryRun = byId("dry").checked;
+      const startDate = byId("start").value;
+      const endDate = byId("end").value;
+
+      return {
+        db_name: byId("db").value.trim(),
+        chat_bot_id: byId("bot").value.trim(),
+        scope: selected("scope"),
+        stage,
+        speed_mode: selected("speed") || "aggressive",
+        dry_run: dryRun,
+        contents_url: byId("contentsUrl").value.trim(),
+        url: byId("url").value.trim(),
+        pattern: byId("pattern").value.trim(),
+        target_date: startDate ? [startDate, endDate] : [],
+        enable_db_save: !dryRun && ["save", "learn"].includes(stage),
+        enable_learning: !dryRun && stage === "learn",
+        file_pipeline_skip_learning: stage === "save",
+      };
+    }
+
+    function buildPreviewPayload() {
+      const payload = readOptions();
+      const hasContentsUrl = Boolean(payload.contents_url);
+
+      return {
+        ...payload,
+        exploration_type: "post",
+        active_only: true,
+        include_duplicates: false,
+        method: payload.target_date.length === 2 ? "period" : "all",
+        scope_by_contents_learn_list_id: hasContentsUrl,
+        contents: hasContentsUrl ? [payload.contents_url] : [],
+      };
+    }
+
+    function renderPayload(payload = readOptions()) {
+      byId("payload").textContent = JSON.stringify(payload, null, 2);
+    }
+
+    function canonicalUrl(value) {
+      return String(value || "").trim();
+    }
+
+    function firstValue(row, keys) {
+      if (!row || typeof row !== "object") return "";
+      for (const key of keys) {
+        const value = row[key];
+        if (value !== undefined && value !== null && String(value).trim()) {
+          return String(value).trim();
+        }
+      }
+      return "";
+    }
+
+    function rowByPostUrl(postUrl) {
+      const key = canonicalUrl(postUrl);
+      return state.rows.find((row) => canonicalUrl(row.url) === key) || {};
+    }
+
+    function attachIfValue(target, key, value) {
+      const text = String(value || "").trim();
+      if (text) target[key] = text;
+    }
+
+    function attachmentExtractionCoversTargets(targetUrls) {
+      const expected = targetUrls.map(canonicalUrl).filter(Boolean).sort();
+      const extracted = (state.attachmentPostUrls || []).map(canonicalUrl).filter(Boolean).sort();
+      return expected.length > 0
+        && expected.length === extracted.length
+        && expected.every((url, index) => url === extracted[index]);
+    }
+
+    function buildDirectAttachmentStartUrls(targetUrls) {
+      const targetKeys = new Set(targetUrls.map(canonicalUrl).filter(Boolean));
+      const grouped = new Map();
+
+      for (const item of state.attachments || []) {
+        const postUrl = canonicalUrl(item.post_url);
+        const fileUrl = canonicalUrl(item.url || item.href);
+        if (!postUrl || !fileUrl || (targetKeys.size && !targetKeys.has(postUrl))) {
+          continue;
+        }
+
+        if (!grouped.has(postUrl)) {
+          const row = rowByPostUrl(postUrl);
+          const title = firstValue(row, ["title", "subject", "web_title", "menu_title"]) || item.post_title || "";
+          const startItem = {
+            url: postUrl,
+            type: "post",
+            source: "file_dashboard_extracted_attachments",
+            attachments: [],
+          };
+          attachIfValue(startItem, "title", title);
+          attachIfValue(startItem, "subject", title);
+          attachIfValue(startItem, "reg_date", firstValue(row, ["reg_date", "reg_date_str", "published_at", "post_date", "created_at"]));
+          attachIfValue(startItem, "learn_list_id", firstValue(row, ["learn_list_id"]));
+          attachIfValue(startItem, "cate1", firstValue(row, ["cate1", "category1", "board_cate1", "store_cate1", "assigned_cate1"]));
+          attachIfValue(startItem, "cate2", firstValue(row, ["cate2", "category2", "board_cate2", "store_cate2", "assigned_cate2"]));
+          attachIfValue(startItem, "board_cate1_name", firstValue(row, ["board_cate1_name", "cate1_name", "category1_name"]));
+          attachIfValue(startItem, "board_cate2_name", firstValue(row, ["board_cate2_name", "cate2_name", "category2_name"]));
+          grouped.set(postUrl, startItem);
+        }
+
+        grouped.get(postUrl).attachments.push({
+          href: fileUrl,
+          url: fileUrl,
+          name: String(item.name || item.title || "").trim(),
+          title: String(item.name || item.title || "").trim(),
+          post_url: postUrl,
+          source_page: postUrl,
+        });
+      }
+
+      return Array.from(grouped.values()).filter((item) => item.attachments.length > 0);
+    }
+
+    function markStage(stage) {
+      STAGES.forEach((name) => {
+        const element = byId(`s-${name}`);
+        if (element) {
+          element.classList.toggle("active", name === stage);
+        }
+      });
+    }
+
+    function updatePlannedMetrics(payload) {
+      byId("select").textContent = "0";
+      byId("save").textContent = "0";
+      byId("learn").textContent = "0";
+    }
+
+    function cell(text, className = "") {
+      const element = document.createElement("td");
+      element.className = className;
+      element.textContent = String(text ?? "");
+      return element;
+    }
+
+    function urlCell(url) {
+      const element = document.createElement("td");
+      element.className = "url";
+      const value = String(url || "").trim();
+      if (/^https?:\/\//i.test(value)) {
+        const link = document.createElement("a");
+        link.href = value;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = value;
+        element.append(link);
+      } else {
+        element.textContent = value;
+      }
+      return element;
+    }
+
+    function renderRows() {
+      const container = byId("rows");
+      container.replaceChildren();
+      const visibleRows = state.rows;
+      byId("previewTitle").textContent = `대상 미리보기 (${visibleRows.length}개)`;
+
+      if (!visibleRows.length) {
+        container.textContent = "조회된 대상이 없습니다.";
+        return;
+      }
+
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["id", "url", "type", "chat_bot_id", "learn_list_id", "created_at"].forEach((label) => {
+        const th = document.createElement("th");
+        th.textContent = label;
+        headRow.append(th);
+      });
+      head.append(headRow);
+
+      const body = document.createElement("tbody");
+      visibleRows.forEach((row) => {
+        const tr = document.createElement("tr");
+        tr.append(
+          cell(row.id || ""),
+          urlCell(row.url),
+          cell(row.type || ""),
+          cell(row.chat_bot_id || ""),
+          cell(row.learn_list_id || ""),
+          cell(row.created_at || ""),
+        );
+        body.append(tr);
+      });
+
+      table.append(head, body);
+      container.append(table);
+    }
+
+    function renderAttachments() {
+      const container = byId("attachments");
+      const items = state.attachments;
+      container.replaceChildren();
+      byId("attachmentsTitle").textContent = `추출 첨부 URL (${items.length}건)`;
+      if (!items.length) {
+        container.textContent = "첨부 URL 추출 결과가 없습니다.";
+        return;
+      }
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["post_url", "name", "url"].forEach((label) => {
+        const th = document.createElement("th");
+        th.textContent = label;
+        headRow.append(th);
+      });
+      head.append(headRow);
+      const body = document.createElement("tbody");
+      items.forEach((item) => {
+        const tr = document.createElement("tr");
+        tr.append(urlCell(item.post_url), cell(item.name), urlCell(item.url));
+        body.append(tr);
+      });
+      table.append(head, body);
+      container.append(table);
+    }
+    async function post(path, payload, signal = undefined) {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal,
+      });
+      const raw = await response.text();
+      let data = {};
+
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = { raw };
+      }
+
+      appendLog(
+        `[응답] ${path}`,
+        { status: response.status, body: data },
+        response.ok ? "option" : "error",
+      );
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.error || raw || String(response.status));
+      }
+      return data;
+    }
+
+    function validateConnection(payload) {
+      if (!payload.db_name || !payload.chat_bot_id) {
+        throw new Error("DB와 챗봇 ID를 입력하세요.");
+      }
+    }
+
+    async function previewTargets(limitOverride = null) {
+      const payload = buildPreviewPayload();
+      if (Number.isFinite(limitOverride) && limitOverride > 0) {
+        payload.limit = limitOverride;
+      }
+      validateConnection(payload);
+      renderPayload(payload);
+      appendLog("[선택옵션] 전체 대상 조회", payload, "option");
+
+      const data = await post("/backend/file-dashboard/exploration-posts", payload, activeRequestController?.signal);
+      state.rows = Array.isArray(data.rows) ? data.rows : [];
+      byId("scan").textContent = data.total ?? state.rows.length;
+      renderRows();
+      appendLog(
+        "대상 조회 완료",
+        { total: data.total, returned: state.rows.length },
+        "option",
+      );
+      return state.rows;
+    }
+
+    function createJobId() {
+      const suffix = globalThis.crypto?.randomUUID?.().slice(0, 8) ||
+        Date.now().toString(36);
+      return `file-test-${suffix}`;
+    }
+
+    function selectedTargetUrls(payload) {
+      if (payload.scope === "single") {
+        return payload.url ? [payload.url] : [];
+      }
+      return state.rows
+        .map((row) => String(row.url || "").trim())
+        .filter(Boolean);
+    }
+
+    async function extractAttachmentUrls(payload, targetUrls) {
+      if (!targetUrls.length) {
+        throw new Error("첨부 URL을 추출할 상세페이지 대상이 없습니다.");
+      }
+
+      let succeeded = 0;
+      let attachmentCount = 0;
+      const failures = [];
+      state.attachments = [];
+      state.attachmentPostUrls = [];
+      renderAttachments();
+      byId("select").textContent = "0";
+
+      for (const [index, postUrl] of targetUrls.entries()) {
+        appendLog(
+          `[첨부 URL 추출] ${index + 1}/${targetUrls.length}`,
+          { post_url: postUrl },
+          "option",
+        );
+        try {
+          const result = await post("/backend/board/crawl-probe", {
+            url: postUrl,
+            db_name: payload.db_name,
+            chat_bot_id: payload.chat_bot_id,
+            job_id: payload.job_id,
+            speed_mode: payload.speed_mode,
+            file_crawl: true,
+            dry_run: true,
+            disable_playwright: false,
+          });
+          const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+          const row = rowByPostUrl(postUrl);
+          const postTitle = result.title || firstValue(row, ["title", "subject", "web_title", "menu_title"]);
+          succeeded += 1;
+          attachmentCount += attachments.length;
+          state.attachments.push(...attachments.map((item) => ({
+            post_url: postUrl,
+            name: item.name || item.title || "",
+            url: item.href || item.url || "",
+            post_title: postTitle,
+          })));
+          renderAttachments();
+          byId("select").textContent = String(attachmentCount);
+          appendLog(
+            "첨부 URL 추출 결과",
+            {
+              post_url: postUrl,
+              title: result.title || "",
+              attachment_count: attachments.length,
+              attachments: attachments.map((item) => ({
+                name: item.name || item.title || "",
+                url: item.href || item.url || "",
+              })),
+            },
+            "option",
+          );
+        } catch (error) {
+          failures.push({ post_url: postUrl, error: error.message });
+        }
+      }
+
+      appendLog(
+        "첨부 URL 추출 요약",
+        {
+          대상상세페이지: targetUrls.length,
+          추출성공: succeeded,
+          추출성공_설명: "첨부 URL 발견 수와 별개로 상세페이지 추출 작업이 정상 완료된 건수",
+          첨부URL: attachmentCount,
+          실패: failures,
+          저장수행: false,
+          학습수행: false,
+        },
+        failures.length ? "error" : "option",
+      );
+      if (failures.length) {
+        throw new Error(`${failures.length}개 상세페이지의 첨부 URL 추출에 실패했습니다.`);
+      }
+      state.attachmentPostUrls = [...targetUrls];
+    }
+
+    async function runSelectedStage({ targetLimit = null, forceAll = false } = {}) {
+      let payload = readOptions();
+      if (forceAll) {
+        payload.scope = "all";
+      }
+      if (Number.isFinite(targetLimit) && targetLimit > 0) {
+        payload.limit = targetLimit;
+      }
+      validateConnection(payload);
+      payload.job_id = createJobId();
+      byId("job").textContent = payload.job_id;
+      markStage(payload.stage);
+      renderPayload(payload);
+      appendLog("[선택옵션] 단계 실행", payload, "option");
+
+      if (payload.stage === "discover") {
+        if (payload.scope === "all") {
+          await previewTargets(targetLimit);
+        } else if (payload.url) {
+          state.rows = [{
+            id: "-",
+            url: payload.url,
+            type: "post",
+            chat_bot_id: payload.chat_bot_id,
+            learn_list_id: "",
+            created_at: "",
+          }];
+          byId("scan").textContent = "1";
+          renderRows();
+        } else {
+          throw new Error("단건 상세페이지 URL을 입력하세요.");
+        }
+        updatePlannedMetrics(payload);
+        appendLog("탐색목록 조회 완료", { 대상수: state.rows.length, 다음단계수행: false }, "option");
+        return;
+      }
+
+      if (payload.scope === "all") {
+        await previewTargets(targetLimit);
+        payload = readOptions();
+        payload.job_id = byId("job").textContent;
+      }
+      const targetUrls = selectedTargetUrls(payload);
+      if (!targetUrls.length) {
+        throw new Error("실행할 상세페이지 URL이 없습니다.");
+      }
+      updatePlannedMetrics(payload);
+
+      if (payload.stage === "select") {
+        await extractAttachmentUrls(payload, targetUrls);
+        return;
+      }
+
+      if (!attachmentExtractionCoversTargets(targetUrls)) {
+        appendLog("첨부 URL 미추출 대상 재추출", {
+          대상상세페이지수: targetUrls.length,
+          기존추출대상수: state.attachmentPostUrls.length,
+        }, "option");
+        await extractAttachmentUrls(payload, targetUrls);
+      }
+
+      const directStartUrls = buildDirectAttachmentStartUrls(targetUrls);
+      if (!directStartUrls.length) {
+        throw new Error("선별된 첨부 URL이 없어 저장 또는 학습을 시작할 수 없습니다.");
+      }
+
+      const directAttachmentCount = directStartUrls.reduce(
+        (total, item) => total + (Array.isArray(item.attachments) ? item.attachments.length : 0),
+        0,
+      );
+
+      Object.assign(payload, {
+        colle: "file",
+        content_type: "file",
+        file_dashboard: true,
+        contents_url: directStartUrls[0].url,
+        contents: directStartUrls.map((item) => item.url),
+        start_urls: directStartUrls,
+        start_urls_override: directStartUrls,
+        start_urls_override_source: "contents_detail_direct",
+        pre_explored_start_urls_count: directStartUrls.length,
+        selected_start_urls_count: directStartUrls.length,
+        actual_start_urls_count: directStartUrls.length,
+        file_dashboard_attachment_count: directAttachmentCount,
+        file_pipeline_skip_learning: payload.stage === "save",
+      });
+      renderPayload(payload);
+      appendLog("저장 또는 학습 워크플로우 시작", {
+        단계: payload.stage,
+        대상상세페이지수: targetUrls.length,
+        직접전달상세페이지수: directStartUrls.length,
+        직접전달첨부수: directAttachmentCount,
+        전달방식: "상세페이지 URL별 attachments 직접 전달",
+        저장수행: payload.enable_db_save,
+        학습수행: payload.enable_learning,
+      }, "option");
+
+      const data = await post("/backend/session/start", payload);
+      activeRemoteJobId = payload.job_id;
+      updateStopButton();
+      appendLog("작업 시작 응답", data, "option");
+    }
+    async function withBusyState(task) {
+      const buttons = [byId("preview"), byId("run")];
+      activeRequestController = new AbortController();
+      buttons.forEach((button) => { button.disabled = true; });
+      updateStopButton();
+
+      try {
+        await task();
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          appendLog("현재 요청 중단", { job_id: byId("job").textContent || "" }, "option");
+        } else {
+          appendLog("오류", { error: error.message }, "error");
+        }
+      } finally {
+        activeRequestController = null;
+        buttons.forEach((button) => { button.disabled = false; });
+        updateStopButton();
+      }
+    }
+
+    async function stopCurrentWork() {
+      const requestedJobId = activeRemoteJobId;
+      if (activeRequestController) activeRequestController.abort();
+      if (!requestedJobId) {
+        updateStopButton();
+        return;
+      }
+      try {
+        const data = await post(`/c1/crawl_stop/${encodeURIComponent(requestedJobId)}`, {
+          db_name: byId("db").value.trim(),
+          chat_bot_id: byId("bot").value.trim(),
+        });
+        appendLog("운영 작업 중단 요청", { job_id: requestedJobId, response: data }, "option");
+        activeRemoteJobId = "";
+      } catch (error) {
+        appendLog("운영 작업 중단 요청 실패", { job_id: requestedJobId, error: error.message }, "error");
+      } finally {
+        updateStopButton();
+      }
+    }
+
+    byId("preview").addEventListener("click", () =>
+      withBusyState(() => runSelectedStage({ targetLimit: 3, forceAll: true })),
+    );
+    byId("run").addEventListener("click", () =>
+      withBusyState(runSelectedStage),
+    );
+    byId("stop").addEventListener("click", stopCurrentWork);
+    byId("clear").addEventListener("click", () => {
+      byId("log").replaceChildren();
+    });
+
+    document.querySelectorAll("input, textarea").forEach((element) => {
+      element.addEventListener("input", () => renderPayload());
+      element.addEventListener("change", () => renderPayload());
+    });
+
+    if (!byId("end").value) {
+      byId("end").value = today();
+    }
+    updateStopButton();
+    renderPayload();
+    appendLog(
+      "대기 중",
+      { 안내: "선택 옵션은 실행 또는 조회 직전에 상세 로그로 출력됩니다." },
+      "option",
+    );
+
+    const dashboardInspectId = sessionStorage.getItem("fileCrawlInspectId") || `dashboard-${crypto.randomUUID()}`;
+    sessionStorage.setItem("fileCrawlInspectId", dashboardInspectId);
+    function inspectJobId() {
+      return String(state?.job_id || state?.jobId || dashboardInspectId);
+    }
+    function publishInspect(event) {
+      const body = {
+        payload: typeof buildPayload === "function" ? buildPayload() : undefined,
+        rows: state?.rows || [],
+        event,
+      };
+      fetch(`/local-file-crawl/api/inspect/${encodeURIComponent(inspectJobId())}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).catch(() => {});
+    }
+    const appendLogForInspect = appendLog;
+    appendLog = function(message, data, kind) {
+      appendLogForInspect(message, data, kind);
+      publishInspect({ at: new Date().toISOString(), message, data, kind: kind || "" });
+    };
+    appendLog("Codex 조회 세션", { inspect_job_id: dashboardInspectId }, "option");
+    async function pollCodexCommand() {
+      try {
+        const response = await fetch(`/local-file-crawl/api/command/${encodeURIComponent(inspectJobId())}`);
+        const data = await response.json();
+        const command = data.command;
+        if (!command) return;
+        const payload = command.payload || {};
+        const fields = { db_name: "db", chat_bot_id: "bot", contents_url: "contentsUrl", url: "url", pattern: "pattern" };
+        Object.entries(fields).forEach(([key, id]) => { if (payload[key] !== undefined && byId(id)) byId(id).value = payload[key]; });
+        if (Array.isArray(payload.target_date) && payload.target_date.length) {
+          if (byId("start")) byId("start").value = payload.target_date[0] || "";
+          if (byId("end")) byId("end").value = payload.target_date[1] || "";
+        }
+        ["scope", "stage"].forEach((name) => {
+          if (!payload[name]) return;
+          const input = document.querySelector(`input[name="${name}"][value="${payload[name]}"]`);
+          if (input) input.checked = true;
+        });
+        if (payload.dry_run !== undefined && byId("dry")) byId("dry").checked = Boolean(payload.dry_run);
+        renderPayload?.();
+        appendLog("Codex 명령 수신", command, "option");
+        const buttons = {
+          preview: ["previewBtn", "fetchExplorationBtn", "preview"],
+          run: ["runBtn", "startBtn", "run"],
+          stop: ["stopBtn", "stop"],
+          clear_log: ["clearLogBtn", "clear"],
+        };
+        const id = (buttons[command.action] || []).find((candidate) => byId(candidate));
+        if (id) byId(id).click();
+      } catch (error) {
+        appendLog("Codex 명령 조회 오류", { error: String(error) }, "error");
+      }
+    }
+    // Codex 명령 조회는 자동 폴링하지 않는다. 사용자가 요청한 경우에만 호출한다.</script>
+</body>
+</html>

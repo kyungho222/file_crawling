@@ -102,5 +102,9 @@
     "chorogusan.or.kr": {
         "title_tag": ".title",
         "content_tag": ".content"
+    },
+    "suwon.go.kr": {
+        "title_tag": ".title",
+        "content_tag": ".content"
     }
 }

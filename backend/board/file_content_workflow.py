@@ -5336,6 +5336,16 @@ class BoardContentFilePipelineMixin:
                         )
                         _record_file_study("skipped", "learning_blocked_by_rrn_pattern", path=upload_path)
                         return
+                from backend.file.file_learning_text_mask import mask_file_learning_text
+
+                extracted_text, fixed_mask_count = mask_file_learning_text(extracted_text)
+                if fixed_mask_count:
+                    logger.info(
+                        "[file_crawl][board][file] fixed keyword masked before learn | job_id=%s url=%s count=%s",
+                        getattr(self, "job_id", None),
+                        (url or "")[:220],
+                        fixed_mask_count,
+                    )
                 file_result = {
                     "source_url": url,
                     "source": url,

@@ -173,9 +173,12 @@ from backend.board.detail_fetch_policy import (
     gm_general_bbs_static_fetch_timeout_sec,
     is_gm_fast_static_fetch_url,
     is_sd_go_fast_static_fetch_url,
+    is_suwon_slow_detail_url,
     prefetch_static_fetch_timeout_sec,
+    suwon_slow_detail_fetch_guard_timeout_sec,
     sd_go_prefetch_static_fetch_timeout_sec,
     should_cap_prefetch_guard_timeout,
+    static_fetch_connect_timeout_sec,
     static_fetch_effective_timeout_sec,
 )
 from backend.board.gm_board import (
@@ -3193,7 +3196,8 @@ class _DetailItem:
     title: Optional[str] = ""     
     direct_attachments: Optional[List[Dict[str, Any]]] = None
     author_info: Optional[Dict[str, Any]] = None
-
+    cate1: str = ""
+    cate2: str = ""
 class BoardContentWorkflow:
     # router에서 주입/참조하는 필드들(인터페이스 호환)
     job_id: str = ""
@@ -6659,6 +6663,18 @@ class BoardContentWorkflow:
                             or item.get("post_date")
                             or ""
                         ).strip()
+                        _cate1_hint = str(
+                            item.get("cate1")
+                            or item.get("store_cate1")
+                            or item.get("assigned_cate1")
+                            or ""
+                        ).strip()
+                        _cate2_hint = str(
+                            item.get("cate2")
+                            or item.get("store_cate2")
+                            or item.get("assigned_cate2")
+                            or ""
+                        ).strip()
                     else:
                         url = str(item)
                         db_type = "unknown"
@@ -6670,6 +6686,9 @@ class BoardContentWorkflow:
                         _author_info = {}
                         _reg_date_hint = ""
                         
+
+                        _cate1_hint = ""
+                        _cate2_hint = ""
                     if not url: continue
                     u_norm = ensure_url_scheme(str(url).strip())
                     if board_static_first_should_disable_playwright(u_norm):
@@ -6708,6 +6727,9 @@ class BoardContentWorkflow:
                         reg_date_str=_reg_date_hint,
                         direct_attachments=_direct_attachments,
                         author_info=_author_info,
+
+                        cate1=_cate1_hint,
+                        cate2=_cate2_hint,
                     )
                     await q.put(detail_item)
                     enqueued_count += 1
@@ -6856,6 +6878,18 @@ class BoardContentWorkflow:
                                     or item.get("post_date")
                                     or ""
                                 ).strip()
+                                _cate1_hint = str(
+                                    item.get("cate1")
+                                    or item.get("store_cate1")
+                                    or item.get("assigned_cate1")
+                                    or ""
+                                ).strip()
+                                _cate2_hint = str(
+                                    item.get("cate2")
+                                    or item.get("store_cate2")
+                                    or item.get("assigned_cate2")
+                                    or ""
+                                ).strip()
                             else:
                                 url = str(item)
                                 db_type = "unknown"
@@ -6866,6 +6900,8 @@ class BoardContentWorkflow:
                                 _direct_attachments = None
                                 _author_info = {}
                                 _reg_date_hint = ""
+                                _cate1_hint = ""
+                                _cate2_hint = ""
                             if not url:
                                 continue
                             u_norm = ensure_url_scheme(str(url).strip())
@@ -6899,6 +6935,8 @@ class BoardContentWorkflow:
                                     reg_date_str=_reg_date_hint,
                                     direct_attachments=_direct_attachments,
                                     author_info=_author_info,
+                                    cate1=_cate1_hint,
+                                    cate2=_cate2_hint,
                                 )
                             )
                 except Exception as stream_ex:
@@ -14906,6 +14944,8 @@ class BoardContentWorkflow:
                 timeout_sec = float(default_sec)
             if timeout_sec <= 0:
                 return 0.0
+            if action in {"detail_prefetch_fetch", "detail_fetch_fetch"} and is_suwon_slow_detail_url(url):
+                timeout_sec = max(timeout_sec, suwon_slow_detail_fetch_guard_timeout_sec())
             return max(0.1, min(timeout_sec, 300.0))
 
         def _selection_slow_ms(action: str, default_ms: float) -> float:
@@ -19658,7 +19698,7 @@ class BoardContentWorkflow:
 
     def _domain_fetch_concurrency_limit(self, domain_key: str) -> int:
         if getattr(self, "is_attachment_file_crawl_workflow", False):
-            return 6
+            return 2
         limit = int(getattr(self, "_domain_fetch_max_concurrent", 6) or 6)
         return max(1, min(int(limit or 1), 32))
 
@@ -21466,7 +21506,11 @@ class BoardContentWorkflow:
                 )
             except Exception:
                 sock_read_timeout_sec = max(sock_read_timeout_sec, float(timeout_sec or 0.0))
-        connect_timeout_sec = max(0.5, min(connect_timeout_sec, max(0.5, timeout_sec)))
+        connect_timeout_sec = static_fetch_connect_timeout_sec(
+            url,
+            request_timeout_sec=timeout_sec,
+            configured_timeout_sec=connect_timeout_sec,
+        )
         sock_read_timeout_sec = max(1.0, min(sock_read_timeout_sec, max(1.0, timeout_sec)))
         request_timeout = aiohttp.ClientTimeout(
             total=timeout_sec,
