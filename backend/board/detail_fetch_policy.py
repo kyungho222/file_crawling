@@ -127,6 +127,45 @@ def sd_go_prefetch_static_fetch_timeout_sec() -> float:
     )
 
 
+def is_suwon_slow_detail_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    return bool(
+        host in {"suwon.go.kr", "www.suwon.go.kr"}
+        and (path.startswith("/culture/") or path.startswith("/web/reserv/"))
+        and path.endswith(".do")
+        and not path.endswith("/index.do")
+    )
+
+
+def suwon_slow_detail_static_fetch_timeout_sec() -> float:
+    return 10.0
+
+
+def suwon_slow_detail_fetch_guard_timeout_sec() -> float:
+    return 12.0
+
+
+def static_fetch_connect_timeout_sec(
+    url: str | None,
+    *,
+    request_timeout_sec: float,
+    configured_timeout_sec: float,
+) -> float:
+    """Resolve the TCP-connect budget without letting a short default preempt a scoped request."""
+    request_timeout = max(0.5, float(request_timeout_sec or 0.0))
+    configured_timeout = max(0.5, float(configured_timeout_sec or 0.0))
+    if is_suwon_slow_detail_url(url):
+        configured_timeout = max(configured_timeout, suwon_slow_detail_static_fetch_timeout_sec())
+    return min(configured_timeout, request_timeout)
+
+
 def prefetch_static_fetch_timeout_sec(
     url: str | None,
     *,
@@ -151,6 +190,8 @@ def prefetch_static_fetch_timeout_sec(
         base_timeout = dobong_receipt_prefetch_static_fetch_timeout_sec()
     elif is_sd_go_fast_static_fetch_url(url):
         base_timeout = sd_go_prefetch_static_fetch_timeout_sec()
+    elif is_suwon_slow_detail_url(url):
+        base_timeout = max(base_timeout, suwon_slow_detail_static_fetch_timeout_sec())
 
     return clamp_timeout(
         base_timeout,
@@ -174,6 +215,8 @@ def static_fetch_effective_timeout_sec(url: str | None, requested_timeout_sec: f
         return clamp_timeout(min(requested, dobong_receipt_prefetch_static_fetch_timeout_sec()), maximum=8.0)
     if is_sd_go_fast_static_fetch_url(url):
         return clamp_timeout(min(requested, sd_go_prefetch_static_fetch_timeout_sec()), maximum=15.0)
+    if is_suwon_slow_detail_url(url):
+        return clamp_timeout(max(requested, suwon_slow_detail_static_fetch_timeout_sec()), maximum=30.0)
     return max(5.0, requested)
 
 

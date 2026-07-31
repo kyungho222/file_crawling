@@ -7,6 +7,8 @@ import os
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
+import requests
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict
 
@@ -64,9 +66,11 @@ def _load_local_env_txt() -> dict[str, str]:
 _LOCAL_ENV_TXT_KEYS = _load_local_env_txt()
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
+from backend.file.file_wait_policy import backend_file_fetch_delay_sec
 from backend.local_file_crawl_server import (
     _base_payload,
     _bool_value,
@@ -83,6 +87,37 @@ from utils.db_name import resolve_db_name
 from utils.url import ensure_url_scheme
 
 logger = logging.getLogger("tools.file_crawl_dashboard.local_server")
+DASHBOARD_INSPECT: Dict[str, Dict[str, Any]] = {}
+DASHBOARD_COMMANDS: Dict[str, list[Dict[str, Any]]] = {}
+
+_probe_domain_last_request_at: Dict[str, float] = {}
+_probe_domain_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _probe_domain_interval_for_speed(speed_mode: Any) -> tuple[str, float]:
+    """공격형은 상세 fetch 기본 정책을 유지하고 안정형만 추가 간격을 둔다."""
+    normalized = str(speed_mode or "aggressive").strip().lower()
+    if normalized not in {"aggressive", "stable"}:
+        normalized = "aggressive"
+    if normalized == "aggressive":
+        return normalized, 0.5
+    return normalized, max(backend_file_fetch_delay_sec(), 3.0)
+
+
+async def _wait_for_probe_domain_interval(url: str, min_interval_sec: float) -> float:
+    """대시보드의 상세페이지 추출 요청을 도메인별로 완만하게 제한한다."""
+    domain = str(urlsplit(str(url or "")).netloc or "").lower()
+    if not domain:
+        return 0.0
+    lock = _probe_domain_locks.setdefault(domain, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        last_request_at = float(_probe_domain_last_request_at.get(domain) or 0.0)
+        wait_sec = max(0.0, max(0.0, float(min_interval_sec)) - (now - last_request_at))
+        if wait_sec > 0:
+            await asyncio.sleep(wait_sec)
+        _probe_domain_last_request_at[domain] = time.monotonic()
+        return wait_sec
 
 app = FastAPI(title="Local File Crawl Dashboard", version="1.0.0-local")
 app.add_middleware(
@@ -252,23 +287,22 @@ def _f1_dev_api_base() -> str:
 
 
 def _post_f1_dev_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    request = urllib.request.Request(
-        f"{_f1_dev_api_base()}/{path.lstrip('/')}",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
+    endpoint = f"{_f1_dev_api_base()}/{path.lstrip('/')}"
+    session = requests.Session()
+    session.trust_env = False
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=exc.code, detail=exc.read().decode("utf-8", errors="replace")[:500]) from exc
-    except Exception as exc:
+        response = session.post(endpoint, json=payload, timeout=45)
+    except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"f1_dev bridge unavailable: {exc}") from exc
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text[:500]}
+    if not response.ok:
+        raise HTTPException(status_code=response.status_code, detail=str(data.get("error") or data.get("detail") or data))
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="invalid f1_dev response")
     return data
-
 
 @app.post("/backend/file-dashboard/exploration-posts")
 @app.post("/Ai_Pro_filecrawler/backend/file-dashboard/exploration-posts")
@@ -278,6 +312,72 @@ async def proxy_exploration_posts(request: Request) -> JSONResponse:
         body = {}
     data = await asyncio.to_thread(_post_f1_dev_json, "/backend/file-dashboard/exploration-posts", body)
     return JSONResponse(data)
+
+@app.post("/backend/board/crawl-probe")
+@app.post("/Ai_Pro_filecrawler/backend/board/crawl-probe")
+async def local_file_crawl_probe(request: Request) -> JSONResponse:
+    """DB 작업 없이 상세 페이지에서 첨부 URL만 읽기 전용으로 추출한다."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    from backend.board.board_probe_endpoints import run_file_crawl_probe_readonly
+
+    probe_url = str(body.get("url") or body.get("detail_url") or body.get("contents_url") or "").strip()
+    speed_mode, domain_interval_sec = _probe_domain_interval_for_speed(body.get("speed_mode"))
+    throttle_wait_sec = await _wait_for_probe_domain_interval(probe_url, domain_interval_sec)
+    if domain_interval_sec > 0:
+        body["probe_domain_min_delay_sec"] = domain_interval_sec
+        body["probe_domain_max_delay_sec"] = domain_interval_sec
+    data = await run_file_crawl_probe_readonly(body)
+    data["dashboard_speed_mode"] = speed_mode
+    data["dashboard_domain_interval_sec"] = domain_interval_sec
+    data["dashboard_domain_wait_sec"] = round(throttle_wait_sec, 3)
+    status_code = 200 if data.get("status") == "ok" else 400
+    return JSONResponse(jsonable_encoder(data), status_code=status_code)
+
+
+@app.post("/local-file-crawl/api/inspect/{job_id}")
+async def save_dashboard_inspect(job_id: str, request: Request) -> JSONResponse:
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+    saved = DASHBOARD_INSPECT.setdefault(job_id, {"job_id": job_id, "logs": []})
+    if body.get("payload") is not None:
+        saved["payload"] = body.get("payload")
+    if body.get("rows") is not None:
+        saved["rows"] = body.get("rows")
+    event = body.get("event")
+    if isinstance(event, dict):
+        logs = saved.setdefault("logs", [])
+        logs.append(event)
+        del logs[:-200]
+    saved["updated_at"] = time.time()
+    return JSONResponse({"ok": True, "job_id": job_id})
+
+
+@app.get("/local-file-crawl/api/inspect/{job_id}")
+async def get_dashboard_inspect(job_id: str) -> JSONResponse:
+    saved = DASHBOARD_INSPECT.get(job_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="dashboard session not found")
+    return JSONResponse(saved)
+
+@app.post("/local-file-crawl/api/command/{job_id}")
+async def enqueue_dashboard_command(job_id: str, request: Request) -> JSONResponse:
+    body = await request.json()
+    if not isinstance(body, dict) or not str(body.get("action") or "").strip():
+        raise HTTPException(status_code=400, detail="action is required")
+    command = dict(body)
+    command["queued_at"] = time.time()
+    DASHBOARD_COMMANDS.setdefault(job_id, []).append(command)
+    return JSONResponse({"ok": True, "job_id": job_id, "pending": len(DASHBOARD_COMMANDS[job_id])})
+
+
+@app.get("/local-file-crawl/api/command/{job_id}")
+async def dequeue_dashboard_command(job_id: str) -> JSONResponse:
+    commands = DASHBOARD_COMMANDS.get(job_id) or []
+    command = commands.pop(0) if commands else None
+    return JSONResponse({"ok": True, "command": command, "pending": len(commands)})
 
 @app.get("/local-file-crawl/api/config")
 @app.get("/Ai_Pro_filecrawler/local-file-crawl/api/config")
@@ -319,19 +419,15 @@ async def local_dashboard_sse(db_name: str, job_id: str) -> StreamingResponse:
 
 @app.post("/c1/crawl_stop/{job_id}")
 @app.post("/Ai_Pro_filecrawler/c1/crawl_stop/{job_id}")
-async def local_dashboard_stop(job_id: str) -> JSONResponse:
-    task = getattr(crawler_state, "active_worker_tasks", {}).get(job_id)
-    cancelled = False
-    if task is not None and not task.done():
-        task.cancel()
-        cancelled = True
+async def local_dashboard_stop(job_id: str, request: Request) -> JSONResponse:
     try:
-        from backend.local_file_crawl_server import LOCAL_JOBS
-        saved = LOCAL_JOBS.setdefault(job_id, {})
-        saved.update({"status": "cancelled", "finished_at": time.time(), "message": "local stop requested"})
+        body = await request.json()
     except Exception:
-        logger.debug("[LocalFileCrawlDashboard] local job state stop update failed", exc_info=True)
-    return JSONResponse({"status": "cancelled", "job_id": job_id, "cancelled_task": cancelled})
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    data = await asyncio.to_thread(_post_f1_dev_json, f"/c1/crawl_stop/{job_id}", body)
+    return JSONResponse(data)
 
 
 @app.post("/backend/file/preview-homepage-categories")

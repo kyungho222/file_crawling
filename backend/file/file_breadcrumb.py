@@ -62,6 +62,22 @@ def _clean_breadcrumb_tokens(tokens: List[str]) -> List[str]:
     return cleaned
 
 
+def _own_label_tokens(node) -> List[str]:
+    if node is None:
+        return []
+    labels: List[str] = []
+    for child in getattr(node, "children", []) or []:
+        try:
+            child_name = str(getattr(child, "name", "") or "").lower()
+        except Exception:
+            child_name = ""
+        if child_name in {"a", "span", "em", "strong", "button"}:
+            text = child.get_text(" ", strip=True)
+            if text:
+                labels.append(text)
+    return labels
+
+
 def _own_label_text(node) -> str:
     if node is None:
         return ""
@@ -148,7 +164,13 @@ def extract_file_breadcrumb_tokens_from_html(html: str) -> List[str]:
             li_nodes = _top_level_li_nodes(node)
             if li_nodes:
                 for li in li_nodes:
-                    tokens.extend(_split_breadcrumb_tokens(_own_label_text(li)))
+                    direct_tokens = _own_label_tokens(li)
+                    if len(li_nodes) == 1 and len(direct_tokens) > 1:
+                        # Some templates put every depth into one li. Only this exceptional
+                        # shape preserves '/' inside a single menu name such as ??/??.
+                        tokens.extend(direct_tokens)
+                    else:
+                        tokens.extend(_split_breadcrumb_tokens(_own_label_text(li)))
             else:
                 direct_labels: List[str] = []
                 for child in getattr(node, "children", []) or []:

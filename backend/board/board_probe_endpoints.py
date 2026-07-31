@@ -263,6 +263,19 @@ async def run_file_crawl_probe_readonly(body: Dict[str, Any]) -> Dict[str, Any]:
     workflow.enable_learning = False
     workflow.file_pipeline_skip_learning = True
 
+    try:
+        probe_min_delay_sec = float(body.get("probe_domain_min_delay_sec") or 0.0)
+    except Exception:
+        probe_min_delay_sec = 0.0
+    if probe_min_delay_sec > 0:
+        probe_min_delay_sec = min(probe_min_delay_sec, 5.0)
+        try:
+            probe_max_delay_sec = float(body.get("probe_domain_max_delay_sec") or probe_min_delay_sec)
+        except Exception:
+            probe_max_delay_sec = probe_min_delay_sec
+        workflow._domain_fetch_min_delay_sec = probe_min_delay_sec
+        workflow._domain_fetch_max_delay_sec = max(probe_min_delay_sec, min(probe_max_delay_sec, 10.0))
+
     html = ""
     fetch_method = "static"
     try:
@@ -310,7 +323,11 @@ async def run_file_crawl_probe_readonly(body: Dict[str, Any]) -> Dict[str, Any]:
         probe_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         metadata_date = reg_date
 
-        attachments = workflow._extract_attachment_links_generic(html, base_url=url)
+        from backend.file.fast_attachment_extractor import extract_fast_attachments
+
+        attachments = extract_fast_attachments(html, url)
+        if not attachments:
+            attachments = extract_fast_attachments(html, url, force_full_scan=True)
         try:
             ajax_attachments = await workflow._extract_kcohesion_filelist_attachments(html, base_url=url)
         except Exception:
@@ -322,6 +339,7 @@ async def run_file_crawl_probe_readonly(body: Dict[str, Any]) -> Dict[str, Any]:
             if href and key not in seen:
                 attachments.append(item)
                 seen.add(key)
+
 
         return {
             "status": "ok",

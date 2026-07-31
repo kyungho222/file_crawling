@@ -1,4 +1,4 @@
-﻿.env
+.env
 .env.*
 !.env.example
 !.env.*.example
@@ -67,3 +67,16 @@ scripts/*result*.txt
 scripts/oka_*.json
 scripts/oka_*.txt
 backend/src/db/ai_news참고용/
+# Local tests (kept outside repository commits)
+tests/
+test/
+test_*.py
+*_test.py
+
+# Python virtual environments
+.venv/
+venv/
+env/
+virtualenv/
+ENV/
+pyvenv.cfg

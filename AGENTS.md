@@ -118,6 +118,9 @@
 
 근거: `docs/codebase_optimization_structure.md`, `backend/shared/start_urls_preexpand.py`, `backend/shared/pre_explored_url.py`, `backend/shared/sse_publish_queue.py`, `backend/shared/redis_sse_service.py`, `utils/http_client.py`, `docs/file_crawl_stage_boundaries.md`
 
+## 수정 결과 보고
+
+- 코드, 설정, 문서 파일을 수정한 경우 최종 응답에 수정한 파일명을 반드시 목록으로 알린다.
 ## 테스트와 검증 규칙
 
 - 이 프로젝트는 pytest 패키지 구조보다 `scripts/test_*.py`, `scripts/verify_*.py`, `scripts/check_*.py`, `scripts/compare_*.py`, `scripts/diagnose_*.py`, `scripts/benchmark_*.py` 형태의 검증 스크립트가 중심이다.
