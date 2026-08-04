@@ -112,13 +112,6 @@ router.include_router(file_router)
 router.include_router(db_bridge_router)
 
 # f1_dev 브리지는 이 router가 /Ai_Pro_filecrawler prefix로 등록된 뒤 사용된다.
-try:
-    from tools.file_dashboard.integration import include_backend_routes as include_file_dashboard_backend_routes
-
-    include_file_dashboard_backend_routes(router)
-except Exception as exc:
-    logger.warning("[FileDashboard] backend API router include skipped: %s", exc)
-
 # Debug: router module loaded (no file writes)
 try:
     logging.getLogger("backend.router").debug(

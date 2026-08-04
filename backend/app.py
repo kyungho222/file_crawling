@@ -165,13 +165,6 @@ app.include_router(backend_router, prefix="/Ai_Pro_filecrawler")
 # Board dashboard routes removed: this project is file-crawling only.
 
 try:
-    from tools.file_dashboard.integration import include_public_routes as include_file_dashboard_routes
-
-    include_file_dashboard_routes(app)
-except Exception as exc:
-    logger.warning("[FileDashboard] router include skipped: %s", exc)
-
-try:
     from tools.file_crawl_dashboard.integration import include_public_routes as include_file_crawl_dashboard_routes
 
     include_file_crawl_dashboard_routes(app)
