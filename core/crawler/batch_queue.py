@@ -40,6 +40,10 @@ class BatchQueue(Generic[T]):
                 self.buffer = self.buffer[self.batch_size:]
                 await self.queue.put(batch)
 
+    def put_nowait(self, item: T) -> None:
+        if self.batch_size > 1:
+            raise RuntimeError("BatchQueue.put_nowait requires batch_size=1")
+        self.queue.put_nowait([item])
     async def get(self) -> List[T]:
         """큐에서 배치를 가져옴"""
         return await self.queue.get()

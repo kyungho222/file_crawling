@@ -1,0 +1,13 @@
+{
+  "db_name": "newvit",
+  "job_id": "file-test-7bcdce14",
+  "target_domains": [],
+  "total_crawled": 1,
+  "crawled_at": "2026-07-30T20:14:08.254728",
+  "status": "completed",
+  "urls": [
+    {
+      "url": "https://suwon.go.kr/culture/ingCultureView.do?ctrseqno=6&listtype=main"
+    }
+  ]
+}

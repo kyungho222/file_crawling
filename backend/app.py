@@ -195,6 +195,13 @@ try:
 except Exception as exc:
     logger.warning("[FilecrawlerBatch] router include skipped: %s", exc)
 
+try:
+    from backend.simhash_matcher.router import router as simhash_matcher_router
+
+    # Public SimHash API. It is independent from the crawler workflow routes.
+    app.include_router(simhash_matcher_router, prefix="/api-aipro/f1/Ai_Pro_filecrawler")
+except Exception as exc:
+    logger.warning("[SimHashMatcher] router include skipped: %s", exc)
 
 def _log_callback_routes() -> None:
     try:
@@ -847,4 +854,3 @@ if __name__ == "__main__":
         reload=settings.RELOAD,
         loop=_loop,
     )
-

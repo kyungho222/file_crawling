@@ -4407,6 +4407,7 @@ class BoardContentWorkflow:
                             display_name=(subject_value or url),
                             post_reg_date=(result or {}).get("reg_date"),
                             preserve_created_at=preserve_created_at,
+                            mark_status_y_on_submit=False,
                         )
                         if batch_submit_result.get("learn_list_id") is None:
                             batch_id_for_cancel = str(batch_submit_result.get("batch_id") or "").strip()
@@ -4783,35 +4784,21 @@ class BoardContentWorkflow:
                 # - web_title 보강·progress_callback 이후 summarize_keywords(또는 FIRE_AND_FORGET 시 백그라운드)
                 # 별도의 update_learn_list_status_board 호출은 중복이다.
                 if batch_submitted:
-                    status_y_on_submit = bool((url_result or {}).get("status_y_on_submit"))
-                    if learn_success and status_y_on_submit:
-                        study_counter_key = self._build_stats_counter_key(
-                            url=url_key,
-                            learn_list_id=resolved_learn_list_id,
-                        )
-                        try:
-                            append_stage_urls(
-                                stage="study",
-                                urls=[
-                                    {
-                                        "url": url_key or url,
-                                        "db_id": str(resolved_learn_list_id) if resolved_learn_list_id is not None else None,
-                                    }
-                                ],
-                                job_id=getattr(self, "job_id", None),
-                                db_name=getattr(self, "db_name", None),
-                            )
-                        except Exception:
-                            pass
-                        await self._mark_study_done(
-                            url=url_key,
-                            outcome="success",
-                            counter_key=study_counter_key,
-                        )
+                    # Scheduler acceptance is not learning completion.  The callback
+                    # verifies the PG write and then updates LEARN_LIST.status to Y.
+                    result["embedding_batch_background_queued"] = True
+                    result["embedding_batch_id"] = (url_result or {}).get("batch_id")
+                    logger.info(
+                        "[Learning][batch_pending] job_id=%s url=%s learn_list_id=%s batch_id=%s chunks=%s",
+                        self.job_id,
+                        (url or "")[:180],
+                        resolved_learn_list_id,
+                        (url_result or {}).get("batch_id"),
+                        chunks,
+                    )
                     if self.progress_callback:
                         self.progress_callback(self.get_stats())
-                    return learn_success
-
+                    return False
                 learning_ok = False
                 if resolved_learn_list_id is not None and learn_success and self.db_name and self.chat_bot_id:
                     try:
@@ -6338,7 +6325,11 @@ class BoardContentWorkflow:
                 "contents_detail_direct",
                 "contents_url_fallback",
             )
-            if _has_dedupe_selection:
+            if override_src in ("file_crawl_post_db", "file_crawl_post_db_stream"):
+                # The file dispatcher already resolved type='post' detail URLs.
+                # Keep the first scan display tied to that concrete list only.
+                _fixed_display_count = _actual_start_urls_count
+            elif _has_dedupe_selection:
                 _fixed_display_count = max(_actual_start_urls_count, _dedupe_selected_count, _pre_count_hint)
             elif _exact_target_source:
                 _fixed_display_count = max(_actual_start_urls_count, _pre_count_hint)
@@ -20073,6 +20064,7 @@ class BoardContentWorkflow:
             trace_enabled = _board_fetch_stage_trace_enabled()
             request_timeout = kwargs.get("timeout")
             request_timeout_sec = getattr(request_timeout, "total", None)
+            connect_timeout_sec = getattr(request_timeout, "connect", None)
             if trace_enabled:
                 crawl_trace(
                     logger,
@@ -20125,6 +20117,13 @@ class BoardContentWorkflow:
                     counts=snapshot,
                     error=repr(exc),
                     url=url,
+                )
+                logger.warning(
+                    "[FetchTimeoutDebug][response_budget] job_id=%s total_timeout_sec=%s connect_timeout_sec=%s url=%s",
+                    getattr(self, "job_id", ""),
+                    request_timeout_sec,
+                    connect_timeout_sec,
+                    (url or "")[:220],
                 )
                 logger.warning(
                     self._format_fetch_timeout_debug_log(
@@ -20591,8 +20590,9 @@ class BoardContentWorkflow:
             return {}
 
     def _static_fetch_retry_enabled(self, url: str, *, http_fallback_attempted: bool = False) -> bool:
-        return False
-
+        # Detail fetches for attachment crawling should recover from transient
+        # connection timeouts before the page is classified as attachment-empty.
+        return bool(getattr(self, "is_attachment_file_crawl_workflow", False) and not http_fallback_attempted)
     def _static_prefetch_empty_cache_enabled(self) -> bool:
         return str(os.getenv("BOARD_STATIC_PREFETCH_EMPTY_CACHE_ENABLED", "1") or "1").strip().lower() in {
             "1",

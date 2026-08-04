@@ -316,25 +316,12 @@ async def proxy_exploration_posts(request: Request) -> JSONResponse:
 @app.post("/backend/board/crawl-probe")
 @app.post("/Ai_Pro_filecrawler/backend/board/crawl-probe")
 async def local_file_crawl_probe(request: Request) -> JSONResponse:
-    """DB 작업 없이 상세 페이지에서 첨부 URL만 읽기 전용으로 추출한다."""
+    """Run the selection probe on the same F1 runtime used by save and learn."""
     body = await request.json()
     if not isinstance(body, dict):
         body = {}
-    from backend.board.board_probe_endpoints import run_file_crawl_probe_readonly
-
-    probe_url = str(body.get("url") or body.get("detail_url") or body.get("contents_url") or "").strip()
-    speed_mode, domain_interval_sec = _probe_domain_interval_for_speed(body.get("speed_mode"))
-    throttle_wait_sec = await _wait_for_probe_domain_interval(probe_url, domain_interval_sec)
-    if domain_interval_sec > 0:
-        body["probe_domain_min_delay_sec"] = domain_interval_sec
-        body["probe_domain_max_delay_sec"] = domain_interval_sec
-    data = await run_file_crawl_probe_readonly(body)
-    data["dashboard_speed_mode"] = speed_mode
-    data["dashboard_domain_interval_sec"] = domain_interval_sec
-    data["dashboard_domain_wait_sec"] = round(throttle_wait_sec, 3)
-    status_code = 200 if data.get("status") == "ok" else 400
-    return JSONResponse(jsonable_encoder(data), status_code=status_code)
-
+    data = await asyncio.to_thread(_post_f1_dev_json, "/backend/board/crawl-probe", body)
+    return JSONResponse(data)
 
 @app.post("/local-file-crawl/api/inspect/{job_id}")
 async def save_dashboard_inspect(job_id: str, request: Request) -> JSONResponse:

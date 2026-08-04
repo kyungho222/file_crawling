@@ -1154,7 +1154,7 @@ async def submit_crawled_url_embedding_batch(
     display_name: str,
     post_reg_date: Optional[Any] = None,
     preserve_created_at: bool = False,
-    mark_status_y_on_submit: bool = True,
+    mark_status_y_on_submit: bool = False,
     presave_rows: bool = True,
 ) -> Dict[str, Any]:
     normalized_content_type = _normalize_batch_content_type(result.get("content_type"))
@@ -1891,22 +1891,42 @@ async def process_embedding_callback(payload: Dict[str, Any]) -> Dict[str, Any]:
     learning_ok = False
     if learn_list_id is not None and chat_bot_id and db_name:
         if status_y_on_submit:
-            learning_ok = True
+            # Older contexts may say status=Y was applied at submission time.
+            # Re-apply and verify it after the callback PG write so Redis cannot
+            # report completion while LEARN_LIST remains N.
+            from backend.shared.db_write_queue import run_db_write
+            from db.mariadb_save_update import update_learn_list_status_board
+
+            learning_ok = bool(
+                await run_db_write(
+                    "batch_embedding.callback_status_y_verify",
+                    lambda: update_learn_list_status_board(
+                        db_name=db_name,
+                        chat_bot_id=chat_bot_id,
+                        db_id=str(learn_list_id),
+                        chunks=len(inserted_records) or len(merged_rows),
+                        raw_filters_str=None,
+                        content_created_at=context.get("post_reg_date"),
+                        preserve_created_at=_as_bool(context.get("preserve_created_at")),
+                    ),
+                )
+            )
             _flow_debug(
-                "callback.learning_finalize_skipped",
+                "callback.status_y_reverified",
                 batch_id=batch_id,
                 db_name=db_name,
                 learn_list_id=learn_list_id,
-                reason="status_y_on_submit",
+                learning_ok=learning_ok,
             )
-            await _dispatch_summarize_keywords_after_status_y_on_submit(
-                chat_bot_id=chat_bot_id,
-                db_name=db_name,
-                learn_list_id=learn_list_id,
-                source_url=source_url,
-                content_type=content_type,
-                batch_id=batch_id,
-            )
+            if learning_ok:
+                await _dispatch_summarize_keywords_after_status_y_on_submit(
+                    chat_bot_id=chat_bot_id,
+                    db_name=db_name,
+                    learn_list_id=learn_list_id,
+                    source_url=source_url,
+                    content_type=content_type,
+                    batch_id=batch_id,
+                )
         else:
             from backend.shared.learning_finalize import finalize_learning_to_mariadb
 

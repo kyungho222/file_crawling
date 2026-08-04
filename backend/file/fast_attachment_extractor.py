@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 from backend.board.anseong_file import resolve_anseong_yhlib_download_url
 from backend.board.yongin_board import resolve_yongin_file_download_url
 from utils.attachment_url_normalize import canonicalize_attachment_url_for_learn_list
-from utils.file import strip_fallback_download_label, strip_trailing_file_size
+from utils.file import parse_display_file_size_bytes, strip_fallback_download_label, strip_trailing_file_size
 from utils.url import canonicalize_url_for_dedup, extract_download_url_from_js, normalize_attachment_href
 
 
@@ -112,6 +112,7 @@ class FastAttachment:
     reason: str = "href"
     source: str = "fast_file_front"
     needs_response_validation: bool = False
+    declared_file_size_bytes: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         out = asdict(self)
@@ -672,7 +673,7 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append(FastAttachment(href=href, name=name, post_url=base_url, reason=reason, needs_response_validation=needs_validation))
+        out.append(FastAttachment(href=href, name=name, post_url=base_url, reason=reason, needs_response_validation=needs_validation, declared_file_size_bytes=parse_display_file_size_bytes(_node_text(node)) or 0))
     if not out:
         anchor_re = re.compile(
             r"<a\b[^>]*\bhref\s*=\s*(['\"])(?P<href>.*?)\1[^>]*>(?P<body>.*?)</a>",
@@ -693,7 +694,7 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
             if not key or key in seen:
                 continue
             seen.add(key)
-            out.append(FastAttachment(href=href, name=name or "attachment", post_url=base_url, reason=f"regex_{reason or 'href'}", needs_response_validation=needs_validation))
+            out.append(FastAttachment(href=href, name=name or "attachment", post_url=base_url, reason=f"regex_{reason or 'href'}", needs_response_validation=needs_validation, declared_file_size_bytes=parse_display_file_size_bytes(body) or 0))
     return [x.to_dict() for x in out]
 
 

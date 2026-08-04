@@ -18,8 +18,27 @@ from typing import Any, Dict, Optional
 
 from asyncio import Queue
 from core.crawler.batch_queue import BatchQueue
+from utils.file import parse_display_file_size_bytes
 
 logger = logging.getLogger(__name__)
+
+
+def is_large_download_item(item: Any) -> bool:
+    """Classify only declared-size attachments; unknown sizes stay in the normal lane."""
+    try:
+        threshold_mb = float(os.getenv("DOWNLOAD_LARGE_FILE_THRESHOLD_MB", "20") or "20")
+    except Exception:
+        threshold_mb = 20.0
+    threshold_bytes = int(max(1.0, min(threshold_mb, 1024.0)) * 1024 * 1024)
+    meta = item if isinstance(item, dict) else {}
+    original_meta = meta.get("original_meta") if isinstance(meta.get("original_meta"), dict) else {}
+    candidates = (
+        meta.get("declared_file_size_bytes"),
+        parse_display_file_size_bytes(meta.get("name")),
+        parse_display_file_size_bytes(meta.get("subject")),
+        parse_display_file_size_bytes(original_meta.get("attachment_name")),
+    )
+    return max((int(size) for size in candidates if size), default=0) >= threshold_bytes
 
 
 def _env_queue_maxsize(name: str, default: int) -> int:
@@ -45,6 +64,11 @@ def _collection_queue_maxsize() -> int:
     if os.getenv("CRAWLER_BATCH_QUEUE_MAXSIZE") is not None:
         return _env_queue_maxsize("CRAWLER_BATCH_QUEUE_MAXSIZE", 30)
     return 30
+
+
+def _collection_lane_queue_maxsize() -> int:
+    """Split the existing aggregate collection capacity across both lanes."""
+    return max(1, (_collection_queue_maxsize() + 1) // 2)
 
 
 _job_pause_flags: Dict[str, Dict[str, bool]] = {}
@@ -271,11 +295,23 @@ class JobQueues:
     collection_batch_queue: BatchQueue = field(
         default_factory=lambda: BatchQueue(
             batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1),
-            queue_maxsize=_collection_queue_maxsize(),
+            queue_maxsize=_collection_lane_queue_maxsize(),
+        )
+    )
+    large_collection_batch_queue: BatchQueue = field(
+        default_factory=lambda: BatchQueue(
+            batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1),
+            queue_maxsize=_collection_lane_queue_maxsize(),
         )
     )
     save_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_SAVE_BATCH_SIZE", 3)))
     study_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_STUDY_BATCH_SIZE", 3)))
+    retry_batch_queue: BatchQueue = field(
+        default_factory=lambda: BatchQueue(
+            batch_size=1,
+            queue_maxsize=_env_queue_maxsize("DOWNLOAD_FAILED_RETRY_MAXSIZE", 500),
+        )
+    )
     progress_queue: Queue = field(default_factory=lambda: Queue(maxsize=_env_queue_maxsize("CRAWLER_PROGRESS_QUEUE_MAXSIZE", 500)))
 
     async def drain(self) -> Dict[str, int]:
@@ -285,8 +321,10 @@ class JobQueues:
             "progress_queue": await _drain_asyncio_queue_nowait(self.progress_queue),
             "scan_batch_queue": await _clear_batch_queue_nowait(self.scan_batch_queue),
             "collection_batch_queue": await _clear_batch_queue_nowait(self.collection_batch_queue),
+            "large_collection_batch_queue": await _clear_batch_queue_nowait(self.large_collection_batch_queue),
             "save_batch_queue": await _clear_batch_queue_nowait(self.save_batch_queue),
             "study_batch_queue": await _clear_batch_queue_nowait(self.study_batch_queue),
+            "retry_batch_queue": await _clear_batch_queue_nowait(self.retry_batch_queue),
         }
 
     def snapshot(self) -> Dict[str, int]:
@@ -317,8 +355,10 @@ class JobQueues:
             "progress_queue": self.progress_queue.qsize(),
             "scan_batch_queue": scan_batch_size,
             "collection_batch_queue": collection_batch_size,
+            "large_collection_batch_queue": self.large_collection_batch_queue.queue.qsize(),
             "save_batch_queue": save_batch_size,
             "study_batch_queue": study_batch_size,
+            "retry_batch_queue": self.retry_batch_queue.queue.qsize(),
         }
 
     def debug_snapshot(self) -> Dict[str, Any]:
@@ -327,8 +367,10 @@ class JobQueues:
         for name in (
             "scan_batch_queue",
             "collection_batch_queue",
+            "large_collection_batch_queue",
             "save_batch_queue",
             "study_batch_queue",
+            "retry_batch_queue",
         ):
             batch_queue = getattr(self, name, None)
             raw_queue = getattr(batch_queue, "queue", None)
@@ -351,7 +393,12 @@ class JobQueues:
 _job_queue_registry: Dict[str, JobQueues] = {}
 
 
-def create_job_queues(job_id: str, *, collection_batch_size: Optional[int] = None) -> JobQueues:
+def create_job_queues(
+    job_id: str,
+    *,
+    collection_batch_size: Optional[int] = None,
+    collection_queue_maxsize: Optional[int] = None,
+) -> JobQueues:
     """Create and register queues for a job.
 
     collection_batch_size:
@@ -366,11 +413,22 @@ def create_job_queues(job_id: str, *, collection_batch_size: Optional[int] = Non
         except Exception:
             bs = _env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1)
         bs = max(1, min(bs, 500))
+    if collection_queue_maxsize is None:
+        queue_maxsize = _collection_queue_maxsize()
+    else:
+        queue_maxsize = max(1, min(int(collection_queue_maxsize), 5000))
     cbq = BatchQueue(
         batch_size=bs,
-        queue_maxsize=_collection_queue_maxsize(),
+        queue_maxsize=max(1, queue_maxsize // 2),
     )
-    queues = JobQueues(collection_batch_queue=cbq)
+    large_cbq = BatchQueue(
+        batch_size=bs,
+        queue_maxsize=max(1, queue_maxsize // 2),
+    )
+    queues = JobQueues(
+        collection_batch_queue=cbq,
+        large_collection_batch_queue=large_cbq,
+    )
     _job_queue_registry[job_id] = queues
     logger.debug(
         "[Queues] Created job queues | job_id=%s collection_batch_size=%s",

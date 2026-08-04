@@ -158,7 +158,7 @@ async def prewarm_crawl_db_cache(*, chat_bot_id: str = "", db_name: str = "") ->
 
 
 def _learn_list_status_verify_enabled() -> bool:
-    raw = str(os.getenv("BOARD_LEARN_LIST_STATUS_VERIFY", "0") or "0").strip().lower()
+    raw = str(os.getenv("BOARD_LEARN_LIST_STATUS_VERIFY", "1") or "1").strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
 
 

@@ -16,6 +16,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config.settings import settings
+try:
+    from core.crawler.queues import is_large_download_item
+except ImportError:
+    def is_large_download_item(item: Any) -> bool:
+        """Compatibility fallback for a partially deployed queue module."""
+        try:
+            threshold_mb = float(os.getenv("DOWNLOAD_LARGE_FILE_THRESHOLD_MB", "20") or "20")
+            declared_size = int((item or {}).get("declared_file_size_bytes") or 0)
+            return declared_size >= int(max(1.0, threshold_mb) * 1024 * 1024)
+        except Exception:
+            return False
 from utils.attachment_url_normalize import (
     canonicalize_attachment_url_for_learn_list,
     extract_attachment_key_candidates,
@@ -23,6 +34,7 @@ from utils.attachment_url_normalize import (
 from utils.download_doc_filter import should_skip_attachment_at_scan
 from utils.download_integrity import wait_for_file_ready
 from utils.file import (
+    parse_display_file_size_bytes,
     preserve_file_learning_subject,
     strip_fallback_download_label,
     strip_file_type_display_prefix,
@@ -38,6 +50,7 @@ from backend.shared.completed_url_ttl_cache import completed_url_cached, remembe
 from backend.shared.file_name_debug import emit_file_name_debug
 
 from urllib.parse import unquote, urlencode, urlparse
+
 
 try:
     from backend.shared.stage_url_report import append_stage_urls  # type: ignore
@@ -726,10 +739,10 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         study_workers = 1
     study_workers = max(1, min(study_workers, 4))
     try:
-        download_workers = int(os.getenv("FILE_CRAWL_DOWNLOAD_WORKERS", "2") or "2")
+        download_workers = int(os.getenv("FILE_CRAWL_DOWNLOAD_WORKERS", "4") or "4")
     except Exception:
         download_workers = 1
-    download_workers = max(1, min(download_workers, 2))
+    download_workers = max(1, min(download_workers, 4))
     return {
         "scan_workers": 1,
         "collection_workers": collection_workers,
@@ -744,17 +757,12 @@ _file_learn_list_insert_semaphore_size: Optional[int] = None
 
 
 def _file_learn_list_insert_concurrency_default() -> int:
+    """Keep LEARN_LIST insert concurrency aligned with the four save workers."""
     try:
-        value = int(
-            os.getenv(
-                "FILE_LEARN_LIST_INSERT_CONCURRENCY",
-                str(min(_file_crawl_pipeline_concurrency_default(), 3)),
-            )
-            or str(min(_file_crawl_pipeline_concurrency_default(), 3))
-        )
+        value = int(os.getenv("FILE_LEARN_LIST_INSERT_CONCURRENCY", "4") or "4")
     except Exception:
-        value = min(_file_crawl_pipeline_concurrency_default(), 3)
-    return max(1, min(value, 32))
+        value = 4
+    return max(1, min(value, 4))
 
 
 def _get_file_learn_list_insert_semaphore() -> asyncio.Semaphore:
@@ -766,6 +774,14 @@ def _get_file_learn_list_insert_semaphore() -> asyncio.Semaphore:
         _file_learn_list_insert_semaphore = asyncio.Semaphore(size)
         _file_learn_list_insert_semaphore_size = size
     return _file_learn_list_insert_semaphore
+
+
+def _file_learn_list_ensure_timeout_sec() -> float:
+    try:
+        value = float(os.getenv("FILE_LEARN_LIST_ENSURE_TIMEOUT_SEC", "300") or "300")
+    except Exception:
+        value = 300.0
+    return max(30.0, min(value, 900.0))
 
 
 def _file_crawl_learn_completion_window_default() -> int:
@@ -784,6 +800,14 @@ def _file_crawl_learn_completion_window_default() -> int:
     except Exception:
         value = default_window
     return max(1, min(value, 128))
+
+
+def _file_pipeline_collection_queue_maxsize() -> int:
+    try:
+        value = int(os.getenv("FILE_PIPELINE_COLLECTION_QUEUE_MAXSIZE", "500") or "500")
+    except Exception:
+        value = 500
+    return max(30, min(value, 5000))
 
 
 def _file_pipeline_collection_batch_size_default() -> int:
@@ -927,6 +951,7 @@ class BoardContentFilePipelineMixin:
     _file_worker_manager_cleanup_pending: Any
     _file_worker_task: Optional[asyncio.Task]
     _file_progress_task: Optional[asyncio.Task]
+    _file_progress_tasks: Set[asyncio.Task]
     _file_queue_watchdog_task: Optional[asyncio.Task]
     _file_pipeline_lock: asyncio.Lock
     _stats_lock: asyncio.Lock
@@ -949,6 +974,97 @@ class BoardContentFilePipelineMixin:
             self._file_pipeline_learn_semaphore = sem
         return sem
 
+    def _file_progress_worker_count(self) -> int:
+        try:
+            workers = int(os.getenv("FILE_CRAWL_SAVE_WORKERS", "4") or "4")
+        except Exception:
+            workers = 2
+        return max(1, min(workers, 4))
+
+    def _file_progress_dispatch_worker_count(self) -> int:
+        try:
+            workers = int(os.getenv("FILE_CRAWL_PROGRESS_DISPATCH_WORKERS", "2") or "2")
+        except Exception:
+            workers = 2
+        return max(1, min(workers, 4))
+
+    async def _ensure_file_progress_workers(self) -> None:
+        save_queue = getattr(self, "_file_save_queue", None)
+        if save_queue is None:
+            try:
+                maxsize = int(os.getenv("FILE_CRAWL_SAVE_QUEUE_MAXSIZE", "500") or "500")
+            except Exception:
+                maxsize = 500
+            save_queue = asyncio.Queue(maxsize=max(1, min(maxsize, 5000)))
+            self._file_save_queue = save_queue
+
+        async def _ensure_tasks(attribute: str, desired: int, factory: Any, label: str) -> Set[asyncio.Task]:
+            existing = getattr(self, attribute, None)
+            if not isinstance(existing, set):
+                existing = set()
+            alive = {task for task in existing if isinstance(task, asyncio.Task) and not task.done()}
+            missing = max(0, desired - len(alive))
+            if missing:
+                start_index = len(alive)
+                alive.update(
+                    asyncio.create_task(
+                        factory(),
+                        name=f"{label}-{getattr(self, 'job_id', 'unknown')}-{start_index + index + 1}",
+                    )
+                    for index in range(missing)
+                )
+                logger.warning(
+                    "[FileCrawlTrace][workers_replenished] job_id=%s stage=%s desired=%s alive_before=%s started=%s",
+                    getattr(self, "job_id", None),
+                    label,
+                    desired,
+                    desired - missing,
+                    missing,
+                )
+            setattr(self, attribute, alive)
+            return alive
+
+        dispatch_tasks = await _ensure_tasks(
+            "_file_progress_dispatch_tasks",
+            self._file_progress_dispatch_worker_count(),
+            self._run_file_progress_loop,
+            "file-progress-dispatch",
+        )
+        save_tasks = await _ensure_tasks(
+            "_file_progress_tasks",
+            self._file_progress_worker_count(),
+            self._run_file_save_loop,
+            "file-progress-save",
+        )
+        self._file_progress_task = next(iter(save_tasks), None)
+        logger.debug(
+            "[FileCrawlTrace][progress_pipeline_ready] job_id=%s dispatch_workers=%s save_workers=%s save_queue_max=%s",
+            getattr(self, "job_id", None),
+            len(dispatch_tasks),
+            len(save_tasks),
+            save_queue.maxsize,
+        )
+
+    async def _wait_for_file_save_drain(self) -> None:
+        queue = getattr(self, "_file_save_queue", None)
+        if queue is not None:
+            await queue.join()
+
+    async def _stop_file_progress_workers(self) -> None:
+        tasks = set(getattr(self, "_file_progress_dispatch_tasks", set()) or set())
+        tasks.update(set(getattr(self, "_file_progress_tasks", set()) or set()))
+        fallback = getattr(self, "_file_progress_task", None)
+        if isinstance(fallback, asyncio.Task):
+            tasks.add(fallback)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._file_progress_dispatch_tasks = set()
+        self._file_progress_tasks = set()
+        self._file_progress_task = None
+        self._file_save_queue = None
     def _file_parallel_learn_enabled(self) -> bool:
         if not getattr(self, "is_attachment_file_crawl_workflow", False):
             return False
@@ -1170,6 +1286,13 @@ class BoardContentFilePipelineMixin:
             self.use_global_pool = bool(use_global_pool)
         except Exception:
             pass
+        # Attachment file crawling uses an isolated WorkerManager per job.
+        # This prevents another job from consuming this job's download workers.
+        if getattr(self, "is_attachment_file_crawl_workflow", False):
+            use_global_pool = False
+            self.use_global_pool = False
+        if self._file_job_queues:
+            await self._ensure_file_local_finalize_workers()
         if self._file_job_queues and (self._file_worker_manager or use_global_pool):
             if not use_global_pool:
                 return
@@ -1191,6 +1314,8 @@ class BoardContentFilePipelineMixin:
                 use_global_pool = False
                 self.use_global_pool = False
         async with self._file_pipeline_lock:
+            if self._file_job_queues:
+                await self._ensure_file_local_finalize_workers()
             if self._file_job_queues and (self._file_worker_manager or use_global_pool):
                 if not use_global_pool:
                     return
@@ -1226,7 +1351,15 @@ class BoardContentFilePipelineMixin:
                     except Exception:
                         coll_bs = _file_pipeline_collection_batch_size_default()
                     coll_bs = max(1, min(coll_bs, 256))
-                self._file_job_queues = create_job_queues(queue_key, collection_batch_size=coll_bs)
+                self._file_job_queues = create_job_queues(
+                    queue_key,
+                    collection_batch_size=coll_bs,
+                    collection_queue_maxsize=(
+                        _file_pipeline_collection_queue_maxsize()
+                        if getattr(self, "is_attachment_file_crawl_workflow", False)
+                        else None
+                    ),
+                )
             try:
                 _plc = int(
                     os.getenv(
@@ -1261,6 +1394,14 @@ class BoardContentFilePipelineMixin:
             if not use_global_pool:
                 self._file_worker_manager_cleanup_pending = None
                 worker_config = _file_pipeline_worker_config()
+                logger.info(
+                    "[FileCrawlTrace][worker_config] job_id=%s download_workers=%s download_max_concurrent=%s save_workers=%s study_workers=%s",
+                    self.job_id,
+                    worker_config.get("download_workers"),
+                    worker_config.get("download_max_concurrent"),
+                    self._file_progress_worker_count(),
+                    worker_config.get("study_workers"),
+                )
                 self._file_worker_manager = WorkerManager(
                     on_collection_batch=None,
                     chat_bot_id=self.chat_bot_id,
@@ -1300,14 +1441,61 @@ class BoardContentFilePipelineMixin:
                     worker_config,
                 )
                 logger.debug("[file_crawl][board][file] file pipeline started | job_id=%s", self.job_id)
-            if not self._file_progress_task or self._file_progress_task.done():
-                self._file_progress_task = asyncio.create_task(self._run_file_progress_loop())
+            await self._ensure_file_local_finalize_workers()
+            await self._ensure_file_progress_workers()
             if not getattr(self, "_file_queue_watchdog_task", None) or self._file_queue_watchdog_task.done():
                 self._file_queue_watchdog_task = asyncio.create_task(
                     self._run_file_queue_watchdog(),
                     name=f"file-queue-watchdog-{self.job_id or 'unknown'}",
                 )
 
+            if not getattr(self, "_file_pipeline_review_logged", False):
+                try:
+                    domain_concurrency = int(
+                        os.getenv("DOWNLOAD_DOMAIN_MAX_CONCURRENT")
+                        or os.getenv("FILE_CRAWL_DOMAIN_MAX_CONCURRENT")
+                        or "4"
+                    )
+                except Exception:
+                    domain_concurrency = 4
+                domain_concurrency = max(1, min(domain_concurrency, 8))
+                try:
+                    retry_enabled = str(
+                        os.getenv("DOWNLOAD_FAILED_RETRY_RAM_QUEUE", "1") or "1"
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    retry_workers = int(os.getenv("DOWNLOAD_FAILED_RETRY_WORKERS", "1") or "1")
+                except Exception:
+                    retry_enabled = True
+                    retry_workers = 1
+                retry_workers = max(1, min(retry_workers, 4))
+                finalize_tasks = getattr(self, "_file_local_finalize_tasks", set()) or set()
+                finalize_workers = sum(
+                    1 for task in finalize_tasks if isinstance(task, asyncio.Task) and not task.done()
+                )
+                logger.info(
+                    "[FileCrawlReview][startup]\n"
+                    "job_id=%s\n"
+                    "db=%s\n"
+                    "pool=job_specific\n"
+                    "domain_semaphore=job_id scoped, limit=%s, release=download_item finally, direct_wait_timeout=%ss\n"
+                    "retry_queue=enabled:%s workers:%s, source_queue_task_done=finally, "
+                    "review=retry path bypasses active tracking and item hard timeout\n"
+                    "worker_blocking=HTTP async, document metadata executor, web sync async subprocess, "
+                    "download slot may wait for non-deferred postprocess\n"
+                    "local_postprocess=deferred:%s finalize_workers:%s, "
+                    "review=finalize queue must be drained before terminal completion\n"
+                    "completion_counter=file_saved event -> progress loop -> LEARN_LIST/save stats; "
+                    "missing terminal counter can be a real finalize-drain race, not only a log omission",
+                    getattr(self, "job_id", None),
+                    getattr(self, "db_name", None),
+                    domain_concurrency,
+                    os.getenv("DOWNLOAD_COMPONENT_DIRECT_DOMAIN_WAIT_SEC", "5"),
+                    retry_enabled,
+                    retry_workers,
+                    str(os.getenv("FILE_CRAWL_DEFER_LOCAL_POSTPROCESS", "1") or "1").strip(),
+                    finalize_workers,
+                )
+                self._file_pipeline_review_logged = True
     def _file_candidate_validation_semaphore(self) -> asyncio.Semaphore:
         sem = getattr(self, "_file_candidate_response_validation_semaphore", None)
         if sem is None:
@@ -1452,11 +1640,17 @@ class BoardContentFilePipelineMixin:
                 _content_author_debug_value(author_raw),
             )
         collection_batch_queue = self._file_job_queues.collection_batch_queue
+        large_collection_batch_queue = getattr(
+            self._file_job_queues,
+            "large_collection_batch_queue",
+            collection_batch_queue,
+        )
 
-        def _collection_queue_stored_count() -> int:
+        def _collection_queue_stored_count(queue=None) -> int:
             """Return the number of file items currently stored in the batch queue."""
-            buffered = len(getattr(collection_batch_queue, "buffer", []) or [])
-            raw_queue = getattr(collection_batch_queue, "queue", None)
+            queue = queue or collection_batch_queue
+            buffered = len(getattr(queue, "buffer", []) or [])
+            raw_queue = getattr(queue, "queue", None)
             try:
                 queued = sum(
                     len(batch) if isinstance(batch, (list, tuple)) else 1
@@ -1469,8 +1663,9 @@ class BoardContentFilePipelineMixin:
                     queued = 0
             return queued + buffered
 
-        def _collection_queue_trace_snapshot() -> Dict[str, Any]:
-            raw_queue = getattr(collection_batch_queue, "queue", None)
+        def _collection_queue_trace_snapshot(queue=None) -> Dict[str, Any]:
+            queue = queue or collection_batch_queue
+            raw_queue = getattr(queue, "queue", None)
             try:
                 queue_size = int(raw_queue.qsize()) if raw_queue is not None else 0
             except Exception:
@@ -1484,27 +1679,16 @@ class BoardContentFilePipelineMixin:
             except Exception:
                 unfinished = 0
             return {
-                "items": _collection_queue_stored_count(),
+                "items": _collection_queue_stored_count(queue),
                 "batches": queue_size,
                 "max_batches": queue_maxsize,
-                "buffer": len(getattr(collection_batch_queue, "buffer", []) or []),
+                "buffer": len(getattr(queue, "buffer", []) or []),
                 "unfinished": unfinished,
                 "full": bool(queue_maxsize and queue_size >= queue_maxsize),
             }
 
         def _collection_queue_worker_health() -> Dict[str, Any]:
-            if bool(getattr(self, "use_global_pool", False)):
-                try:
-                    from core.crawler.global_pool import get_global_worker_pool
-
-                    return get_global_worker_pool().worker_health_snapshot(job_id=str(getattr(self, "job_id", "") or ""))
-                except Exception as exc:
-                    return {"health_error": str(exc)}
-            worker_task = getattr(self, "_file_worker_task", None)
-            return {
-                "local_worker_alive": bool(worker_task and not worker_task.done()),
-                "local_worker_done": bool(worker_task and worker_task.done()),
-            }
+            return self._file_pipeline_worker_health_snapshot()
 
         async def _put_collection_queue_with_trace(
             item: Dict[str, Any],
@@ -1512,7 +1696,9 @@ class BoardContentFilePipelineMixin:
             file_url: str,
             file_name: str,
         ) -> None:
-            before = _collection_queue_trace_snapshot()
+            lane = str(item.get("download_lane") or "normal")
+            target_queue = large_collection_batch_queue if lane == "large" else collection_batch_queue
+            before = _collection_queue_trace_snapshot(target_queue)
             started_at = time.monotonic()
             if before["full"]:
                 logger.warning(
@@ -1537,16 +1723,16 @@ class BoardContentFilePipelineMixin:
                     (post_url or "")[:220],
                     (file_url or "")[:220],
                     (file_name or "")[:160],
-                    _collection_queue_trace_snapshot(),
+                    _collection_queue_trace_snapshot(target_queue),
                     _collection_queue_worker_health(),
                 )
 
             wait_notice_task = asyncio.create_task(
                 _warn_queue_put_waiting(),
-                name=f"file-queue-put-wait:{effective_job_id}",
+                name=f"file-queue-put-wait:{effective_job_id}:{lane}",
             )
             try:
-                await collection_batch_queue.put(item)
+                await target_queue.put(item)
             finally:
                 wait_notice_task.cancel()
                 try:
@@ -1555,7 +1741,7 @@ class BoardContentFilePipelineMixin:
                     pass
             wait_sec = time.monotonic() - started_at
             if before["full"] or wait_sec >= 3.0:
-                after = _collection_queue_trace_snapshot()
+                after = _collection_queue_trace_snapshot(target_queue)
                 reason = "queue_full" if before["full"] else "slow_queue_put"
                 logger.warning(
                     "[파일크롤링추적][큐적재대기완료] 작업ID=%s 게시물URL=%s 파일URL=%s 파일명=%s "
@@ -1604,6 +1790,15 @@ class BoardContentFilePipelineMixin:
                         "name": str(file_name or "")[:160],
                     }
                 )
+            logger.warning(
+                "[FileCrawlTrace][enqueue_missing] job_id=%s post_url=%s file_url=%s reason=%s count=%s file=%s",
+                effective_job_id,
+                (post_url or "")[:300],
+                (file_url or "")[:300],
+                normalized_reason,
+                normalized_count,
+                (file_name or "")[:160],
+            )
             logger.warning(
                 "[파일크롤링추적][큐누락] 파일URL=%s\n작업ID=%s 사유=%s 건수=%s 파일명=%s",
                 (file_url or post_url)[:300],
@@ -1761,9 +1956,11 @@ class BoardContentFilePipelineMixin:
                 )
                 _count_candidate_skip("empty_url" if not file_url else "seen_url")
                 continue
-            skip_by_completed_cache = (
-                not getattr(self, "is_attachment_file_crawl_workflow", False)
-                and completed_url_cached(file_url_key or file_url, stage="save")
+            # A successful LEARN_LIST save makes the attachment reusable for this
+            # process-wide TTL window, including attachment-file crawl jobs.
+            skip_by_completed_cache = completed_url_cached(
+                file_url_key or file_url,
+                stage="save",
             )
             if skip_by_completed_cache:
                 try:
@@ -2226,6 +2423,9 @@ class BoardContentFilePipelineMixin:
                 detail_cates=detail_cates,
                 post_title=post_title,
             )
+            if file_meta:
+                file_meta["declared_file_size_bytes"] = int(attach.get("_declared_file_size_bytes") or 0)
+                file_meta["download_lane"] = "large" if is_large_download_item(file_meta) else "normal"
             if not file_meta:
                 _track_enqueue_missing(
                     "file_meta_empty",
@@ -2296,14 +2496,19 @@ class BoardContentFilePipelineMixin:
                             file_name=file_name,
                         )
                         break
+                    if any(k in self._seen_file_urls for k in dedup_keys):
+                        _count_candidate_skip("seen_before_enqueue")
+                        _file_dashboard_download_debug(
+                            "enqueue.skip reason=seen_before_enqueue job_id=%s post=%s name=%s url=%s keys=%s",
+                            effective_job_id, (post_url or "")[:160], (file_name or "")[:120],
+                            (file_url or "")[:220], dedup_keys[:5],
+                        )
+                        continue
                     self._seen_file_urls.update(dedup_keys)
                     _file_dashboard_download_debug(
                         "queue.put job_id=%s post=%s name=%s url=%s key=%s queue_size_before=%s",
-                        effective_job_id,
-                        (post_url or "")[:160],
-                        (file_name or "")[:120],
-                        (file_url or "")[:220],
-                        (file_url_key or "")[:220],
+                        effective_job_id, (post_url or "")[:160], (file_name or "")[:120],
+                        (file_url or "")[:220], (file_url_key or "")[:220],
                         _collection_queue_stored_count(),
                     )
                     await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
@@ -2342,14 +2547,19 @@ class BoardContentFilePipelineMixin:
                         file_name=file_name,
                     )
                     break
+                if any(k in self._seen_file_urls for k in dedup_keys):
+                    _count_candidate_skip("seen_before_enqueue")
+                    _file_dashboard_download_debug(
+                        "enqueue.skip reason=seen_before_enqueue job_id=%s post=%s name=%s url=%s keys=%s",
+                        effective_job_id, (post_url or "")[:160], (file_name or "")[:120],
+                        (file_url or "")[:220], dedup_keys[:5],
+                    )
+                    continue
                 self._seen_file_urls.update(dedup_keys)
                 _file_dashboard_download_debug(
                     "queue.put job_id=%s post=%s name=%s url=%s key=%s queue_size_before=%s",
-                    effective_job_id,
-                    (post_url or "")[:160],
-                    (file_name or "")[:120],
-                    (file_url or "")[:220],
-                    (file_url_key or "")[:220],
+                    effective_job_id, (post_url or "")[:160], (file_name or "")[:120],
+                    (file_url or "")[:220], (file_url_key or "")[:220],
                     _collection_queue_stored_count(),
                 )
                 await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
@@ -2404,6 +2614,7 @@ class BoardContentFilePipelineMixin:
         if enqueued:
             try:
                 await collection_batch_queue.flush()
+                await large_collection_batch_queue.flush()
             except Exception:
                 pass
         if enqueued:
@@ -2667,6 +2878,10 @@ class BoardContentFilePipelineMixin:
             or attach.get("img_alt")
             or ""
         ).strip()
+        try:
+            attach["_declared_file_size_bytes"] = int(attach.get("declared_file_size_bytes") or parse_display_file_size_bytes(file_name) or 0)
+        except Exception:
+            attach["_declared_file_size_bytes"] = 0
         if file_name:
             cleaned_name = strip_file_type_display_prefix(strip_trailing_file_size(file_name))
             cleaned_name = strip_fallback_download_label(cleaned_name) or cleaned_name
@@ -3874,7 +4089,7 @@ class BoardContentFilePipelineMixin:
         except Exception:
             pass
         try:
-            await wait_for_file_ready(path, timeout_sec=30.0)
+            await wait_for_file_ready(path, timeout_sec=30.0, check_partial_siblings=False)
         except Exception as exc:
             logger.debug(
                 "[board][file] learning file not ready | path=%s err=%s",
@@ -4148,11 +4363,17 @@ class BoardContentFilePipelineMixin:
             await self._reconcile_file_study_counts_from_learn_list()
             return
 
-        pending: List[asyncio.Task] = []
-        for attr in ("_file_progress_task", "_file_worker_task"):
-            t = getattr(self, attr, None)
-            if isinstance(t, asyncio.Task) and not t.done():
-                pending.append(t)
+        pending: List[asyncio.Task] = [
+            task
+            for task in (
+                set(getattr(self, "_file_progress_dispatch_tasks", set()) or set())
+                | set(getattr(self, "_file_progress_tasks", set()) or set())
+            )
+            if isinstance(task, asyncio.Task) and not task.done()
+        ]
+        worker_task = getattr(self, "_file_worker_task", None)
+        if isinstance(worker_task, asyncio.Task) and not worker_task.done():
+            pending.append(worker_task)
         if not pending:
             await self._reconcile_file_study_counts_from_learn_list()
             return
@@ -4217,15 +4438,22 @@ class BoardContentFilePipelineMixin:
             except Exception:
                 pass
             self._file_queue_watchdog_task = None
-        if self._file_progress_task:
-            try:
-                self._file_progress_task.cancel()
-                await self._file_progress_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            self._file_progress_task = None
+        try:
+            await self._stop_file_local_finalize_workers(graceful=graceful)
+        except Exception:
+            logger.exception(
+                "[FileCrawlTrace][local_finalize_shutdown_failed] job_id=%s graceful=%s",
+                getattr(self, "job_id", None),
+                graceful,
+            )
+        try:
+            await self._stop_file_progress_workers()
+        except Exception:
+            logger.exception(
+                "[FileCrawlTrace][save_workers_shutdown_failed] job_id=%s graceful=%s",
+                getattr(self, "job_id", None),
+                graceful,
+            )
         if self._file_worker_manager:
             manager = self._file_worker_manager
             try:
@@ -5555,6 +5783,7 @@ class BoardContentFilePipelineMixin:
                     str(os.getenv("FILE_CRAWL_POST_SUMMARIZE_KEYWORDS", "1") or "1").strip(),
                     (url or "")[:180],
                 )
+                batch_pending = bool(file_result.get("embedding_batch_background_queued"))
                 if learning_completed_ok:
                     _log_file_url_status(
                         stage="learning",
@@ -5595,6 +5824,22 @@ class BoardContentFilePipelineMixin:
                                 (url or "")[:180],
                                 sum_exc,
                             )
+                elif batch_pending:
+                    _log_file_url_status(
+                        stage="learning",
+                        status="queued",
+                        process_url=url,
+                        post_url=info.get("source_page") or info.get("source_url") or "",
+                        file_url=url,
+                        selected="yes",
+                        saved="yes",
+                        learn="queued",
+                        reason="embedding_batch_pending_callback",
+                        name=file_name,
+                        learn_list_id=pre_learn_list_id,
+                        job_id=getattr(self, "job_id", ""),
+                        db_name=getattr(self, "db_name", ""),
+                    )
                 else:
                     _log_file_url_status(
                         stage="learning",
@@ -5773,6 +6018,81 @@ class BoardContentFilePipelineMixin:
                 exc,
             )
 
+    def _file_pipeline_worker_health_snapshot(self) -> Dict[str, Any]:
+        """Report actual per-job worker tasks instead of the completed startup task."""
+        if bool(getattr(self, "use_global_pool", False)):
+            try:
+                from core.crawler.global_pool import get_global_worker_pool
+
+                return get_global_worker_pool().worker_health_snapshot(
+                    job_id=str(getattr(self, "job_id", "") or "")
+                )
+            except Exception as exc:
+                return {"health_error": str(exc)}
+
+        manager = getattr(self, "_file_worker_manager", None)
+        result: Dict[str, Any] = {"mode": "local", "manager_present": bool(manager)}
+        stages = []
+        if manager is not None:
+            stages.extend(
+                (("scan", getattr(manager, "scan_tasks", [])),
+                 ("collection", getattr(manager, "collection_tasks", [])),
+                 ("download", getattr(manager, "download_tasks", [])),
+                 ("study", getattr(manager, "study_tasks", [])))
+            )
+        stages.extend(
+            (("progress_dispatch", getattr(self, "_file_progress_dispatch_tasks", set())),
+             ("save", getattr(self, "_file_progress_tasks", set())),
+             ("local_finalize", getattr(self, "_file_local_finalize_tasks", set())),
+             ("learn", getattr(self, "_file_parallel_learn_tasks", set())))
+        )
+        for stage, stage_tasks in stages:
+            tasks = list(stage_tasks or [])
+            failures: List[str] = []
+            active: List[str] = []
+            for task in tasks:
+                if isinstance(task, asyncio.Task) and not task.done():
+                    stack = task.get_stack(limit=1)
+                    if stack:
+                        frame = stack[-1]
+                        active.append(f"{task.get_name()}:{frame.f_code.co_name}:{frame.f_lineno}")
+                    else:
+                        active.append(task.get_name())
+                if not isinstance(task, asyncio.Task) or not task.done() or task.cancelled():
+                    continue
+                try:
+                    exc = task.exception()
+                except Exception as exc:
+                    failures.append(f"exception_read_failed:{type(exc).__name__}:{exc}")
+                else:
+                    if exc is not None:
+                        failures.append(f"{type(exc).__name__}:{exc}")
+            result[f"{stage}_total"] = len(tasks)
+            result[f"{stage}_alive"] = sum(1 for task in tasks if isinstance(task, asyncio.Task) and not task.done())
+            result[f"{stage}_done"] = sum(1 for task in tasks if isinstance(task, asyncio.Task) and task.done())
+            result[f"{stage}_cancelled"] = sum(1 for task in tasks if isinstance(task, asyncio.Task) and task.cancelled())
+            if active:
+                result[f"{stage}_active"] = active[:8]
+            if failures:
+                result[f"{stage}_failures"] = failures[:5]
+        try:
+            from core.crawler.workers.download import get_download_worker_activity_snapshot
+
+            result["download_inflight"] = get_download_worker_activity_snapshot(
+                job_id=str(getattr(self, "job_id", "") or "")
+            )[:8]
+        except Exception as exc:
+            result["download_inflight_error"] = f"{type(exc).__name__}:{exc}"
+        active_progress = getattr(self, "_file_progress_active", None)
+        if isinstance(active_progress, dict):
+            now = time.monotonic()
+            result["save_inflight"] = [
+                {**dict(value), "elapsed_sec": round(max(0.0, now - float(value.get("started_at", now))), 1)}
+                for value in list(active_progress.values())[:8]
+                if isinstance(value, dict)
+            ]
+        return result
+
     async def _run_file_queue_watchdog(self) -> None:
         """Emit a rate-limited queue heartbeat and warn when its state stops changing."""
         try:
@@ -5795,22 +6115,35 @@ class BoardContentFilePipelineMixin:
             queues = getattr(self, "_file_job_queues", None)
             if queues is None:
                 return
+            await self._ensure_file_progress_workers()
             try:
                 snapshot = queues.debug_snapshot() if hasattr(queues, "debug_snapshot") else queues.snapshot()
             except Exception:
                 snapshot = {}
+            save_queue = getattr(self, "_file_save_queue", None)
+            if save_queue is not None:
+                try:
+                    snapshot["file_save_queue"] = save_queue.qsize()
+                    snapshot["file_save_queue_unfinished"] = int(getattr(save_queue, "_unfinished_tasks", 0) or 0)
+                except Exception:
+                    snapshot["file_save_queue"] = -1
             try:
                 async with self._stats_lock:
                     stats = dict(self.stats or {})
             except Exception:
                 stats = {}
 
-            pending = max(
-                0,
+            normal_pending = max(
                 int(snapshot.get("collection_batch_queue_unfinished", 0) or 0),
                 int(snapshot.get("collection_batch_queue", 0) or 0)
                     + int(snapshot.get("collection_batch_queue_buffer", 0) or 0),
             )
+            large_pending = max(
+                int(snapshot.get("large_collection_batch_queue_unfinished", 0) or 0),
+                int(snapshot.get("large_collection_batch_queue", 0) or 0)
+                    + int(snapshot.get("large_collection_batch_queue_buffer", 0) or 0),
+            )
+            pending = max(0, normal_pending + large_pending)
             if pending <= 0:
                 last_activity = None
                 last_change_at = time.monotonic()
@@ -5833,12 +6166,33 @@ class BoardContentFilePipelineMixin:
                 except Exception as exc:
                     worker_health = {"health_error": str(exc)}
             else:
-                worker_task = getattr(self, "_file_worker_task", None)
-                worker_health = {
-                    "local_worker_alive": bool(worker_task and not worker_task.done()),
-                    "local_worker_done": bool(worker_task and worker_task.done()),
-                }
-            logger.info(
+                worker_health = self._file_pipeline_worker_health_snapshot()
+            progress_trace: Dict[str, Any] = {}
+            try:
+                progress_raw = list(getattr(queues.progress_queue, "_queue", []) or [])
+                event_counts: Dict[str, int] = {}
+                event_samples: List[Dict[str, str]] = []
+                for event in progress_raw:
+                    event_type = str(event.get("type") if isinstance(event, dict) else type(event).__name__)
+                    event_counts[event_type] = event_counts.get(event_type, 0) + 1
+                    if len(event_samples) < 5 and isinstance(event, dict):
+                        info = event.get("file_info") if isinstance(event.get("file_info"), dict) else {}
+                        event_samples.append({
+                            "type": event_type,
+                            "url": str(info.get("url") or event.get("url") or "")[:220],
+                            "post_url": str(info.get("source_page") or event.get("source_page") or event.get("source_url") or "")[:220],
+                        })
+                progress_trace = {"types": event_counts, "samples": event_samples}
+            except Exception as trace_exc:
+                progress_trace = {"trace_error": f"{type(trace_exc).__name__}:{trace_exc}"}
+            logger.debug(
+                "[FileCrawlTrace][progress_queue] job_id=%s queued=%s unfinished=%s trace=%s",
+                getattr(self, "job_id", None),
+                snapshot.get("progress_queue", 0),
+                snapshot.get("progress_queue_unfinished", 0),
+                progress_trace,
+            )
+            logger.debug(
                 "[FileCrawlTrace][queue_status] job_id=%s pending=%s queued=%s max_batches=%s "
                 "buffer=%s unfinished=%s saved=%s learned=%s global_registered=%s workers=%s",
                 getattr(self, "job_id", None),
@@ -5852,12 +6206,22 @@ class BoardContentFilePipelineMixin:
                 registered,
                 worker_health,
             )
+            logger.info(
+                "[FileCrawlTrace][download_lanes] job_id=%s normal_queued=%s normal_unfinished=%s large_queued=%s large_unfinished=%s",
+                getattr(self, "job_id", None),
+                snapshot.get("collection_batch_queue", 0),
+                snapshot.get("collection_batch_queue_unfinished", 0),
+                snapshot.get("large_collection_batch_queue", 0),
+                snapshot.get("large_collection_batch_queue_unfinished", 0),
+            )
             activity = (
                 int(stats.get("save_count", 0) or 0),
                 int(stats.get("file_study_done_count", stats.get("study_done_count", 0)) or 0),
                 int(snapshot.get("collection_batch_queue", 0) or 0),
                 int(snapshot.get("collection_batch_queue_buffer", 0) or 0),
                 int(snapshot.get("collection_batch_queue_unfinished", 0) or 0),
+                int(snapshot.get("large_collection_batch_queue", 0) or 0),
+                int(snapshot.get("large_collection_batch_queue_unfinished", 0) or 0),
                 int(snapshot.get("progress_queue_unfinished", 0) or 0),
             )
             now = time.monotonic()
@@ -5882,12 +6246,81 @@ class BoardContentFilePipelineMixin:
                 except Exception as exc:
                     worker_health = {"health_error": str(exc)}
             else:
-                worker_task = getattr(self, "_file_worker_task", None)
-                worker_health = {
-                    "local_worker_alive": bool(worker_task and not worker_task.done()),
-                    "local_worker_done": bool(worker_task and worker_task.done()),
-                }
+                worker_health = self._file_pipeline_worker_health_snapshot()
 
+            # A batch remains unfinished while a worker is actively downloading it.
+            # The ordinary 10-second watchdog interval is too short to call that a stall.
+            download_inflight = []
+            if isinstance(worker_health, dict):
+                download_inflight = (
+                    worker_health.get("download_inflight")
+                    or worker_health.get("download_active")
+                    or []
+                )
+            if not isinstance(download_inflight, list):
+                download_inflight = []
+            active_download_elapsed = max(
+                (float(item.get("elapsed_sec") or 0.0) for item in download_inflight if isinstance(item, dict)),
+                default=0.0,
+            )
+            download_stall_warn_sec = max(45.0, interval_sec * 3.0)
+            if active_download_elapsed > 0.0 and active_download_elapsed < download_stall_warn_sec:
+                busy_lines = [
+                    "worker={worker} lane={lane} elapsed_sec={elapsed} url={url} post_url={post_url} name={name}".format(
+                        worker=item.get("worker"), lane=item.get("lane") or "unknown",
+                        elapsed=item.get("elapsed_sec") or 0, url=item.get("url") or "-",
+                        post_url=item.get("post_url") or "-", name=item.get("name") or "-",
+                    )
+                    for item in download_inflight if isinstance(item, dict)
+                ]
+                logger.info(
+                    "[FileCrawlTrace][download_workers_busy]\njob_id=%s\nactive_count=%s\n%s",
+                    getattr(self, "job_id", None), len(busy_lines),
+                    "\n".join(busy_lines) or "active_detail=unavailable",
+                )
+                logger.debug(
+                    "[FileCrawlTrace][download_waiting] job_id=%s stagnant_sec=%.1f download_elapsed_sec=%.1f threshold_sec=%.1f",
+                    getattr(self, "job_id", None),
+                    stagnant_sec,
+                    active_download_elapsed,
+                    download_stall_warn_sec,
+                )
+                last_change_at = now
+                continue
+
+            if download_inflight:
+                active_lines = []
+                for item in download_inflight:
+                    if not isinstance(item, dict):
+                        continue
+                    active_lines.append(
+                        "worker={worker} lane={lane} elapsed_sec={elapsed} url={url} post_url={post_url} name={name}".format(
+                            worker=item.get("worker"),
+                            lane=item.get("lane") or "unknown",
+                            elapsed=item.get("elapsed_sec") or 0,
+                            url=item.get("url") or "-",
+                            post_url=item.get("post_url") or "-",
+                            name=item.get("name") or "-",
+                        )
+                    )
+                logger.warning(
+                    "[FileCrawlTrace][stall_active_downloads]\njob_id=%s\nactive_count=%s\n%s",
+                    getattr(self, "job_id", None),
+                    len(active_lines),
+                    "\n".join(active_lines) or "active_detail=unavailable",
+                )
+            else:
+                logger.warning(
+                    "[FileCrawlTrace][stall_active_downloads]\njob_id=%s\nactive_count=0\nreason=no_active_download_worker",
+                    getattr(self, "job_id", None),
+                )
+            logger.warning(
+                "[FileCrawlTrace][progress_queue_stall] job_id=%s stalled_sec=%.1f progress=%s workers=%s",
+                getattr(self, "job_id", None),
+                stagnant_sec,
+                progress_trace,
+                worker_health,
+            )
             logger.warning(
                 "[파일크롤링추적][큐정체] 작업ID=%s 정체초=%.1f collection_미완료=%s "
                 "큐적재=%s 버퍼=%s 현재저장=%s 학습완료=%s 글로벌등록=%s 워커=%s 큐상태=%s",
@@ -5904,19 +6337,211 @@ class BoardContentFilePipelineMixin:
             )
             last_change_at = now
 
+    async def _ensure_file_local_finalize_workers(self) -> None:
+        """Start bounded crawler-local workers for post-download file work."""
+        queue = getattr(self, "_file_local_finalize_queue", None)
+        if queue is None:
+            try:
+                maxsize = int(os.getenv("FILE_CRAWL_LOCAL_FINALIZE_QUEUE_MAXSIZE", "100") or "100")
+            except Exception:
+                maxsize = 100
+            queue = asyncio.Queue(maxsize=max(1, min(maxsize, 1000)))
+            self._file_local_finalize_queue = queue
+        tasks = getattr(self, "_file_local_finalize_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+        alive = {task for task in tasks if isinstance(task, asyncio.Task) and not task.done()}
+        if alive:
+            self._file_local_finalize_tasks = alive
+            return
+        try:
+            workers = int(os.getenv("FILE_CRAWL_LOCAL_FINALIZE_WORKERS", "2") or "2")
+        except Exception:
+            workers = 2
+        workers = max(1, min(workers, 8))
+        self._file_local_finalize_tasks = {
+            asyncio.create_task(
+                self._run_file_local_finalize_worker(index + 1),
+                name=f"file-local-finalize-{getattr(self, 'job_id', 'unknown')}-{index + 1}",
+            )
+            for index in range(workers)
+        }
+        logger.info(
+            "[FileCrawlTrace][local_finalize_workers_started] job_id=%s workers=%s queue_max=%s",
+            getattr(self, "job_id", None),
+            workers,
+            queue.maxsize,
+        )
+
+    async def _enqueue_file_local_finalize(self, item: Dict[str, Any]) -> None:
+        await self._ensure_file_local_finalize_workers()
+        queue = getattr(self, "_file_local_finalize_queue", None)
+        if queue is None:
+            raise RuntimeError("local finalize queue unavailable")
+        await queue.put(item)
+
+    async def _run_file_local_finalize_worker(self, worker_id: int) -> None:
+        queue = getattr(self, "_file_local_finalize_queue", None)
+        if queue is None:
+            return
+        while True:
+            item = await queue.get()
+            try:
+                if not isinstance(item, dict) or self.stop_event.is_set():
+                    continue
+                info = dict(item.get("file_info") or {})
+                file_path = str(info.get("file_path") or info.get("local_path") or "").strip()
+                file_url = str(info.get("url") or "").strip()
+                post_url = str(info.get("source_page") or info.get("source_url") or "").strip()
+                if not file_path:
+                    raise RuntimeError("local_file_path_missing")
+                started = time.perf_counter()
+                await wait_for_file_ready(file_path, timeout_sec=30.0, check_partial_siblings=False)
+                from core.crawler.workers.download import (
+                    _extract_doc_created_at_async,
+                    _sync_after_download_if_needed,
+                )
+
+                info["file_created_at"] = await _extract_doc_created_at_async(file_path)
+                original_meta = info.get("original_meta") if isinstance(info.get("original_meta"), dict) else {}
+                sync_meta = dict(original_meta or info)
+                sync_meta.setdefault("job_id", item.get("job_id"))
+                sync_meta.setdefault("url", file_url)
+                sync_meta.setdefault("source_page", post_url)
+                if not await _sync_after_download_if_needed(sync_meta, file_path):
+                    event = {
+                        "type": "download_skipped",
+                        "job_id": item.get("job_id"),
+                        "url": file_url,
+                        "source_page": post_url,
+                        "source_url": post_url,
+                        "name": info.get("name") or info.get("subject"),
+                        "reason": "websync_failed",
+                        "detail": f"local_path={file_path}",
+                        "worker_id": worker_id,
+                    }
+                else:
+                    event = dict(item)
+                    event["type"] = "file_saved"
+                    event["file_info"] = info
+                await self._file_job_queues.progress_queue.put(event)
+                logger.info(
+                    "[FileCrawlTrace][local_finalize_done] job_id=%s worker=%s elapsed_ms=%s url=%s post_url=%s",
+                    item.get("job_id"),
+                    worker_id,
+                    int((time.perf_counter() - started) * 1000),
+                    file_url[:220],
+                    post_url[:220],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                try:
+                    info = item.get("file_info") if isinstance(item, dict) else {}
+                    await self._file_job_queues.progress_queue.put(
+                        {
+                            "type": "download_skipped",
+                            "job_id": item.get("job_id") if isinstance(item, dict) else getattr(self, "job_id", None),
+                            "url": (info or {}).get("url"),
+                            "source_page": (info or {}).get("source_page") or (info or {}).get("source_url"),
+                            "source_url": (info or {}).get("source_page") or (info or {}).get("source_url"),
+                            "name": (info or {}).get("name") or (info or {}).get("subject"),
+                            "reason": "local_finalize_failed",
+                            "detail": f"{type(exc).__name__}: {exc}",
+                            "worker_id": worker_id,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "[FileCrawlTrace][local_finalize_emit_failed] job_id=%s worker=%s",
+                        getattr(self, "job_id", None),
+                        worker_id,
+                    )
+            finally:
+                queue.task_done()
+
+    async def _wait_for_file_local_finalize_drain(self) -> None:
+        queue = getattr(self, "_file_local_finalize_queue", None)
+        if queue is not None:
+            await queue.join()
+
+    async def _stop_file_local_finalize_workers(self, *, graceful: bool) -> None:
+        queue = getattr(self, "_file_local_finalize_queue", None)
+        tasks = list(getattr(self, "_file_local_finalize_tasks", set()) or set())
+        if graceful and queue is not None:
+            await queue.join()
+        if not graceful and queue is not None:
+            while True:
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        for task in tasks:
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._file_local_finalize_tasks = set()
+        self._file_local_finalize_queue = None
+
     @log_calls
     async def _run_file_progress_loop(self) -> None:
-        """progress_queue에서 file_saved / download_skipped 이벤트를 받아 파일 저장 통계를 갱신한다."""
+        """Drain download events quickly, then hand them to bounded save workers."""
         if not self._file_job_queues:
             return
         progress_queue = self._file_job_queues.progress_queue
-
+        save_queue = getattr(self, "_file_save_queue", None)
+        if save_queue is None:
+            return
         while True:
             try:
                 item = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
+                if self.stop_event.is_set() and progress_queue.empty():
+                    return
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[FileCrawlTrace][progress_dispatch_get_failed] job_id=%s", getattr(self, "job_id", None))
+                return
+            try:
+                await save_queue.put(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[FileCrawlTrace][progress_dispatch_enqueue_failed] job_id=%s", getattr(self, "job_id", None))
+            finally:
+                progress_queue.task_done()
+    @log_calls
+    async def _run_file_save_loop(self) -> None:
+        """save_queue에서 file_saved / download_skipped 이벤트를 받아 파일 저장 통계를 갱신한다."""
+        save_queue = getattr(self, "_file_save_queue", None)
+        if save_queue is None:
+            return
+        active_progress = getattr(self, "_file_progress_active", None)
+        if not isinstance(active_progress, dict):
+            active_progress = {}
+            self._file_progress_active = active_progress
+
+        current_task = asyncio.current_task()
+        save_worker_name = current_task.get_name() if current_task is not None else "file-progress-save"
+        logger.info(
+            "[FileSaveTrace][worker_started] job_id=%s worker=%s queue_max=%s",
+            getattr(self, "job_id", None),
+            save_worker_name,
+            getattr(save_queue, "maxsize", None),
+        )
+
+        while True:
+            trace_key = ""
+            trace_started_at = 0.0
+            try:
+                item = await asyncio.wait_for(save_queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
                 try:
-                    if self.stop_event.is_set() and progress_queue.empty():
+                    if self.stop_event.is_set() and save_queue.empty():
                         break
                 except Exception:
                     if self.stop_event.is_set():
@@ -5925,12 +6550,38 @@ class BoardContentFilePipelineMixin:
             except Exception:
                 break
 
+            current_task = asyncio.current_task()
+            trace_key = current_task.get_name() if current_task is not None else f"progress-{id(item)}"
+            trace_info = item.get("file_info") if isinstance(item, dict) and isinstance(item.get("file_info"), dict) else {}
+            trace_started_at = time.monotonic()
+            active_progress[trace_key] = {
+                "started_at": trace_started_at,
+                "stage": "save_item_taken",
+                "type": str(item.get("type") if isinstance(item, dict) else type(item).__name__),
+                "url": str(trace_info.get("url") or (item.get("url") if isinstance(item, dict) else "") or "")[:220],
+                "post_url": str(trace_info.get("source_page") or (item.get("source_page") if isinstance(item, dict) else "") or "")[:220],
+            }
+            logger.info(
+                "[FileSaveTrace][item_taken] job_id=%s worker=%s event=%s url=%s queue_after_take=%s unfinished_after_take=%s",
+                getattr(self, "job_id", None), trace_key, active_progress[trace_key]["type"], active_progress[trace_key]["url"],
+                save_queue.qsize(), int(getattr(save_queue, "_unfinished_tasks", 0) or 0),
+            )
             skip_pq_task_done = False
             evt_type = None
             try:
                 if not isinstance(item, dict):
                     continue
                 evt_type = item.get("type")
+
+                if evt_type == "download_local_saved":
+                    await self._enqueue_file_local_finalize(item)
+                    logger.info(
+                        "[FileCrawlTrace][local_finalize_enqueued] job_id=%s url=%s post_url=%s",
+                        item.get("job_id"),
+                        ((item.get("file_info") or {}).get("url") or "")[:220],
+                        ((item.get("file_info") or {}).get("source_page") or "")[:220],
+                    )
+                    continue
 
                 if evt_type == "file_saved":
                     t_fs0 = time.perf_counter()
@@ -6028,7 +6679,7 @@ class BoardContentFilePipelineMixin:
                             file_size = 0
                     if file_path and path_ok:
                         try:
-                            file_size = await wait_for_file_ready(file_path, timeout_sec=30.0)
+                            file_size = await wait_for_file_ready(file_path, timeout_sec=30.0, check_partial_siblings=False)
                         except Exception as exc:
                             path_ok = False
                             file_size = 0
@@ -6069,6 +6720,7 @@ class BoardContentFilePipelineMixin:
                         if throttle_sec > 0:
                             await asyncio.sleep(throttle_sec)
                         pre_extracted_text = None
+                        active_progress[trace_key]["stage"] = "learn_list_ensure"
                         logger.info(
                             "[FilePersist][learn_list_ensure_begin] job_id=%s db=%s enable_db_save=%s post_url=%s file_url=%s file=%s size=%s",
                             getattr(self, "job_id", None),
@@ -6080,12 +6732,46 @@ class BoardContentFilePipelineMixin:
                             file_size,
                         )
                         t_ll0 = time.perf_counter()
-                        row_out = await self._ensure_learn_list_row_for_file_save(
-                            info=info,
-                            file_path=file_path,
-                            file_name=file_name,
-                            file_size=file_size,
-                        )
+                        ensure_timeout_sec = _file_learn_list_ensure_timeout_sec()
+                        try:
+                            row_out = await asyncio.wait_for(
+                                self._ensure_learn_list_row_for_file_save(
+                                    info=info,
+                                    file_path=file_path,
+                                    file_name=file_name,
+                                    file_size=file_size,
+                                ),
+                                timeout=ensure_timeout_sec,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                "[FileSaveTrace][learn_list_ensure_timeout] job_id=%s db=%s timeout_sec=%.1f post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None),
+                                getattr(self, "db_name", None),
+                                ensure_timeout_sec,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220],
+                                file_name,
+                            )
+                            try:
+                                self._record_job_result_stage(
+                                    url=save_key,
+                                    stage="save",
+                                    status="failed",
+                                    reason="learn_list_ensure_timeout",
+                                    source_url=info.get("source_page") or info.get("source_url"),
+                                    file_url=url,
+                                    file_name=file_name,
+                                    file_path=file_path,
+                                )
+                            except Exception:
+                                pass
+                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._mark_study_done(url=save_key, outcome="skipped")
+                            if self.progress_callback:
+                                self.progress_callback(self.get_stats())
+                            continue
+                        active_progress[trace_key]["stage"] = "learn_list_ensure_done"
                         if _file_pipeline_bottleneck_log_enabled():
                             logger.debug(
                                 "[Bottleneck][progress_loop] insert_into_learn_list(ensure) %sms row_out=%s url=%s",
@@ -6403,7 +7089,7 @@ class BoardContentFilePipelineMixin:
                         sem = self._get_file_pipeline_learn_semaphore()
                         if self._file_parallel_learn_enabled():
                             skip_pq_task_done = True
-                            pq = progress_queue
+                            pq = save_queue
 
                             async def _runner(
                                 _info: Dict[str, Any] = info,
@@ -6481,6 +7167,16 @@ class BoardContentFilePipelineMixin:
                                     },
                                     attempt=0,
                                 )
+                elif evt_type == "download_deferred":
+                    logger.info(
+                        "[FileCrawlTrace][download_deferred_to_large_lane] job_id=%s item_job=%s url=%s post_url=%s size=%s worker=%s",
+                        getattr(self, "job_id", None),
+                        item.get("job_id"),
+                        (item.get("url") or "")[:220],
+                        (item.get("source_page") or item.get("source_url") or "")[:220],
+                        item.get("declared_file_size_bytes"),
+                        item.get("worker_id"),
+                    )
                 elif evt_type == "download_skipped":
                     url = (item.get("url") or "").strip()
                     reason = str(item.get("reason") or "").strip() or "unknown"
@@ -6576,11 +7272,21 @@ class BoardContentFilePipelineMixin:
                     item_exc,
                 )
             finally:
+                trace_state = dict(active_progress.get(trace_key) or {}) if trace_key else {}
+                elapsed_sec = max(0.0, time.monotonic() - trace_started_at) if trace_started_at else 0.0
+                if trace_key:
+                    active_progress.pop(trace_key, None)
                 if not skip_pq_task_done:
                     try:
-                        progress_queue.task_done()
+                        save_queue.task_done()
                     except Exception:
                         pass
+                if trace_key:
+                    logger.info(
+                        "[FileSaveTrace][item_done] job_id=%s worker=%s event=%s stage=%s elapsed_sec=%.2f queue_after_done=%s unfinished_after_done=%s url=%s",
+                        getattr(self, "job_id", None), trace_key, evt_type, trace_state.get("stage", "unknown"), elapsed_sec,
+                        save_queue.qsize(), int(getattr(save_queue, "_unfinished_tasks", 0) or 0), trace_state.get("url", ""),
+                    )
 
     @log_calls
     async def _copy_file_to_upload_path(self, source_path: str) -> Optional[str]:

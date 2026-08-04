@@ -1191,7 +1191,35 @@ async def dispatch_and_schedule_workflow(
     except Exception:
         exploration_post_total = 0
     duplicate_exclude_selected = bool(data.get("learn_list_duplicate_exclude_result"))
-    if exploration_post_total > 0:
+    # File crawl must start with the actual type='post' detail URL count. Do not
+    # let an earlier exploration/display hint inflate the initial scan counter.
+    if _ov_src in ("file_crawl_post_db", "file_crawl_post_db_stream"):
+        # Stream mode keeps start_urls empty and reads post rows page by page.
+        # Preserve the exploration DB count as the base before attachments add to it.
+        if _ov_src == "file_crawl_post_db_stream" and not start_urls:
+            post_start_count = max(
+                0,
+                int(
+                    data.get("pre_explored_start_urls_count")
+                    or data.get("exploration_post_total_count")
+                    or data.get("exploration_display_max_count")
+                    or 0
+                ),
+            )
+        else:
+            post_start_count = len(start_urls or [])
+        data["pre_explored_start_urls_count"] = post_start_count
+        data["exploration_post_total_count"] = post_start_count
+        data["exploration_display_max_count"] = post_start_count
+        data["selected_start_urls_count"] = post_start_count
+        data["actual_start_urls_count"] = post_start_count
+        data["exploration_display_count_fixed"] = True
+        _dispatch_flow_log(
+            "[Dispatch][file] initial scan count fixed to post URLs | job_id=%s post_start_urls=%s",
+            job_id,
+            post_start_count,
+        )
+    elif exploration_post_total > 0:
         data["exploration_display_count_fixed"] = True
         data["exploration_display_max_count"] = exploration_post_total
         data["actual_start_urls_count"] = len(start_urls or [])

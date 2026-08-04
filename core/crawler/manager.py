@@ -40,6 +40,7 @@ class WorkerManager:
         end_date=None,
         max_depth: Optional[int] = None,
         job_queues: Optional[JobQueues] = None,
+        worker_config_override: Optional[Dict[str, Any]] = None,
     ):
         self.tasks: List[asyncio.Task] = []
         # 역할별 task (부분 중단/그레이스풀 중단 제어용)
@@ -65,6 +66,7 @@ class WorkerManager:
         self.start_date = start_date
         self.end_date = end_date
         self.max_depth = max_depth
+        self.worker_config_override = dict(worker_config_override or {})
         self.on_collection_batch = on_collection_batch
         self._semaphore_acquired = False  # 동시 브라우저 수 제한용
         self._browser_use_count: Dict[int, int] = {}
@@ -122,7 +124,9 @@ class WorkerManager:
             default_timeout=get_default_timeout_ms(),
         )
 
-        cfg = settings.worker_config
+        cfg = dict(getattr(settings, "worker_config", {}) or {})
+        if self.worker_config_override:
+            cfg.update(self.worker_config_override)
 
         # Serialize browser relaunch across workers (prevents TargetClosedError races)
         self._relaunch_lock = asyncio.Lock()
@@ -255,6 +259,8 @@ class WorkerManager:
             # 기본 동시 다운로드 수를 소폭 낮추고, 필요 시 환경변수로 올리도록 한다.
             if is_no_limits_mode():
                 max_concurrent = 1_000_000
+            elif cfg.get("download_max_concurrent") is not None:
+                max_concurrent = int(cfg["download_max_concurrent"])
             else:
                 # 기본 10: batch_size=1일 때 워커당 1건씩만 돌아가 저장이 선별보다 크게 밀리는 현상 완화
                 max_concurrent = int(
@@ -267,10 +273,18 @@ class WorkerManager:
             max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
         max_concurrent = max(1, max_concurrent)
 
-        for i in range(cfg["download_workers"]):
+        normal_workers = 2
+        large_workers = 2
+        for i in range(normal_workers + large_workers):
+            worker_lane = "normal" if i < normal_workers else "large"
+            worker_queue = (
+                self.job_queues.collection_batch_queue
+                if worker_lane == "normal"
+                else self.job_queues.large_collection_batch_queue
+            )
             t = asyncio.create_task(
                 download_worker(
-                    self.job_queues.collection_batch_queue,
+                    worker_queue,
                     self.job_queues.save_batch_queue,
                     progress_queue=self.job_queues.progress_queue,
                     max_concurrent=max_concurrent,
@@ -279,6 +293,8 @@ class WorkerManager:
                     browser_releaser=self.release_browser,
                     browser_relauncher=self._relaunch_browser,
                     worker_id=i + 1,
+                    worker_lane=worker_lane,
+                    large_download_queue=self.job_queues.large_collection_batch_queue,
                 )
             )
             self.download_tasks.append(t)
@@ -402,6 +418,7 @@ class WorkerManager:
         """실시간 처리를 보장하기 위해 0.1초마다 남은 아이템 강제 전달 (안전장치)"""
         scan_batch_queue = self.job_queues.scan_batch_queue
         collection_batch_queue = self.job_queues.collection_batch_queue
+        large_collection_batch_queue = self.job_queues.large_collection_batch_queue
         save_batch_queue = self.job_queues.save_batch_queue
         study_batch_queue = self.job_queues.study_batch_queue
         # flush 주기 단축(기본 50ms): batch buffer로 인해 다음 단계가 지연되는 현상 완화
@@ -416,6 +433,7 @@ class WorkerManager:
                 pending_before_flush = (
                     not scan_batch_queue.empty()
                     or not collection_batch_queue.empty()
+                    or not large_collection_batch_queue.empty()
                     or not save_batch_queue.empty()
                     or not study_batch_queue.empty()
                 )
@@ -425,6 +443,7 @@ class WorkerManager:
                 await scan_batch_queue.flush()
                 await asyncio.sleep(0.01)
                 await collection_batch_queue.flush()
+                await large_collection_batch_queue.flush()
                 await asyncio.sleep(0.01)
                 await save_batch_queue.flush()
                 await asyncio.sleep(0.01)
@@ -477,6 +496,7 @@ class WorkerManager:
             logger.info("[WorkerManager] Flushing batch queues (scan/collection/save/study)...")
             await self.job_queues.scan_batch_queue.flush()
             await self.job_queues.collection_batch_queue.flush()
+            await self.job_queues.large_collection_batch_queue.flush()
             await self.job_queues.save_batch_queue.flush()
             await self.job_queues.study_batch_queue.flush()
             logger.info("[WorkerManager] Batch queues flushed.")

@@ -142,7 +142,22 @@ def should_skip_attachment_at_scan(file_url: str, display_name: str = "") -> boo
 
     for label in _labels():
         ext = ext_of_name(label)
+        normalized_label = re.sub(r"\s+", " ", unquote(str(label or "")).strip()).lower()
         if not ext:
+            # Dynamic endpoints can omit extensions; only exclude explicit wallpaper labels.
+            has_wallpaper_marker = any(
+                token in normalized_label
+                for token in ("\ubc30\uacbd\ud654\uba74", "wallpaper")
+            )
+            has_display_marker = any(
+                token in normalized_label
+                for token in ("pc\uc6a9", "\ubaa8\ubc14\uc77c\uc6a9", "\uc2a4\ub9c8\ud2b8\ud3f0\uc6a9")
+            )
+            has_pixel_dimensions = bool(
+                re.search(r"\b\d{3,5}\s*[x\u00d7]\s*\d{3,5}\b", normalized_label)
+            )
+            if has_wallpaper_marker or (has_display_marker and has_pixel_dimensions):
+                return True
             continue
         if ext in _AMBIGUOUS_HANDLER_EXTS:
             continue

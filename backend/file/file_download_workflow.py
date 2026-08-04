@@ -1941,15 +1941,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             _cu = _valid_contents_url(start_urls)
         return _cu.strip() if isinstance(_cu, str) else None
 
-    async def _reload_file_crawl_url_pattern_cache_from_learn_list(
-        self,
-        *,
-        start_urls: Any,
-        kwargs: Dict[str, Any],
-    ) -> None:
-        """Legacy no-op. File crawling no longer reads url_pattern category rules."""
-        return None
-
     async def start_workflow(
         self,
         start_urls: Any = None,
@@ -1960,27 +1951,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
         filtered_memory_storage: Any = None,
         **kwargs: Any,
     ) -> None:
-        kw = dict(kwargs) if isinstance(kwargs, dict) else {}
-        await self._reload_file_crawl_url_pattern_cache_from_learn_list(
-            start_urls=start_urls,
-            kwargs=kw,
-        )
-        if str(os.getenv("FILE_CRAWL_USE_LEGACY_BOARD_FRONT", "0") or "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            await super().start_workflow(
-                start_urls=start_urls,
-                progress_callback=progress_callback,
-                start_date=start_date,
-                end_date=end_date,
-                target_domains=target_domains,
-                filtered_memory_storage=filtered_memory_storage,
-                **kwargs,
-            )
-            return
 
         from backend.file.fast_attachment_producer import run_fast_file_attachment_front
 
@@ -2022,11 +1992,10 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             concurrency = _file_crawl_fast_front_concurrency(kwargs)
             timeout_sec = _file_crawl_detail_fetch_timeout_sec(kwargs)
             logger.info(
-                "[파일크롤링][동시성] fast_front_concurrency=%s timeout_sec=%s learn_concurrency=%s legacy_front=%s post_url_count=%s",
+                "[파일크롤링][동시성] fast_front_concurrency=%s timeout_sec=%s learn_concurrency=%s post_url_count=%s",
                 concurrency,
                 timeout_sec,
                 getattr(self, "_file_learn_concurrency", None),
-                str(os.getenv("FILE_CRAWL_USE_LEGACY_BOARD_FRONT", "0") or "0"),
                 len(start_urls or []),
             )
             self.fast_file_front_result = await run_fast_file_attachment_front(
@@ -2145,6 +2114,7 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 logger.debug("[Phase][file] scan flush | %s", ex)
             try:
                 await qs.collection_batch_queue.flush()
+                await qs.large_collection_batch_queue.flush()
             except Exception as ex:
                 logger.debug("[Phase][file] collection flush | %s", ex)
         async with self._stats_lock:
@@ -2193,6 +2163,7 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 try:
                     await queues.scan_batch_queue.flush()
                     await queues.collection_batch_queue.flush()
+                    await queues.large_collection_batch_queue.flush()
                     await queues.save_batch_queue.flush()
                     await queues.study_batch_queue.flush()
                 except Exception:
@@ -2255,12 +2226,24 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                     self.job_id,
                 )
                 await _join_until_drained(queues.scan_batch_queue, "scan_batch")
-                await _join_until_drained(queues.collection_batch_queue, "download")
+                await _join_until_drained(queues.collection_batch_queue, "download_normal")
+                await _join_until_drained(queues.large_collection_batch_queue, "download_large")
                 logger.debug(
-                    "[Phase][file] 2b. progress_queue.join (file_saved·스킵 이벤트) | job_id=%s",
+                    "[Phase][file] 2b. progress_queue.join (download event dispatch) | job_id=%s",
                     self.job_id,
                 )
-                await _join_until_drained(queues.progress_queue, "progress")
+                await _join_until_drained(queues.progress_queue, "progress_dispatch")
+                logger.debug(
+                    "[Phase][file] 2b. local_finalize_queue.join | job_id=%s",
+                    self.job_id,
+                )
+                await self._wait_for_file_local_finalize_drain()
+                await _join_until_drained(queues.progress_queue, "progress_after_finalize")
+                logger.debug(
+                    "[Phase][file] 2b. file_save_queue.join | job_id=%s",
+                    self.job_id,
+                )
+                await self._wait_for_file_save_drain()
                 logger.debug(
                     "[Phase][file] 2c. save_batch_queue.join | job_id=%s",
                     self.job_id,

@@ -441,6 +441,7 @@ class IntegratedWorkflow:
                 all_queues_empty = (
                     scan_queue.empty()
                     and queues.collection_batch_queue.empty()
+                    and queues.large_collection_batch_queue.empty()
                     and queues.save_batch_queue.empty()
                     and queues.study_batch_queue.empty()
                 )

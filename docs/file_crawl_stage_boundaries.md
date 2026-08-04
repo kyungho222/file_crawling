@@ -1,6 +1,6 @@
 # File Crawl Stage Boundaries
 
-Updated: 2026-06-18
+Updated: 2026-08-01
 
 This document names the current attachment file crawl boundaries before moving
 code out of the large workflow methods. The source of truth for code-facing
@@ -55,26 +55,33 @@ stage names is `backend/file/file_crawl_stage_contract.py`.
 8. download_save
    owner: core.crawler.workers.download.download_worker
    input: file_meta
-   output: file_saved event
+   output: download_local_saved event
    preserve: attachment_name, saved_filename, storage_filename, original_meta
-   rule: do not overwrite the source attachment name with the storage filename
+   rule: remote work ends after response validation and atomic local file move
 
-9. save_event_handle
+9. local_file_finalize
+   owner: BoardContentFilePipelineMixin local finalize workers
+   input: download_local_saved event
+   output: file_saved event
+   work: local file readiness, document metadata, storage sync
+   rule: this bounded local queue must not occupy a remote download worker
+
+10. save_event_handle
    owner: _run_file_progress_loop / _file_run_saved_file_learn_after_save
    input: file_saved event
    output: learn_list file_info
    preserve: original_meta, attachment_name, cate1/cate2
 
-10. learn_list_row_ensure
-    owner: _ensure_learn_list_row_for_file_save
-    input: saved file_info
-    output: insert_into_learn_list call
-    preserve: subject candidates, category candidates, content URL
+11. learn_list_row_ensure
+   owner: _ensure_learn_list_row_for_file_save
+   input: saved file_info
+   output: insert_into_learn_list call
+   preserve: subject candidates, category candidates, content URL
 
-11. learn_list_persist
-    owner: db.mariadb_save_update.insert_into_learn_list
-    input: file_info
-    output: LEARN_LIST insert/update
+12. learn_list_persist
+   owner: db.mariadb_save_update.insert_into_learn_list
+   input: file_info
+   output: LEARN_LIST insert/update
     decision:
       subject = _resolve_file_learning_subject(file_info)
       cate = coalesce_learn_list_cates(file_info)
@@ -96,3 +103,22 @@ stage names is `backend/file/file_crawl_stage_contract.py`.
 - `post_title` should be added to `original_meta` during the next behavior patch;
   the current extraction flow computes it but does not consistently pass it to
   the download payload.
+
+## Local Postprocess Settings
+
+- FILE_CRAWL_DEFER_LOCAL_POSTPROCESS=1 enables the split stage for file
+  crawls that use defer_save_batch_until_learn_list.
+- FILE_CRAWL_LOCAL_FINALIZE_WORKERS defaults to 2.
+- FILE_CRAWL_LOCAL_FINALIZE_QUEUE_MAXSIZE defaults to 100.
+- FILE_PIPELINE_COLLECTION_QUEUE_MAXSIZE defaults to 500 for file crawls only;
+  the shared crawler collection queue keeps its existing default.
+- The workflow waits for this queue before final save/learning completion and
+  cancels it during a forced stop.
+
+## Download Safety Settings
+
+- DOWNLOAD_ITEM_HARD_TIMEOUT_SEC defaults to 240 seconds and bounds one complete
+  attachment attempt, including domain-lock waits and browser fallbacks.
+- DOWNLOAD_ITEM_LARGE_HARD_TIMEOUT_SEC defaults to 600 seconds for files at or
+  above DOWNLOAD_LARGE_FILE_THRESHOLD_MB.
+- A hard timeout releases the worker slot and uses the existing delayed retry queue.

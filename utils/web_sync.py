@@ -35,6 +35,29 @@ if FLOW_DEBUG:
 def _debug_log(*args: Any, **kwargs: Any) -> None:
     return None
 
+def _atomic_copy_to_public_path(source_path: str, destination_path: str) -> int:
+    """Expose a completed file only after its local WebSync copy is complete."""
+    import shutil
+
+    destination_dir = os.path.dirname(destination_path)
+    if destination_dir:
+        os.makedirs(destination_dir, exist_ok=True)
+    temp_path = f"{destination_path}.sync-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}.part"
+    try:
+        shutil.copy2(source_path, temp_path)
+        source_size = os.path.getsize(source_path)
+        copied_size = os.path.getsize(temp_path)
+        if source_size != copied_size:
+            raise IOError(f"local sync size mismatch: source={source_size} copied={copied_size}")
+        os.replace(temp_path, destination_path)
+        return copied_size
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
 
 import importlib.util
 import sys
@@ -725,11 +748,7 @@ async def sync_file_to_webserver(
                 if found_dir:
                     import shutil
                     dst_file = os.path.join(found_dir, os.path.basename(local_file_path))
-                    shutil.copy2(local_file_path, dst_file)
-                    try:
-                        dst_size = os.path.getsize(dst_file)
-                    except Exception:
-                        dst_size = None
+                    dst_size = _atomic_copy_to_public_path(local_file_path, dst_file)
                     _debug_log(
                         "H_sync_local_default",
                         "utils/web_sync.py:sync_file_to_webserver",
@@ -900,11 +919,7 @@ async def sync_file_to_webserver(
             try:
                 import shutil
                 logger.debug("[WebSync][TRACE] local_copy_prepare | src=%s dest_path=%s", local_file_path, dest_path)
-                shutil.copy2(local_file_path, dest_path)
-                try:
-                    copied_size = os.path.getsize(dest_path)
-                except Exception:
-                    copied_size = None
+                copied_size = _atomic_copy_to_public_path(local_file_path, dest_path)
                 logger.debug("[WebSync][TRACE] local_copy_done | src=%s dest=%s", local_file_path, dest_path)
                 _debug_log(
                     "H_sync_local_copy",

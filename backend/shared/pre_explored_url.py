@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Optional, List, AsyncIterable, Union, Dict, Any, Tuple
 from backend.shared.url_scope import (
+    build_sql_scope_condition,
     extract_service_scope_path_prefix,
     extract_scope_host,
     extract_scope_identities,
@@ -24,6 +25,7 @@ from backend.shared.exploration_query import (
     EXPLORATION_TABLE,
     ExplorationQuerySpec,
     build_exploration_conditions,
+    sql_single_quoted_literal,
 )
 from backend.shared.detail_page_utils import url_query_suggests_board_article_detail
 from backend.shared.crawl_trace import crawl_trace
@@ -153,18 +155,43 @@ async def count_exploration_post_urls(
         effective_prefix = normalize_scope_path_prefix(scope_path_prefix)
         if not effective_prefix and contents_url:
             effective_prefix = extract_service_scope_path_prefix(contents_url)
-        query_conditions = build_exploration_conditions(
-            ExplorationQuerySpec(
-                chat_bot_id=chat_bot_id,
-                target_domains=list(final_domains or []),
-                path_prefix=effective_prefix,
-                include_empty_type=False,
-                dedupe_urls=True,
-                require_active=True,
+        # The initial dashboard count runs before the crawl workers start. Keep
+        # this predicate index-friendly; the stream retains its compatibility
+        # checks for legacy values during actual processing.
+        predicates = [
+            "`type` = 'post'",
+            "`is_active` = 1",
+            "(`study_status` IS NULL OR `study_status` <> 'delete')",
+            "(`merge_status` IS NULL OR `merge_status` <> 'duplicate')",
+        ]
+        normalized_chat_bot_id = str(chat_bot_id or "").strip()
+        if normalized_chat_bot_id:
+            predicates.append(
+                "`chat_bot_id` = '"
+                + sql_single_quoted_literal(normalized_chat_bot_id)
+                + "'"
             )
+        scope_condition = build_sql_scope_condition(
+            "url",
+            list(final_domains or []),
+            path_prefix=effective_prefix,
         )
-        condition = query_conditions.condition
-        legacy_condition = query_conditions.legacy_condition
+        if scope_condition:
+            predicates.append(scope_condition)
+        condition = " AND ".join(predicates)
+        legacy_predicates = [
+            "`type` = 'post'",
+            "(`study_status` IS NULL OR `study_status` <> 'delete')",
+        ]
+        if normalized_chat_bot_id:
+            legacy_predicates.append(
+                "`chat_bot_id` = '"
+                + sql_single_quoted_literal(normalized_chat_bot_id)
+                + "'"
+            )
+        if scope_condition:
+            legacy_predicates.append(scope_condition)
+        legacy_condition = " AND ".join(legacy_predicates)
     except Exception as scope_exc:
         logger.debug(
             "[START_URLS_TRACE] exploration post count scope skipped | db=%s chat_bot_id=%s contents_url=%s prefix=%s err=%s",
@@ -174,16 +201,25 @@ async def count_exploration_post_urls(
             scope_path_prefix,
             scope_exc,
         )
-        query_conditions = build_exploration_conditions(
-            ExplorationQuerySpec(
-                chat_bot_id=chat_bot_id,
-                include_empty_type=False,
-                dedupe_urls=True,
-                require_active=True,
-            )
+        normalized_chat_bot_id = str(chat_bot_id or "").strip()
+        condition = (
+            "`type` = 'post'"
+            " AND `is_active` = 1"
+            " AND (`study_status` IS NULL OR `study_status` <> 'delete')"
+            " AND (`merge_status` IS NULL OR `merge_status` <> 'duplicate')"
         )
-        condition = query_conditions.condition
-        legacy_condition = query_conditions.legacy_condition
+        legacy_condition = (
+            "`type` = 'post'"
+            " AND (`study_status` IS NULL OR `study_status` <> 'delete')"
+        )
+        if normalized_chat_bot_id:
+            chat_bot_condition = (
+                "`chat_bot_id` = '"
+                + sql_single_quoted_literal(normalized_chat_bot_id)
+                + "'"
+            )
+            condition += " AND " + chat_bot_condition
+            legacy_condition += " AND " + chat_bot_condition
     try:
         rows = await maria_select_data(
             EXPLORATION_TABLE,

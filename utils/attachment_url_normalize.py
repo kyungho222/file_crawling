@@ -8,6 +8,7 @@ portal/health·menuNo 등으로만 달라지는 동일 파일을 한 키로 묶�
 from __future__ import annotations
 
 from posixpath import normpath
+import re
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 from utils.url import (
@@ -52,6 +53,11 @@ _ATTACHMENT_ID_QUERY_KEYS = frozenset(
         "atchfileid",
         "filesn",
     }
+)
+
+
+_UUID_ATTACHMENT_ID_RE = re.compile(
+    r"(?i)(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])"
 )
 
 
@@ -207,6 +213,13 @@ def extract_attachment_key_candidates(url: str | None) -> list[str]:
     else:
         for val in atch_ids:
             _add(val, min_len=6)
+
+    # Link dynamic and static aliases only when they share a canonical UUID.
+    uuid_sources = [unquote(p.path or "")]
+    uuid_sources.extend(unquote((v or "").strip()) for _, v in pairs)
+    for source in uuid_sources:
+        for match in _UUID_ATTACHMENT_ID_RE.finditer(source):
+            _add(f"uuid={match.group(1).lower()}", min_len=41)
 
     return out
 

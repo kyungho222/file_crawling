@@ -345,6 +345,15 @@ class MultiplexProgressQueue:
         except Exception:
             return logging.INFO
 
+    @staticmethod
+    def _is_lossy_telemetry(item: Dict[str, Any]) -> bool:
+        return str(item.get("type") or "").strip().lower() in {
+            "scan",
+            "collection",
+            "post",
+            "in_flight",
+        }
+
     async def put(self, item: Any) -> None:
         if not isinstance(item, dict):
             return
@@ -390,7 +399,35 @@ class MultiplexProgressQueue:
                 list(self._pool._jobs.keys()),
             )
             return
-        await ctx.queues.progress_queue.put(item)
+        progress_queue = ctx.queues.progress_queue
+        maxsize = int(getattr(progress_queue, "maxsize", 0) or 0)
+        queue_size = progress_queue.qsize()
+        reserved_terminal_slots = max(10, maxsize // 10) if maxsize > 0 else 0
+        if (
+            maxsize > 0
+            and self._is_lossy_telemetry(item)
+            and queue_size >= max(1, maxsize - reserved_terminal_slots)
+        ):
+            logger.debug(
+                "[GlobalPool][progress_backpressure] telemetry dropped | job_id=%s type=%s queue=%s/%s",
+                jid,
+                item.get("type"),
+                queue_size,
+                maxsize,
+            )
+            return
+        wait_started = time.monotonic()
+        await progress_queue.put(item)
+        wait_sec = time.monotonic() - wait_started
+        if wait_sec >= 1.0:
+            logger.warning(
+                "[GlobalPool][progress_backpressure] progress enqueue delayed | job_id=%s type=%s wait_sec=%.1f queue=%s/%s",
+                jid,
+                item.get("type"),
+                wait_sec,
+                queue_size,
+                maxsize,
+            )
 
     def put_nowait(self, item: Any) -> None:
         if not isinstance(item, dict):
@@ -469,6 +506,7 @@ class GlobalWorkerPool:
         self.scan_queue = MultiplexQueue(self, lambda q: q.scan_queue, stage="scan")
         self.scan_batch_queue = MultiplexBatchQueue(self, lambda q: q.scan_batch_queue, stage="scan_batch")
         self.collection_batch_queue = MultiplexBatchQueue(self, lambda q: q.collection_batch_queue, stage="collection_batch")
+        self.large_collection_batch_queue = MultiplexBatchQueue(self, lambda q: q.large_collection_batch_queue, stage="large_collection_batch")
         self.save_batch_queue = MultiplexBatchQueue(self, lambda q: q.save_batch_queue, stage="save_batch")
         self.progress_queue = MultiplexProgressQueue(self)
 
@@ -479,7 +517,7 @@ class GlobalWorkerPool:
 
     def worker_health_snapshot(self, *, job_id: Optional[str] = None) -> Dict[str, Any]:
         """Expose download worker liveness and active item context for queue diagnosis."""
-        download_tasks = [t for t in self._tasks if t.get_name().startswith("global-download-worker-")]
+        download_tasks = [t for t in self._tasks if t.get_name().startswith("global-download-")]
         return {
             "download_total": len(download_tasks),
             "download_alive": sum(1 for t in download_tasks if not t.done()),
@@ -798,10 +836,18 @@ class GlobalWorkerPool:
                 max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
             max_concurrent = max(1, max_concurrent)
 
-            for i in range(max(1, download_workers)):
+            normal_download_workers = 2
+            large_download_workers = 2
+            for i in range(normal_download_workers + large_download_workers):
+                worker_lane = "normal" if i < normal_download_workers else "large"
+                worker_queue = (
+                    self.collection_batch_queue
+                    if worker_lane == "normal"
+                    else self.large_collection_batch_queue
+                )
                 t = asyncio.create_task(
                     download_worker(
-                        self.collection_batch_queue,
+                        worker_queue,
                         self.save_batch_queue,
                         progress_queue=self.progress_queue,
                         max_concurrent=max_concurrent,
@@ -809,9 +855,11 @@ class GlobalWorkerPool:
                         browser_getter=self.acquire_browser,
                         browser_releaser=self.release_browser,
                         worker_id=i + 1,
+                        worker_lane=worker_lane,
+                        large_download_queue=self.large_collection_batch_queue,
                         browser_relauncher=self._relaunch_browser,
                     ),
-                    name=f"global-download-worker-{i+1}",
+                    name=f"global-download-{worker_lane}-worker-{i+1}",
                 )
                 self._track_worker_task(t)
 
@@ -929,6 +977,7 @@ class GlobalWorkerPool:
                     try:
                         await ctx.queues.scan_batch_queue.flush()
                         await ctx.queues.collection_batch_queue.flush()
+                        await ctx.queues.large_collection_batch_queue.flush()
                         await ctx.queues.save_batch_queue.flush()
                     except Exception:
                         pass

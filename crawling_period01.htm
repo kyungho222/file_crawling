@@ -1,0 +1,1761 @@
+<?php
+include_once $_SERVER['DOCUMENT_ROOT']."/config.php";
+include_once "./chatbotConfig.php";
+include_once "./config.php";
+include_once $_SERVER['DOCUMENT_ROOT'].'/begin.htm';
+
+if ($_GET['id']) {
+	$sql = "SELECT * FROM ASADAL_CRAWLING_LEARN_LIST WHERE id = ".htmlspecialchars(trim($_GET['id']), ENT_QUOTES, 'UTF-8');
+} else {
+	$sql = "SELECT * FROM ASADAL_CRAWLING_LEARN_LIST WHERE chat_bot_id = '$chat_bot' AND status='Y' AND method LIKE '%period%' ORDER BY created_at ASC LIMIT 1";
+}
+$dbObj->setQuery($sql);
+$res=$dbObj->exQuery();
+$row_craw = mysql_fetch_assoc($res);
+
+$sql = "SELECT * FROM ASADAL_CRAWLING_CONFIG WHERE chat_bot_id = '$chat_bot'";
+$dbObj->setQuery($sql);
+$res=$dbObj->exQuery();
+$data = array();
+while($row_con = mysql_fetch_assoc($res)) {
+	$data[$row_con['key']] = $row_con['value'];
+}
+//크롤링 환경설정값
+$week_count = $data['week_count'] ? $data['week_count'] : '3,000';// 평일 낮 시간 페이지 수집 개수
+$page_count = $data['page_count'] ? $data['page_count'] : '3,000';// 야간 및 주말 페이지 수집 개수
+$currentDayOfWeek = date('w');
+$currentHour = date('H');
+$isWeekend = ($currentDayOfWeek == 0 || $currentDayOfWeek == 6);
+if (!$isWeekend && $currentHour >= 9 && $currentHour < 18) {
+	$pageCount = $week_count;
+} else {
+	$pageCount = $page_count;
+}
+
+// 메뉴
+include_once './crawling_topmenu.htm';
+
+$code = 'AS1729062288';
+include_once './cate_menu.php';
+?>
+	<link rel="stylesheet" type="text/css" href="./css/style.css">
+	<script language="javascript" src="./js/ai.js"></script>
+<style>
+	#progressModal {
+		position: fixed;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		background-color: rgba(0,0,0,0.5);
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		z-index: 9999;
+	}
+	.modal-content {
+		background-color: white;
+		padding: 25px 25px;
+		border-radius: 8px;
+		width: 400px;
+		box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+		position: relative;
+	}
+	.progress-header {
+		display: flex;
+		align-items: center;
+		margin-bottom: 15px;flex-wrap: wrap;
+	}
+	.step-indicator {
+		display:none;
+	}
+	.current-step {
+		font-size: 16px;
+	}
+	.total-steps {
+		font-size: 12px;
+		opacity: 0.8;
+	}
+	.progress-message {
+		flex: 1;
+		font-size: 15px;
+		text-align: center;
+		line-height: 1.4;
+		position: relative;width:100%;
+	}
+	.crawling-ul{list-style:none;margin: 0;padding: 0;}
+	.crawling-ul *{margin: 0;padding: 0;}
+	.crawling-ul li{float: left;width: calc(100% / 2 - 4px);margin: 2px;border: 1px solid #9AB6E4;background: #E6EFFF;border-radius: 5px;display: flex;align-items: center;justify-content: center;flex-wrap: wrap;padding: 10px ;box-sizing: border-box;}
+	.crawling-ul li p{width: 100%;font-weight: bold;font-size: 15px;}
+	.progress-container {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		width: 100%;
+		margin-top: 5px;
+	}
+	.progress-bar {
+		flex: 1;
+		height: 20px;
+		background-color: #f0f0f0;
+		border-radius: 10px;
+		overflow: hidden;
+		position: relative;
+		margin-bottom: 20px;
+	}
+	.progress-fill {
+		height: 100%;
+		width: 0%;
+		background-color: #4CAF50;
+		transition: width 0.5s ease;
+	}
+	.progress-text {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 12px;
+		font-weight: bold;
+		color: #000;
+	}
+	.progress-fill[style*="50%"] ~ .progress-text {
+		color: white !important;
+	}
+	.pause-btn {
+		background-color: #007bff;
+		color: white;
+		border: none;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 15px;
+		transition: background 0.2s;
+		white-space: nowrap;
+		display: inline-block;
+bottom: 25px;left: calc(50% - 40px);width: 100%;margin: 0 3px;
+		width: 80px;height: 30px;line-height: 30px;
+	}
+	
+	.pause-btn:hover {
+		background-color: #347dcb;
+	}
+	.number-text {
+		font-size: 25px;
+		font-weight: bold;
+	}
+	.green-number {
+		color: green;
+		font-size: inherit;
+	}
+	.blue-number {
+		color: #007bff;
+		font-size: 19px;
+	}
+	.progress-message h3{margin-top: 0;font-size: 20px;text-align: center;}
+	
+	/* 🟢 깜빡이는 점 애니메이션 */
+	.pulse-dot {
+		display: inline-block;
+		color: #4CAF50;
+		animation: pulse 1.5s ease-in-out infinite;
+	}
+	@keyframes pulse {
+		0%, 100% { opacity: 1; }
+		50% { opacity: 0.3; }
+	}
+	
+	/* ⏳ 스피너 애니메이션 */
+	.spinner {
+		display: inline-block;
+		animation: spin 2s linear infinite;
+	}
+	@keyframes spin {
+		0% { transform: rotate(0deg); }
+		100% { transform: rotate(360deg); }
+	}
+	
+	/* 📁 로딩 아이콘 애니메이션 */
+	.loading-icon {
+		display: inline-block;
+		animation: bounce 1s ease-in-out infinite;
+	}
+	@keyframes bounce {
+		0%, 100% { transform: translateY(0); }
+		50% { transform: translateY(-5px); }
+	}
+	
+	/* ... 로딩 점 3개 애니메이션 */
+	.loading-dots span {
+		display: inline-block;
+		animation: blink 1.4s infinite both;
+	}
+	.loading-dots span:nth-child(1) {
+		animation-delay: 0s;
+	}
+	.loading-dots span:nth-child(2) {
+		animation-delay: 0.2s;
+	}
+	.loading-dots span:nth-child(3) {
+		animation-delay: 0.4s;
+	}
+	@keyframes blink {
+		0%, 80%, 100% { opacity: 0; }
+		40% { opacity: 1; }
+	}
+	.container-ai .all-table-style {
+		margin-bottom: 0px;
+	}
+	
+	/* LIVE 배지 스타일 */
+	.live-badge {
+		display: inline-block;
+		background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+		color: white;
+		padding: 2px 8px;
+		border-radius: 4px;
+		font-size: 12px;
+		font-weight: bold;
+		margin-left: 8px;
+		animation: pulse 1.5s ease-in-out infinite;
+	}
+	#button{display:flex;align-items: center;justify-content: center;}
+	#button .pause-btn.aNo1{position: static;margin: 0 2px;}
+	.open-close{border: 1px solid #ddd;border-radius: 4px;padding: 10px 15px;margin-bottom: 30px;}
+	.open-close .all-table-style{margin-bottom: 0;}
+	.open-close h5{margin: 0;display: flex;justify-content: space-between;align-items: center;}
+	.open-close h5 strong{display: flex;align-items: center;font-weight:normal;}
+	.open-close h5 strong input{margin: 0;margin-right: 3px;}
+	.open-close h5 a{position:relative;padding: 2px 10px;padding-right: 35px;font-size: 14px;border-radius: 3px;box-sizing: border-box;white-space: nowrap;height: 26px;width: 65px;font-weight: normal;}
+	.open-close h5 a::after {content: "접기 ▲";position: absolute;right: 10px;top: 50%;transform: translateY(-50%);font-size: 14px;pointer-events: none;transition: .2s;}
+	.open-close h5 a.open::after {content: "펼치기 ▼";}
+	.object{margin-left: 50px;}
+	#urlPatternModal {
+		position: fixed;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		background-color: rgba(0,0,0,0.5);
+		display: none;
+		justify-content: center;
+		align-items: center;
+		z-index: 9999;
+	}
+	#urlPatternModal .modal-content {
+		background-color: white;
+		padding: 25px 25px;
+		border-radius: 8px;
+		width: 400px;
+		box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+		position: relative;
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: space-between;
+	}
+	#urlPatternModal .modal-content h4 {
+		margin: 0 0 12px;
+		font-size: 18px;width: 100%;
+	}
+	#urlPatternModal .modal-content input[type="text"] {
+		width: 100%;
+		height: 36px;
+		padding: 6px 10px;
+		border: 1px solid #d0d0d0;
+		border-radius: 4px;
+		box-sizing: border-box;
+	}
+	#urlPatternModal .modal-content .field-label {
+		display: block;
+		margin: 10px 0 6px;
+		font-size: 13px;
+		color: #333;text-align: left;
+	}
+	#urlPatternModal .modal-content .hint {
+		margin-top: 8px;
+		font-size: 12px;
+		color: #666;
+		line-height: 1.4;
+	}
+	#urlPatternModal .modal-content select{margin-top: 5px;width: calc(50% - 5px) !important;height: 28px !important;}
+	#urlPatternModal .modal-actions {
+		display: flex;
+		justify-content: center;
+		gap: 8px;
+		margin-top: 16px;
+		width:100%;
+	}
+	#urlPatternModal .modal-actions button {
+		border: none;
+		border-radius: 4px;
+		padding: 6px 14px;
+		font-size: 14px;
+		cursor: pointer;
+	}
+	#urlPatternModal .modal-actions .btn-confirm {
+		background: #007bff;
+		color: #fff;
+	}
+	#urlPatternModal .modal-actions .btn-cancel {
+		background: #e9ecef;
+		color: #333;
+	}
+</style>
+
+<div class="container container-ai">
+	<h3 class="h3-title">AI봇
+		<?php echo $chatbotSelectBox?>
+	</h3>
+	<h3 class="h3-titles">기간수집 <span class="aDtxt">지정한 기간에 올라온 게시판, 파일, 뉴스를 수집합니다.</span></h3>
+<style>
+	.crawlingModify-ul li.method-item{display: flex;align-items: center;}
+	.crawlingModify-ul li.method-item strong{margin-right: 5px;}
+	.all-table-style .crawlingModify-ul{margin: 0;padding: 0;}
+	.all-table-style.crawling input[type="text"], .all-table-style.crawling input[type="date"], .all-table-style.crawling select{height: 26px !important;vertical-align: middle;}
+	ul, li {list-style: none;}
+	.timeConDiv .crawling-select-all ul{margin: 0;}
+	.crawling-select-all a {font-size: inherit;text-decoration: none;overflow: hidden;white-space: nowrap;text-overflow: ellipsis;display: block;}.custom-tooltip {position: absolute;background: #fff;padding: 5px;border-radius: 5px;box-shadow: 0 4px 10px #aaa;white-space: nowrap !important;color: #333;font-size: 14px;display: none;visibility: hidden;transition: opacity 0.2s, visibility 0.2s;z-index: 1000;pointer-events: none;}
+	.crawling-select-all li:hover .custom-tooltip {display: block;visibility: visible;}
+</style>
+	<div class="all-table-style chatbro-m t1s-table setingAdd-table  crawling">
+		<table class="timeConDiv">
+			<colgroup>
+				<col style="width:150px">
+				<col style="width:600px;">
+				<col style="width:auto">
+			</colgroup>
+			<tbody>
+				<tr>
+					<th>사이트명 *</th>
+					<td>
+						<div class="crawling-select" style="margin-left: 0px;">
+							<a href="#n" id="select-display" class="select-display">선택하세요</a>
+							<div class="crawling-select-all" style="max-height: 500px;"></div>
+						</div>
+					</td>
+					<td class="td-lf">* 크롤링 대상 먼저 등록하세요.</td>
+				</tr>
+				<tr>
+					<th>수집대상 *</th>
+					<td>
+						<input type="radio" name="wpradio" id="wpradio1" value="board" onclick="radio_click('AS1729062288')" checked> <label for="wpradio1">게시판</label>
+						<input type="radio" name="wpradio" id="wpradio2" value="file" onclick="radio_click('AS1729062287')"> <label for="wpradio2">파일</label>
+						<input type="radio" name="wpradio" id="wpradio3" value="date" onclick="radio_click('AS1729062288')"> <label for="wpradio3">뉴스</label>
+						<input type="radio" name="wpradio" id="wpradio4" value="video" onclick="radio_click('AS1729065005')"> <label for="wpradio4">동영상</label>
+					</td>
+					<td class="td-lf">* 수집 대상을 선택하세요.</td>
+				</tr>
+				<tr>
+					<th>기간설정 *</th>
+					<td>
+						<input type="date" id="startDate" style="width: 200px;"> ~<input type="date" id="endDate" style="width: 200px;">
+						<select id="during" onchange="formatDate(this);" style="width: 133px;">
+							<option value="">기간 선택</option>
+							<option value="1">최근 1일</option>
+							<option value="2">최근 2일</option>
+							<option value="3">최근 3일</option>
+							<option value="5">최근 5일</option>
+							<option value="7">최근 7일</option>
+							<option value="14">최근 14일</option>
+							<option value="30">최근 30일</option>
+							<option value="all">전체기간</option>
+						</select>
+					</td>
+					<td class="td-lf">* 메인 도메인만 입력한 경우: 게시판을 제외한 모든 URL을 크롤링합니다. <br>폴더 주소까지 입력한 경우: 해당 폴더의 하위 경로의 URL을 크롤링합니다.</td>
+				</tr>
+				<tr>
+					<th>최대 수집 개수</th>
+					<td><input type="text" name="max_videos" placeholder="예: 10" value=""></td>
+					<td class="td-lf">* 미입력 시 모든 데이터를 수집합니다.</td>
+				</tr>
+			</tbody>
+		</table>
+	</div>
+<ul class="rating-list" style="margin-left: 0;padding-left: 0;">
+	<li class="p-t">※ 수집 결과는 홈페이지학습 페이지에서 확인할 수 있습니다. </li>
+</ul>
+<div class="button-right">
+	<a class="btnY" href="#n" onclick="crawling_start('crawling');" name="saveButton" data-id="crawling" data-name="크롤링 중" data-oname="크롤링 시작">크롤링 시작</a>
+</div>
+<div id="board" style="display:none;">
+	<h3 class="h3-title" id="crawling_text">게시판 크롤링</h3>
+	<div class="open-close">
+		<h5><strong><input type="radio" id="addr1" name="addraa" value="include" onclick="handleRadioClick(this)" checked> <label for="addr1">포함할 주소</label></strong> <a href="#n"></a></h5>
+		<div class="all-table-style chatbro-m t1s-table">
+			<div class="searchBar">
+				<div class="btns">
+					<a href="#n" onclick="addUrlPattern('include')" class="add">추가하기</a>
+					<a href="#n" onclick="deleteSelectedPatterns('include')" class="del">삭제하기</a>
+					<span class="txt">※ 아래에서 설정한 주소를 크롤링에 포함하고, 다른 주소는 크롤링하지 않습니다.</span>
+				</div>
+				<div class="rtArea">
+					<span>
+						<input type="hidden" name="pageMax" id="pageMax" value="20">
+						<input type="hidden" name="pageNum" id="pageNum" value="0">
+						<select name="serch_page" id="serch_page" onchange="loadWebSubList('N');">
+							<option value="10">10</option>
+							<option value="20">20</option>
+							<option value="30" selected>30</option>
+							<option value="50">50</option>
+							<option value="100">100</option>
+							<option value="1000">1000</option>
+						</select>
+					</span>
+				</div>
+			</div>
+			<table id="commonBlocksTable">
+				<colgroup>
+					<col style="width: 3%">
+					<col style="width: 5%">
+					<col style="width: 20%">
+					<col style="">
+				</colgroup>
+				<thead>
+					<tr>
+						<th scope="col"><input type="checkbox" id="include" onclick="javascript:check();"></th>
+						<th>번호</th>
+						<th>제목</th>
+						<th>웹페이지 주소 (URL)</th>
+					</tr>
+				</thead>
+				<tbody id="domainTable">
+					<tr><td colspan="4" style="text-align: center;">포함할 주소 로드 중...</td></tr>
+				</tbody>
+			</table>
+		</div>
+	</div>
+	<div class="open-close">
+		<h5><strong><input type="radio" id="addr2" name="addraa" value="exclude" onclick="handleRadioClick(this)"> <label for="addr2">제외할 주소</label></strong> <a href="#n"></a></h5>
+		<div class="all-table-style chatbro-m t1s-table">
+			<div class="searchBar">
+				<div class="btns">
+					<a href="#n" onclick="addUrlPattern('exclude')" class="add">추가하기</a>
+					<a href="#n" onclick="deleteSelectedPatterns('exclude')" class="del">삭제하기</a>
+					<span class="txt">※ 아래에서 설정한 주소를 크롤링에서 제외하고, 다른 주소는 모두 크롤링합니다. </span>
+				</div>
+				<div class="rtArea">
+					<span>
+						<input type="hidden" name="pageMax" id="pageMax" value="20">
+						<input type="hidden" name="pageNum" id="pageNum" value="0">
+						<select name="serch_page" id="serch_page" onchange="loadWebSubList('N');">
+							<option value="10">10</option>
+							<option value="20">20</option>
+							<option value="30" selected>30</option>
+							<option value="50">50</option>
+							<option value="100">100</option>
+							<option value="1000">1000</option>
+						</select>
+					</span>
+				</div>
+			</div>
+			<table id="commonBlocksTable">
+				<colgroup>
+					<col style="width: 3%">
+					<col style="width: 5%">
+					<col style="width: 20%">
+					<col style="">
+				</colgroup>
+				<thead>
+					<tr>
+						<th scope="col"><input type="checkbox" id="exclude" onclick="javascript:precheck();"></th>
+						<th>번호</th>
+						<th>제목</th>
+						<th>웹페이지 주소 (URL)</th>
+					</tr>
+				</thead>
+				<tbody id="domainTable">
+					<tr><td colspan="4" style="text-align: center;">제외할 주소 로드 중...</td></tr>
+				</tbody>
+			</table>
+		</div>
+	</div>
+	<div class="paging" id="paging"></div>
+	<div class="button-right center">
+		<a class="btnY" href="#n" onclick="save();">저장하기</a>
+	</div>
+</div>
+<div id="progressModal" style="display:none;">
+	<div class="modal-overlay">
+		<div class="modal-content">
+			<a href="#n" id="a_close" class="modal-close" onclick="close_box();">X</a>
+			<div class="progress-header" id="progress_header"></div>
+			<pre id="file_queue_trace" style="display:none; max-height:260px; overflow:auto; margin:12px 0 0; padding:10px; background:#101820; color:#d9e2ec; font-size:12px; line-height:1.45; white-space:pre-wrap;"></pre>
+			<div id="button"></div>
+		</div>
+	</div>
+</div>
+<?php
+// ✅ URL 필터 JSON 준비 (스크립트 밖에서 먼저 처리)
+$url_filters_json = '{}';  // 기본값
+
+if (!empty($row_craw["url_pattern"])) {
+	if (is_string($row_craw["url_pattern"])) {
+		// JSON 문자열인 경우: 이미 유효한 JSON이면 그대로 사용
+		$url_filters_data = json_decode($row_craw["url_pattern"], true);
+		if ($url_filters_data !== null && is_array($url_filters_data)) {
+			// 파싱 성공: 원본 JSON 그대로 사용 (이미 올바른 형식)
+			$url_filters_json = $row_craw["url_pattern"];
+		}
+	} elseif (is_array($row_craw["url_pattern"])) {
+		// 배열인 경우 직접 인코딩
+		$url_filters_json = json_encode($row_craw["url_pattern"]);
+	}
+}
+?>
+<script>
+	// PHP 변수를 JavaScript로 주입
+	const url1_doc = '<?php echo $craw_video_url; ?>';
+	if (typeof window !== "undefined") {
+		window.url1_doc = url1_doc; // 전역에서도 접근 가능하도록 복사
+	}
+	//전체분류명
+	const catejson =<?echo $catejsonData;?>;
+	const order = <?echo $catejsonData3;?>;
+	const orderMap = new Map(order.map((id, index) => [id, index]));
+	const pmodal = document.getElementById('progressModal');
+	const progress_header = document.getElementById('progress_header');
+	const button = document.getElementById('button');
+	const saveButtons = document.querySelectorAll('a.btnY[name="saveButton"]');
+	let eventSource = null, cstatus='';
+
+	function appendFileQueueTrace(event, detail = '') {
+		const area = document.getElementById('file_queue_trace');
+		if (!area) return;
+		area.style.display = 'block';
+		const time = new Date().toLocaleTimeString();
+		area.textContent += `${area.textContent ? '\n' : ''}[${time}] ${event}${detail ? ` | ${detail}` : ''}`;
+		area.scrollTop = area.scrollHeight;
+	}
+
+	function startFileQueueTrace(jobId) {
+		window.job_id = jobId;
+		const area = document.getElementById('file_queue_trace');
+		if (area) {
+			area.textContent = '';
+			area.style.display = 'block';
+		}
+		appendFileQueueTrace('job_created', jobId);
+	}
+	var cstatus_obj = {};
+	const learnListId = "<?php echo $row_craw['id']?>";
+	const contents = "<?php echo $row_craw['content']?>";
+	const subject = "<?php echo $row_craw['subject']?>";
+	const memo = "<?php echo $row_craw['memo1']?>";
+	const cate1 = "<?php echo $row_craw['cate1']?>";
+	const cate2 = "<?php echo $row_craw['cate2']?>";
+	const method = "<?php echo $row_craw['method']?>";
+	const chat_bot_id = "<?php echo $chat_bot?>";
+	const db_name = "<?echo $asapro2_db_info['db_name'];?>";
+	let page_count = '<?php echo $pageCount ?>';
+	window.start = "";
+	window.colle = "";
+	window.job_id = "";
+	window.events = false;
+	window.status;
+			
+	window.onload = async function() {
+		radio_click('start');
+		formatDate('');
+		select_list();
+	};
+	
+	document.getElementById('startDate').addEventListener('change', function() {
+		document.getElementById('during').selectedIndex = "";
+		const endDate = document.getElementById('endDate').value;
+		const s_date = new Date(this.value);
+		const e_date = new Date(endDate);
+		if (s_date > e_date) {
+			this.value = '';
+			alert('시작일은 종료일보다 클수 없습니다.');
+		}
+	});
+	
+	document.getElementById('endDate').addEventListener('change', function() {
+		document.getElementById('during').selectedIndex = "";
+		const startDate = document.getElementById('startDate').value;
+		const s_date = new Date(startDate);
+		const e_date = new Date(this.value);
+		if (s_date > e_date) {
+			this.value = '';
+			alert('시작일은 종료일보다 클수 없습니다.');
+		}
+	});
+
+	async function radio_click(code) {
+		if (code === 'start') {
+			const wpradio = document.querySelectorAll('input[name="wpradio"]');
+			wpradio.forEach(function(item) {
+				if (!method.includes(item.value)) {
+					item.disabled = true; 
+				}
+			});
+		}
+		const rad_val = document.querySelector('input[name="wpradio"]:checked').value;
+		if(rad_val === 'board') {
+			if (document.getElementById('select-display').innerHTML !== '해당하는 내용이 없습니다.') {
+				document.getElementById('crawling_text').innerHTML = '게시판 크롤링';
+				document.getElementById('board').style.display = 'block';
+			}
+			const ra_during = document.getElementById('during');
+			ra_during.value ="";
+			formatDate(ra_during);
+			loadurl_pattern(rad_val);
+		} else if(rad_val === 'file') {
+			if (document.getElementById('select-display').innerHTML !== '해당하는 내용이 없습니다.') {
+				document.getElementById('crawling_text').innerHTML = '파일 크롤링';
+				document.getElementById('board').style.display = 'block';
+			}
+			const ra_during = document.getElementById('during');
+			ra_during.value ="";
+			formatDate(ra_during);
+			loadurl_pattern(rad_val);
+		} else if(rad_val === 'date') {
+			document.getElementById('board').style.display = 'none';
+			const ra_during = document.getElementById('during');
+			ra_during.value ="";
+			formatDate(ra_during);
+		} else if(rad_val === 'video') {
+			document.getElementById('board').style.display = 'none';
+			const ra_during = document.getElementById('during');
+			ra_during.value ="all";
+			formatDate(ra_during);
+		}
+	}
+
+	$(function(){
+		$(".open-close h5 a").click(function(e){
+			e.preventDefault();
+			if($(this).hasClass("open")){
+				$(this).parent("h5").next(".all-table-style").slideDown("fast");
+				$(this).removeClass("open");
+			}else{
+				$(this).parent("h5").next(".all-table-style").slideUp("fast");
+				$(this).addClass("open");
+			}
+		});
+	});
+
+	function formatDate(obj) {
+		const value = obj.value;
+		const startDate = document.getElementById('startDate');
+		const endDate = document.getElementById('endDate');
+		if (value === 'all') {
+			startDate.value = '';
+			endDate.value = '';
+		} else if (obj === '' || value === '') {
+			const endBordDate = new Date();
+			const startBordDate = new Date(endBordDate.getFullYear(), endBordDate.getMonth(), 1);
+			const fmtendBordDate = endBordDate.getFullYear() + '-' + String(endBordDate.getMonth() + 1).padStart(2, '0') + '-' + String(endBordDate.getDate()).padStart(2, '0');
+			const fmtstaBordDate = startBordDate.getFullYear() + '-' + String(startBordDate.getMonth() + 1).padStart(2, '0') + '-' + String(startBordDate.getDate()).padStart(2, '0');
+			document.getElementById('startDate').value = fmtstaBordDate;
+			document.getElementById('endDate').value = fmtendBordDate;
+		} else {
+			//마지막 날자
+			const selectedDate = new Date();
+			const e_year = selectedDate.getFullYear();
+			const e_month = String(selectedDate.getMonth() + 1).padStart(2, '0');
+			const e_day = String(selectedDate.getDate()).padStart(2, '0');
+			const e_formatDate = `${e_year}-${e_month}-${e_day}`;
+			//시작 날자
+			selectedDate.setDate(selectedDate.getDate() - Number(obj.value)+1);
+			const s_year = selectedDate.getFullYear();
+			const s_month = String(selectedDate.getMonth() + 1).padStart(2, '0');
+			const s_day = String(selectedDate.getDate()).padStart(2, '0');
+			const s_formatDate = `${s_year}-${s_month}-${s_day}`;
+			startDate.value = s_formatDate;
+			endDate.value = e_formatDate;
+		}
+	}
+	let select_length;
+	$('.select-display').click(function(e) {
+		e.preventDefault(); 
+		if (select_length > 1) {
+			$('.crawling-select-all').toggle();
+		}
+	});
+
+	$(document).on('click', '.crawling-select-all a', function(e) {
+		e.preventDefault();
+		const dataId = $(this).data('id');
+		location.href='./crawling_period.htm?id='+dataId;
+	});
+
+	$(document).click(function(e) {
+		if (!$(e.target).closest('.crawling-select').length) {
+			$('.crawling-select-all').hide();
+		}
+	});
+	// 크롤링시작
+	function crawling_start(str) {
+		window.start = str;
+		saveButtons.forEach(saveButton => {
+			saveButton.style.cssText = "background-color: #d3e3fd;color: #6c757d !important;";
+			if (saveButton.dataset.id === str) {
+				saveButton.innerHTML = saveButton.dataset.name;
+				saveButton.onclick = function() {loading();};
+			} else {
+				saveButton.onclick = function(event) {
+					event.preventDefault();
+					event.stopPropagation();
+					return false;
+				};
+			}
+		});
+		pmodal.style.display = 'flex';
+		button.innerHTML = "";
+		progress_header.innerHTML = "";
+		const jobId = generateJobId();
+		startFileQueueTrace(jobId);
+		appendFileQueueTrace('crawl_requested', str);
+		if (str === 'explorat') {
+			progress_header.innerHTML = `<div class="progress-message">크롤링 탐색 중입니다.</div><div style="width: 100%;text-align: center;margin-top: 20px;"><button class="pause-btn aNo1" onclick="click_button('stop');">중단하기</button><button class="pause-btn aNo1" onclick="close_box();">닫기</button></div>`;
+			start_exploration(jobId);
+		} else if (str === 'ex_crawl') {
+			progress_header.innerHTML = `<div class="progress-message">크롤링 준비 중입니다.</div><div style="width: 100%;text-align: center;margin-top: 20px;"><button class="pause-btn aNo1" onclick="click_button('stop');">중단하기</button><button class="pause-btn aNo1" onclick="close_box();">닫기</button></div>`;
+			crawling_startLog(jobId);
+		} else {
+			progress_header.innerHTML = `<div class="progress-message">크롤링 준비 중입니다.</div><div style="width: 100%;text-align: center;margin-top: 20px;"><button class="pause-btn aNo1" onclick="click_button('stop');">중단하기</button><button class="pause-btn aNo1" onclick="close_box();">닫기</button></div>`;
+			crawling_startLog(jobId);
+		}
+	}
+
+	function loading() {
+		window.events = true;
+	}
+
+	async function start_exploration(jobId) {
+		// 1. POST 요청으로 탐색 시작
+		const startUrl = "https://api-aipro.chatbaram.com/url-scout-dev/explore/learn-list";
+		const obj = {
+			learn_list_id: parseInt(learnListId),
+			max_depth: 10,  // 최대값 (API 제약: 1-10)
+			max_crawl_urls: 10000,  // 최대 수집 URL
+			session_id: jobId,
+			db_name: db_name
+		};
+
+		console.log('탐색 요청 데이터:', obj);  // 디버깅용
+
+		try {
+			appendFileQueueTrace('exploration_request_sent', startUrl);
+			const response = await fetch(startUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(obj)
+			});
+
+			if (!response.ok) {
+				const errorData = await response.json().catch(() => ({ detail: '알 수 없는 오류' }));
+				console.error('서버 오류 상세:', response.status, errorData);
+
+				// FastAPI 검증 오류 상세 표시
+				let errorMsg = `서버 응답 오류 (${response.status})`;
+				if (Array.isArray(errorData.detail)) {
+					// Pydantic 검증 오류 (배열 형태)
+					const errors = errorData.detail.map(err =>
+						`- ${err.loc.join('.')}: ${err.msg} (입력값: ${err.input})`
+					).join('\n');
+					errorMsg += ':\n' + errors;
+				} else if (typeof errorData.detail === 'string') {
+					errorMsg += ': ' + errorData.detail;
+				} else {
+					errorMsg += ': ' + JSON.stringify(errorData);
+				}
+				throw new Error(errorMsg);
+			}
+
+			const result = await response.json();
+			appendFileQueueTrace('exploration_request_accepted', result.job_id || jobId);
+			console.log('탐색 시작:', result);
+
+			// 2. SSE 연결 시작 (재사용 가능한 함수 호출)
+			const radios = document.querySelector('input[name="wpradio"]:checked');
+			const colle = radios.value;
+			const text = document.querySelector(`label[for="${radios.id}"]`).textContent;
+			const content = document.getElementById('p_url').value;
+			var craw_obj = {
+				job_id: jobId,
+				siteName: subject,
+				colle: colle,
+				details: content,
+				h3: text
+			}
+			window.events = true;
+			// Queue trace polling only; no SSE subscription.
+
+		} catch (err) {
+			appendFileQueueTrace('exploration_request_failed', err.message || String(err));
+			console.error('탐색 오류:', err);
+			progress_header.innerHTML = `
+				<div class="progress-message">
+					<h3>탐색 실패</h3>
+					<p style="color: red;">서버 연결에 실패했습니다.</p>
+				</div>
+			`;
+			button.innerHTML = `<button class="pause-btn aNo1" onclick="close_box();">닫기</button>`;
+			saveButtons_recover();
+		}
+	}
+
+	const buildUrl = (path) => {
+		if (!path.startsWith("/")) return path;
+		const base = (typeof url1_doc !== "undefined" && url1_doc) ? String(url1_doc).trim() : "";
+		if (!base) {
+			console.warn('[WARN buildUrl] url1_doc이 비어있습니다. 상대 경로를 반환합니다.');
+			return path;
+		}
+		const result = base.replace(/\/+$/, "") + path;
+		return result;
+	};
+
+	async function crawling_startLog(jobId) {
+		const radios = document.querySelector('input[name="wpradio"]:checked');
+		const during = document.getElementById('during').value;
+		const colle = radios.value;
+		const text = document.querySelector(`label[for="${radios.id}"]`).textContent;
+		let startDate = document.getElementById('startDate').value;
+		let endDate = document.getElementById('endDate').value;
+		const max_videos_input = document.querySelector('input[name="max_videos"]');
+		const max_videos = max_videos_input ? parseInt(max_videos_input.value) || null : null;
+		if (during !== 'all' && !startDate && !endDate) {
+			alert('기간 날자를 입력해주세요.');
+			return;
+		}
+		if (!startDate) {
+			startDate = endDate;
+		}
+		if (!endDate) {
+			endDate = startDate;
+		}
+		let url = "";
+		let details;
+		if (during === 'all') {
+			details = '전체기간';
+		} else {
+			details = startDate+' ~ '+endDate;
+		}
+		var craw_obj = {
+			chat_bot_id: chat_bot_id,
+			content_type: 'url',
+			status: 'ADD',
+			contents: [contents],
+			siteName: subject,
+			colle: colle,
+			cstatus: 'start',
+			job_id: jobId,
+			h3: text,
+			details: contents,
+			ui_details: details
+		}
+		if (colle == 'board') {
+			url = 'https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/backend/session/start';
+		} else if (colle == 'file') {
+			url = 'https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/backend/session/start';
+		} else if (colle == 'date') {
+			url = '<?=$url1?>/api/ai_news/crawling_date';
+		} else if (colle == 'video') {
+			url = buildUrl('/AI_video/channel-ingest');
+			if (max_videos) {
+				craw_obj.page_count = max_videos;
+			}
+			craw_obj.details = contents;
+			craw_obj.start_by = 'm';
+		}
+		try {
+			const response = await fetch('./learn_craw_url_add.php', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify(craw_obj)
+			});
+			const result = await response.json();
+			console.log('[crawling_log add]', craw_obj, result);
+			if (result.status === "success") {
+				try {
+					var obj = {
+						chat_bot_id: chat_bot_id,
+						db_name: db_name,
+						content_type: 'url',
+						status: 'Y',
+						contents: [contents],
+						subjects: [subject],
+						state: 'S',
+						job_id: jobId,
+						memo: [memo],
+						crawl_mode: 'crawling',
+						colle: colle,
+						ui_details: details,
+					}
+					if (during !== 'all') {
+						obj.target_date = [startDate, endDate];
+					}
+					if (colle == 'video') {
+						obj.channel_url = contents;
+						obj.model = "gpt-4.1";
+						if (max_videos) {
+							obj.max_videos = max_videos;
+						}
+					}
+					const res = await fetch(url, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify(obj)
+					});
+					
+					if (res.ok) {
+						appendFileQueueTrace('crawl_request_accepted', jobId);
+						window.colle = colle;
+						window.job_id = jobId;
+						window.events = true;
+						// Queue trace polling only; no SSE subscription.
+					} else if (res.status === 429) {
+						obj.status = '429';
+						window.status = 'error';
+						update_status('error', obj);
+					} else {
+						throw new Error(res.statusText);
+					}
+				} catch (err) {
+					appendFileQueueTrace('crawl_request_failed', err.message || String(err));
+					console.log(err);
+				} finally {
+					isTaskRunning = false;
+				}
+			}
+		} catch (err) {
+			console.log('크롤링기록 실패: ', err);
+			saveButtons_recover();
+		}
+	}
+
+	async function craw_log_action(obj) {
+		cstatus = '';
+		try {
+			let url;
+			if (window.start == 'explorat') {
+				url = `https://api-aipro.chatbaram.com/url-scout-dev/explore/sse/${obj.job_id}`;
+			} else {
+				if (obj.colle == 'video') {
+					const qs = new URLSearchParams({
+						channel_url: obj.contents,
+						db_name: db_name,
+						chat_bot_id: chat_bot_id,
+						job_id: obj.job_id
+					}).toString();
+					url = buildUrl(`/AI_video/channel-ingest/status?${qs}`);
+				} else {
+					url = `<?=$craw_url?>/c1/crawl_sse/${db_name}/${obj.job_id}`;
+				}
+			}
+			eventSource = new EventSource(url);
+			eventSource.onopen = function(event) {
+			};
+			eventSource.onmessage = function(event) {
+				try {
+					const data = JSON.parse(event.data);
+					data.subject = obj.siteName;
+					data.details = obj.details;
+					data.colle = obj.colle;
+					data.h3 = obj.h3;
+					// 완료/오류/취소 시 자동 연결 종료
+					if (window.events) {
+						handleMessage(data);
+					}
+				} catch (e) {
+					console.log(`데이터 파싱 오류: ${e.message}`, 'error');
+				}
+			};
+			eventSource.onerror = function(event) {
+				disconnect();
+			};
+		} catch (error) {
+			console.error('요청실패:', error);
+		}
+	}
+
+	function disconnect() {
+		if (eventSource) {
+			eventSource.close();
+			eventSource = null;
+		}
+	}
+
+	function saveButtons_recover() {
+		saveButtons.forEach(saveButton => {
+			saveButton.style.cssText = "background-color: #007bff;color: #fff !important;";
+			saveButton.innerHTML = saveButton.dataset.oname;
+			saveButton.onclick = function() {crawling_start(saveButton.dataset.id);};
+		});
+	}
+
+	function generateJobId() {
+		return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+		const r = Math.random() * 16 | 0;
+		return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+		});
+	}
+
+	//천단위마다 , 찍기
+	function format_number(n) {
+		// undefined, null, NaN 체크
+		if (n === undefined || n === null || isNaN(n)) {
+			return '0';
+		}
+		var b=parseInt(n).toString();
+		var len=b.length;
+		if(len<=3){return b;}
+		var r=len%3;
+		return r>0?b.slice(0,r)+","+b.slice(r,len).match(/\d{3}/g).join(","):b.slice(r,len).match(/\d{3}/g).join(",");
+	}
+
+	async function handleMessage(data) {
+		pmodal.style.display = 'flex';
+		progress_header.innerHTML = "";
+		window.status = data.status;
+		if (data.status === 'running') {
+			// ✅ 페이지 수집 카운트만 표시
+			running (data);
+		}
+		else if (data.status === 'completed' || data.status === 'cancelled' || data.status === 'error' || data.status === 'stop') {
+			if (window.start == 'explorat') {
+				// 안내 문구 생성
+				let resultMessage = '';
+				if (data.status === 'completed') {
+					// 3단계 정보 추출
+					const discovered = data.discovered || 0;  // 1. 발견
+					const newCount = data.new || 0;           // 2. 신규
+					const deleted = data.deleted || 0;        // 3. 삭제
+					const total = data.total || 0;            // DB 총 개수
+					const isReExploration = data.is_re_exploration || false;
+
+					if (isReExploration) {
+						if (newCount === 0 && deleted === 0) {
+							resultMessage = `<p style="color: #28a745; margin-top: 10px; font-weight: bold;">✓ 재탐색 완료: 변경사항이 없습니다. (총 ${format_number(total)}개 URL 유지)</p>`;
+						} else if (newCount > 0 && deleted > 0) {
+							resultMessage = `<p style="color: #17a2b8; margin-top: 10px; font-weight: bold;">✓ 재탐색 완료: ${format_number(newCount)}개 추가, ${format_number(deleted)}개 삭제되었습니다. (총 ${format_number(total)}개)</p>`;
+						} else if (newCount > 0) {
+							resultMessage = `<p style="color: #28a745; margin-top: 10px; font-weight: bold;">✓ 재탐색 완료: ${format_number(newCount)}개의 새로운 URL이 추가되었습니다. (총 ${format_number(total)}개)</p>`;
+						} else if (deleted > 0) {
+							resultMessage = `<p style="color: #ff9800; margin-top: 10px; font-weight: bold;">⚠️ 재탐색 완료: ${format_number(deleted)}개의 URL이 삭제되었습니다. (총 ${format_number(total)}개)</p>`;
+						}
+					}
+				}
+				progress_header.innerHTML = `
+					<div class="progress-message">
+						<h3>URL 탐색 결과</h3> [${data.subject}] 탐색결과<br>다음과 같이 처리되었습니다. <br>
+						${data.details}<br>
+						<ul class="crawling-ul clearfix">
+							<li><h5>1. 탐색</h5><p><span class="blue-number">${format_number(data.total_count)}</span>개</p></li>
+						</ul>
+						${resultMessage}
+					</div>`;
+				if (cstatus != 'completed') {
+					button.innerHTML = "";
+					button.innerHTML = `<button class="pause-btn" onclick="close_box('reload');">닫기</button>`;
+				}
+			} else {
+				progress_header.innerHTML = `
+					<div class="progress-message">
+						<h3>${data.h3} 크롤링 결과</h3> [${data.subject}]크롤링 결과<br>다음과 같이 처리되었습니다. <br>
+						${data.details}<br>
+						<ul class="crawling-ul clearfix">
+							<li><h5>1. 탐색</h5><p><span class="blue-number">${format_number(data.total_count)}</span>개</p></li>
+							<li><h5>2. 선별</h5><p><span class="blue-number">${format_number(data.collection_count)}</span>개</p></li>
+							<li><h5>3. 저장</h5><p><span class="blue-number">${format_number(data.save_count)}</span>개</p></li>
+							<li><h5>4. 학습</h5><p><span class="blue-number">${format_number(data.study_count)}</span>개</p></li>
+						</ul>
+					</div>`;
+				if (cstatus != 'completed') {
+					button.innerHTML = "";
+					button.innerHTML = `<button class="pause-btn" onclick="close_box('reload');">닫기</button>`;
+				}
+			}
+			const terminalLogStatus = (data.status === 'cancelled' || data.status === 'stop')
+				? 'stop'
+				: (data.status === 'error' ? 'error' : 'completed');
+			update_status(terminalLogStatus, data);
+			cstatus = 'completed';
+			disconnect();
+		}
+	}
+
+	function running (data){
+		let display = 'none';
+		if (cstatus_obj.hasOwnProperty(data.job_id) && cstatus_obj[data.job_id] === 'stop') {
+			cstatus = 'stop';
+			display = 'block';
+		}
+		const jsonString = JSON.stringify(data).replace(/"/g, '&quot;');
+		if (window.start == 'explorat') {
+			progress_header.innerHTML = `
+				<div class="progress-message">
+					<h3>URL 탐색중</h3><strong style="font-size: 15px;color: #007bff;">[${data.subject}]</strong> 탐색 중입니다.<br>
+					${data.details}<br>
+					<div class="all-table-style">
+						<table>
+							<colgroup>
+								<col style="width: 70px;">
+								<col style="width: 100px;">
+								<col style="width: auto;">
+							</colgroup>
+							<tbody>
+								<tr>
+									<th>1. 탐색</th>
+									<td><strong><span class="blue-number">${format_number(data.total_count)}</span>개</strong></td>
+									<td class="td-lf">크롤링 대상(URL)을 탐색합니다.</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+				</div>
+				<p style="color: red;width: 100%;display:${display}">탐색 중단 중입니다…  <i class="shalou">⏳</i></p>`;
+		} else {
+			progress_header.innerHTML = `
+				<div class="progress-message">
+					<h3>${data.h3} 크롤링</h3><strong style="font-size: 15px;color: #007bff;">[${data.subject}]</strong> 크롤링 중입니다.<br>
+					${data.details}<br>
+					<div class="all-table-style">
+						<table>
+							<colgroup>
+								<col style="width: 70px;">
+								<col style="width: 100px;">
+								<col style="width: auto;">
+							</colgroup>
+							<tbody>
+								<tr>
+									<th>1. 탐색</th>
+									<td><strong><span class="blue-number">${format_number(data.total_count)}</span>개</strong></td>
+									<td class="td-lf">크롤링 대상(URL)을 탐색합니다.</td>
+								</tr>
+								<tr>
+									<th>2. 선별</th>
+									<td><strong><span class="blue-number">${format_number(data.collection_count)}</span>개</strong></td>
+									<td class="td-lf">크롤링할 주소(URL)를 선별합니다.</td>
+								</tr>
+								<tr>
+									<th>3. 저장</th>
+									<td><strong><span class="blue-number">${format_number(data.save_count)}</span>개</strong></td>
+									<td class="td-lf">선별한 데이터를 DB에 저장합니다.</td>
+								</tr>
+								<tr>
+									<th>4. 학습</th>
+									<td><strong><span class="blue-number">${format_number(data.study_count)}</span>개</strong></td>
+									<td class="td-lf">저장된 데이터를 벡터로 변환합니다.</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+				</div>
+				<p style="width: 100%;margin-bottom: 0px;">최대 ${page_count}개 수집합니다.</p>
+				<p style="color: red;width: 100%;display:${display}">크롤링이 중단되었습니다.<br>데이터를 저장 중입니다…  <i class="shalou">⏳</i></p>`;
+		}
+		if (cstatus != 'crawl_count' && cstatus != 'stop') {
+			button.innerHTML = "";
+			if (window.start == 'explorat') {
+				button.innerHTML = `<button class="pause-btn aNo1" onclick="close_box();">닫기</button>`;
+			} else {
+				button.innerHTML = `<button class="pause-btn aNo1" onclick="click_button('stop', ${jsonString});">중단하기</button><button class="pause-btn aNo1" onclick="close_box();">닫기</button>`;
+			}
+			cstatus = 'crawl_count';
+		} else if (cstatus == 'stop') {
+			window.status = 'cancelled';
+			button.innerHTML = "";
+			button.innerHTML = `<button class="pause-btn aNo1" style="background-color: #6c757d;">저장 중</button><button class="pause-btn aNo1" onclick="close_box();">닫기</button>`;
+			cstatus = 'stop';
+		}
+	}
+
+	async function update_status(str, data){
+		try {
+			var eobj = {
+				status: 'UPD',
+				cstatus: str,
+				job_id: data.job_id
+			}
+			const response = await fetch('./learn_craw_url_add.php', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify(eobj)
+			});
+			const result = await response.json();
+			if (result.status === "success") {
+				if (str == 'error' && data.status == '429') {
+					close_box();
+					alert("동시 진행 가능한 크롤링 개수를 초과하였습니다.");
+				}
+			}
+		} catch (error) {
+			console.warn('[crawling_log update error]', error);
+		}
+	}
+
+	// 진행률 모달 숨기기
+	function close_box(str=null) {
+		disconnect();
+		window.events = false;
+		if (pmodal.style.display == 'flex') {
+			pmodal.style.display = 'none';
+		}
+		if (str == 'erro') {
+			alert('크롤링이 원활하지 않습니다. 다시 시도해 주세요.');
+		} else if (str == 'pre_close') {
+			pmodal.style.display = 'flex';
+			progress_header.innerHTML = "";
+			progress_header.innerHTML = `<div class="progress-message">크롤링이 중단되었습니다.</div><div style="width: 100%;text-align: center;margin-top: 20px;"><button class="pause-btn" onclick="close_box();">닫기</button></div>`;
+		} else {
+			if (window.status === 'completed' || window.status === 'cancelled' || window.status === 'error') {
+				saveButtons_recover();
+			}
+		}
+	}
+	
+	async function click_button(str, data=null) {
+		// 중단 신호 전송
+		if (confirm('중단하시겠습니까?')) {
+			try {
+				if (str === 'stop' && data) {
+					cstatus_obj[data.job_id] = 'stop';
+					running (data);
+					const stopMessage = {
+						job_id: data.job_id,
+						status: 'use_crawl_stop'
+					};
+					let stopUrl = "";
+					if (data.colle == 'date') {
+						stopUrl = `<?=$url1?>/api/ai_news/crawl_stop/${data.job_id}`;
+					} else if (data.colle == 'board' || data.colle == 'web') {
+						stopUrl = `https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/c1/crawl_stop/${data.job_id}`;
+					} else if (data.colle == 'file') {
+						stopUrl = `https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/c1/crawl_stop/${data.job_id}`;
+					} else if (data.colle == 'video') {
+						stopUrl = buildUrl('/AI_video/channel-ingest/stop');
+						stopMessage.db_name = db_name;
+						stopMessage.chat_bot_id = chat_bot_id;
+					}
+					const response = await fetch(stopUrl, {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+						},
+						body: JSON.stringify(stopMessage)
+					});
+					const result = await response.json();
+					if (result.status === "stop") {
+					}
+					console.log('크롤링 중단 요청 전송');
+				} else {
+					const stopMessage = {
+						job_id: window.job_id,
+						status: 'use_crawl_stop'
+					};
+					close_box('pre_close');
+					if (window.colle) {
+						let stopUrl = "";
+						if (window.colle == 'date') {
+							stopUrl = `<?=$url1?>/api/ai_news/crawl_stop/${window.job_id}`;
+						} else if (window.colle == 'board' || window.colle == 'web') {
+							stopUrl = `https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/c1/crawl_stop/${window.job_id}`;
+						} else if (window.colle == 'file') {
+							stopUrl = `https://api-aipro.chatbaram.com/api-aipro/f1_dev/Ai_Pro_filecrawler/c1/crawl_stop/${window.job_id}`;
+						} else if (data.colle == 'video') {
+							stopUrl = buildUrl('/AI_video/channel-ingest/stop');
+							stopMessage.db_name = db_name;
+							stopMessage.chat_bot_id = chat_bot_id;
+						}
+						const response = await fetch(stopUrl, {
+							method: 'POST',
+							headers: {
+								'Content-Type': 'application/json',
+							},
+							body: JSON.stringify(stopMessage)
+						});
+						const result = await response.json();
+						if (result.status === "stop") {
+						}
+						console.log('크롤링 중단 요청 전송');
+					}
+				}
+			} catch (err) {
+				console.error('중단 요청 실패:', err);
+				saveButtons_recover();
+			}
+		}
+	}
+
+	// 통합 모달 열기 함수
+	async function select_list() {
+		const craw_select = document.querySelectorAll('.crawling-select-all');
+		const craw_sele = document.querySelectorAll('.crawling-select');
+		
+		const formData = new FormData();
+		formData.append('chat_bot_id', chat_bot_id);
+		formData.append('action', 'urls');
+		formData.append('content_type', 'url');
+		formData.append('status', 'Y');
+		formData.append('serch_pro', 'method');
+		formData.append('serch_tex', 'period');
+		try {
+			const response = await fetch('./learn_craw_list.php', {
+				method: 'POST',
+				body: formData
+			});
+			const urls = await response.json();
+			urlList = urls.data;
+			var length = urls.data.length;
+			select_length = length;
+			var url_count = urls.count;
+			craw_select.forEach(element => {
+				while (element.firstChild) {
+					element.removeChild(element.firstChild);
+				}
+			});
+			if (length <= 0) {
+				document.getElementById('select-display').innerHTML = '해당하는 내용이 없습니다.';
+				document.getElementById('select-display').title = '해당하는 내용이 없습니다.';
+				saveButtons.forEach(saveButton => {
+					saveButton.style.cssText = "background-color: #d3e3fd;color: #6c757d !important;";
+					saveButton.onclick = function(event) {
+						event.preventDefault();
+						event.stopPropagation();
+						return false;
+					};
+				});
+			} else {
+				document.getElementById('board').style.display = 'block';
+				const new_data = groupAndSort(urls.data);
+				if (length > 25) {
+					craw_sele[0].className += ' more x5';
+					craw_select[0].style.width = "579px";
+				} else {
+					craw_select[0].style.width = "579px";
+				}
+				new_data.forEach(url => {
+					const newDiv = document.createElement('div');
+					const newH4 = document.createElement('h4');
+					const newUl = document.createElement('ul');
+					const cate = (url.cate2 != '')?catejson[url.cate2]:'';
+					if (cate) {
+						newH4.textContent = cate;
+					} else {
+						newH4.textContent = '미분류';
+					}
+					newDiv.appendChild(newH4);
+					newDiv.appendChild(newUl);
+					url.items.forEach(item => {
+						const newLi = document.createElement('li');
+						const newA = document.createElement('a');
+						const newS = document.createElement('p');
+						const newurl = item.content.includes('http')?item.content:'https://'+item.content;
+						newA.href = item.content;
+						newA.dataset.id = item.id;
+						if (length > 25) {
+							newS.classList.add('custom-tooltip');
+							newS.innerText = newurl;
+							newA.innerText = item.subject;
+						} else {
+							if (length <= 1) {
+								const link = document.getElementById('select-display');
+								link.innerText = item.subject+" - "+newurl;
+								link.title = item.subject+" - "+newurl;
+							} else {
+								newA.innerText = item.subject+" - "+newurl;
+							}
+						}
+						if (learnListId == item.id) {
+							document.getElementById('select-display').innerHTML = item.subject+" - "+newurl;
+						}
+						newLi.appendChild(newA);
+						newLi.appendChild(newS);
+						newUl.appendChild(newLi);
+					});
+					newDiv.appendChild(newUl);
+					craw_select[0].appendChild(newDiv);
+				});
+			}
+		} catch (error) {
+			craw_select.forEach(element => {
+				while (element.firstChild) {
+					element.removeChild(element.firstChild);
+				}
+			});
+			const newDiv = document.createElement('div');
+			const newUl = document.createElement('ul');
+			const newLi = document.createElement('li');
+			newLi.textContent = '해당하는 내용이 없습니다.';
+			newUl.appendChild(newLi);
+			newDiv.appendChild(newUl);
+			craw_select[0].appendChild(newDiv);
+			console.log(error);
+		}
+	}
+
+	function groupAndSort(data) {
+		const groupMap = new Map();
+
+		data.forEach(item => {
+			const key = `${item.cate2}`;
+			if (!groupMap.has(key)) {
+				groupMap.set(key, []);
+			}
+			groupMap.get(key).push(item);
+		});
+
+		const result = Array.from(groupMap.entries()).map(([key, group]) => {
+			return {
+				cate2: key,
+				items: group
+			};
+		});
+
+		result.sort((a, b) => {
+			const indexA = orderMap.has(a.cate2) ? orderMap.get(a.cate2) : Infinity;
+			const indexB = orderMap.has(b.cate2) ? orderMap.get(b.cate2) : Infinity;
+			return indexA - indexB;
+		});
+
+		return result;
+	}
+
+	// ========== URL 필터 CRUD 함수들 ==========
+
+	// URL 필터 데이터 저장
+	let url_pattern = {
+		include: [],
+		exclude: [],
+		subject: {
+			include: [],
+			exclude: []
+		},
+		cate1: {
+			include: [],
+			exclude: []
+		},
+		cate2: {
+			include: [],
+			exclude: []
+		}
+	};
+
+	// ✅ 라디오 버튼 클릭 시 재클릭으로 선택 해제 가능하도록
+	let lastCheckedRadio = null;
+	function handleRadioClick(radio) {
+		if (lastCheckedRadio === radio) {
+			// 같은 라디오 버튼을 다시 클릭하면 선택 해제
+			radio.checked = false;
+			lastCheckedRadio = null;
+		} else {
+			// 다른 라디오 버튼 클릭 시 저장
+			lastCheckedRadio = radio;
+		}
+	}
+	
+	function check() { 
+		$("input[name='checkN']").removeAttr("checked");
+		$("input[name='checkN']").prop("checked",$("#include").is(':checked'));
+	}
+	
+	function precheck() { 
+		$("input[name='precheckN']").removeAttr("checked");
+		$("input[name='precheckN']").prop("checked",$("#exclude").is(':checked'));
+	}
+
+	/**
+	 * URL 필터 로드 (PHP에서 이미 로드됨)
+	 */
+	async function loadurl_pattern(str=null) {
+		// ✅ PHP에서 이미 url_pattern 객체에 로드했으므로, mode만 체크
+		let url_patternFromDB;
+		try {
+			const formData = new FormData();
+			formData.append('chat_bot_id', chat_bot_id);
+			formData.append('id', learnListId);
+			const response = await fetch('./learn_craw_list.php', {
+				method: 'POST',
+				body: formData
+			});
+			const urls = await response.json();
+			var length = urls.data.length;
+			if (str === 'board') {
+				url_patternFromDB = (length > 0 && urls.data[0].url_pattern)?JSON.parse(urls.data[0].url_pattern):'{}';
+			} else if (str === 'file') {
+				url_patternFromDB = (length > 0 && urls.data[0].file_pattern)?JSON.parse(urls.data[0].file_pattern):'{}';
+			}
+			const savedMode = url_patternFromDB.mode;
+
+			// ✅ 라디오 버튼 설정 - mode가 명시적으로 저장된 경우만 체크
+			if (savedMode === 'include') {
+				const addr1 = document.getElementById('addr1');
+				addr1.checked = true;
+				lastCheckedRadio = addr1;
+			} else if (savedMode === 'exclude') {
+				const addr2 = document.getElementById('addr2');
+				addr2.checked = true;
+				lastCheckedRadio = addr2;
+			}
+
+			if (url_patternFromDB && typeof url_patternFromDB === 'object') {
+				url_pattern.include = url_patternFromDB.include || [];
+				url_pattern.exclude = url_patternFromDB.exclude || [];
+				url_pattern.subject = url_patternFromDB.subject || { include: [], exclude: [] };
+				if (typeof url_patternFromDB.cate1 === 'object' && url_patternFromDB.cate1 !== null && !Array.isArray(url_patternFromDB.cate1)) {
+					url_pattern.cate1 = {
+						include: url_patternFromDB.cate1.include || [],
+						exclude: url_patternFromDB.cate1.exclude || []
+					};
+				} else {
+					url_pattern.cate1 = { include: [], exclude: [] };
+				}
+				if (typeof url_patternFromDB.cate2 === 'object' && url_patternFromDB.cate2 !== null && !Array.isArray(url_patternFromDB.cate2)) {
+					url_pattern.cate2 = {
+						include: url_patternFromDB.cate2.include || [],
+						exclude: url_patternFromDB.cate2.exclude || []
+					};
+				} else {
+					url_pattern.cate2 = { include: [], exclude: [] };
+				}
+			}
+		} catch (error) {
+			console.error('[URL 필터 mode 로드 실패]', error);
+		}
+
+		// 테이블에 표시
+		renderUrlFilterTable('include', url_pattern.include);
+		renderUrlFilterTable('exclude', url_pattern.exclude);
+	}
+
+	/**
+	 * URL 필터 테이블 렌더링
+	 */
+	function renderUrlFilterTable(type, patterns) {
+		const tableIndex = type === 'include' ? 0 : 1;
+		const tbody = document.querySelectorAll('#domainTable')[tableIndex];
+		const rad_val = document.querySelector('input[name="wpradio"]:checked').value;
+		const subjects = url_pattern.subject[type] || [];
+		const name = type === 'include' ? 'name="checkN"' : 'name="precheckN"';
+
+		if (!tbody) {
+			console.error('[테이블 렌더링] tbody 없음:', type);
+			return;
+		}
+
+		// 테이블 초기화
+		tbody.innerHTML = '';
+
+		if (!patterns || patterns.length === 0) {
+			if (type === 'include') {
+				tbody.innerHTML = '<tr id="no_0"><td colspan="4" style="text-align: center;">해당하는 내용이 없습니다.</td></tr>';
+			} else {
+				tbody.innerHTML = '<tr id="no_1"><td colspan="4" style="text-align: center;">해당하는 내용이 없습니다.</td></tr>';
+			}
+			return;
+		}
+		let cate_code = "";
+		if (rad_val === 'board') {
+			cate_code = 'AS1729062288';
+		} else if (rad_val === 'file') {
+			cate_code = 'AS1729062287';
+		}
+
+		// 패턴 표시
+		patterns.forEach((pattern, index) => {
+			const subject = subjects[index] || '';
+			const tr = document.createElement('tr');
+			tr.id = `${type}_${index}`;
+			tr.innerHTML = `
+				<td><input type="checkbox" ${name} value="${index}"></td>
+				<td>${index + 1}</td>
+				<td><input id="${type}_subject_${index}" value="${subject}" style="width: 90%;"></td>
+				<td><input id="${type}_url_${index}" value="${pattern}" style="width: 90%;"></td>
+			`;
+			tbody.appendChild(tr);
+		});
+	}
+
+	/**
+	 * URL 패턴 추가 (모달 오픈)
+	 */
+	function addUrlPattern(type) {
+		const tableIndex = type === 'include' ? 0 : 1;
+		const name = type === 'include' ? 'name="checkN"' : 'name="precheckN"';
+		const tbody = document.querySelectorAll('#domainTable')[tableIndex];
+		var row = document.getElementById('no_'+tableIndex);
+		if (row) {
+			row.remove();
+		}
+		if (type === 'include') {
+			url_pattern[type].unshift('');
+			url_pattern.cate1[type].unshift('');
+			url_pattern.cate2[type].unshift('');
+			url_pattern.subject[type].unshift('');
+		} else {
+			url_pattern[type].unshift('');
+			url_pattern.subject[type].unshift('');
+		}
+		renderUrlFilterTable(type, url_pattern[type]);
+	}
+
+	const table = document.querySelector('#domainTable');
+	table.addEventListener('change', function(e) {
+		if (e.target.classList.contains('category-select')) {
+			const selectedValue = e.target.value;
+			const targetId = e.target.getAttribute('data-id');
+		}
+	});
+	/**
+	 * 선택된 URL 패턴 삭제 (DB에도 즉시 저장)
+	 */
+	async function deleteSelectedPatterns(type) {
+		const name = type === 'include' ? 'checkN' : 'precheckN';
+		const tableIndex = type === 'include' ? 0 : 1;
+		const tbody = document.querySelectorAll('#domainTable')[tableIndex];
+		const checkedBoxes = document.querySelectorAll('input[name="'+name+'"]:checked');
+		const rad_val = document.querySelector('input[name="wpradio"]:checked').value;
+		if(checkedBoxes.length <= 0){
+			alert('삭제할 항목을 선택해주세요.');
+			return;
+		}
+		if(!confirm('정말 삭제하시겠습니까?')) return;
+		const indicesToDelete = Array.from(checkedBoxes).map(cb => parseInt(cb.value));
+		indicesToDelete.sort((a, b) => b - a);
+		indicesToDelete.forEach(index => {
+			url_pattern[type].splice(index, 1);
+			if (url_pattern.subject[type]) {
+				url_pattern.subject[type].splice(index, 1);
+			}
+			if (url_pattern.cate1[type]) {
+				url_pattern.cate1[type].splice(index, 1);
+			}
+			if (url_pattern.cate2[type]) {
+				url_pattern.cate2[type].splice(index, 1);
+			}
+		});
+		document.getElementById(type).checked = false;
+		const modeVal = document.querySelector('input[name="addraa"]:checked').value;
+		url_pattern.mode = modeVal;
+		const obj = {
+			status: 'Y',
+			id: [learnListId]
+		};
+		if (rad_val === 'board') {
+			obj.url_pattern = url_pattern;
+		} else if (rad_val === 'file') {
+			obj.file_pattern = url_pattern;
+		}
+		try {
+			const response = await fetch('./learn_craw_url_add.php', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify(obj)
+			});
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error('[save] response error', response.status, errorText);
+				alert('삭제 실패했습니다. (HTTP '+response.status+')' + (errorText? '\n'+errorText : ''));
+				return;
+			}
+			const responseText = await response.text();
+			const result = JSON.parse(responseText);
+			if (result.status === "success") {
+				alert('삭제하였습니다.');
+				await renderUrlFilterTable(type, url_pattern[type]);
+				return;
+			} 
+		} catch (error) {
+			console.error('[save] invalid json', error, responseText);
+			alert('삭제 실패했습니다.\n' + responseText);
+			return;
+		}
+	}
+
+	//전체분류명
+	async function save() {
+		const checkboxes = document.getElementsByName('checkN');
+		const pre_checkboxes = document.getElementsByName('precheckN');
+		const checkedBoxes = document.querySelector('input[name="addraa"]:checked').value;
+		const rad_val = document.querySelector('input[name="wpradio"]:checked').value;
+		for (var i = 0; i < checkboxes.length; i++) {
+			const subject = document.getElementById('include_subject_'+i);
+			const url = document.getElementById('include_url_'+i);
+			if (!subject.value) {
+				subject.focus();
+				alert('포함할 주소 게시판명을 입력해주세요.');
+				return;
+			}
+			if (!url.value) {
+				url.focus();
+				alert('포함할 주소 URL을 입력해주세요.');
+				return;
+			}
+			url_pattern.include[i] = url.value;
+			url_pattern.cate1.include[i] = '';
+			url_pattern.cate2.include[i] = '';
+			url_pattern.subject.include[i] = subject.value;
+		}
+		for (var i = 0; i < pre_checkboxes.length; i++) {
+			const subject = document.getElementById('exclude_subject_'+i);
+			const url = document.getElementById('exclude_url_'+i);
+			if (!subject.value) {
+				subject.focus();
+				alert('제외할 주소 게시판명을 입력해주세요.');
+				return;
+			}
+			if (!url.value) {
+				url.focus();
+				alert('제외할 주소 URL을 입력해주세요.');
+				return;
+			}
+			url_pattern.exclude[i] = url.value;
+			url_pattern.subject.exclude[i] = subject.value;
+		}
+		url_pattern.mode = checkedBoxes;
+		const obj = {
+			status: 'Y',
+			id: [learnListId]
+		};
+		if (rad_val === 'board') {
+			obj.url_pattern = url_pattern;
+		} else if (rad_val === 'file') {
+			obj.file_pattern = url_pattern;
+		}
+		const response = await fetch('./learn_craw_url_add.php', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(obj)
+		});
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('[save] response error', response.status, errorText);
+			alert('저장에 실패했습니다. (HTTP '+response.status+')' + (errorText? '\n'+errorText : ''));
+			return;
+		}
+		const responseText = await response.text();
+		let result = null;
+		try {
+			result = JSON.parse(responseText);
+		} catch (error) {
+			console.error('[save] invalid json', error, responseText);
+			alert('저장에 실패했습니다.\n' + responseText);
+			return;
+		}
+		if (result.status === "success") {
+			alert('크롤링대상을 수정하였습니다.');
+			await renderUrlFilterTable('include', url_pattern.include);
+			await renderUrlFilterTable('exclude', url_pattern.exclude);
+			return;
+		}
+		console.error('[save] failed', result);
+		alert(result && result.message ? result.message : '저장에 실패했습니다.');
+	}
+</script>
+<?
+include_once $_SERVER['DOCUMENT_ROOT']."/end.htm";
+?>

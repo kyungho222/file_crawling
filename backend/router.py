@@ -42,6 +42,7 @@ from backend.shared.sse_publish_queue import (
 )
 from core.crawler.queues import dispose_job_queues
 from core.crawler.global_pool import get_global_worker_pool
+from core.crawler.workers.download import cancel_download_worker_activity
 
 try:
     import requests  # type: ignore[import-not-found]
@@ -1059,7 +1060,29 @@ async def stop_crawl(job_id: str):
                 stop_event.set()
         except Exception:
             pass
-    
+
+    # The stop flag prevents new work, but it does not interrupt an HTTP request
+    # already owned by a download worker. Cancel active items and drain this job's
+    # queue here so the button takes effect even before workflow cleanup runs.
+    stop_cleanup = {"cancelled_downloads": 0, "drained_queues": {}}
+    stop_queue_key = getattr(workflow, "_job_queue_key", None) if workflow is not None else None
+    stop_queue_key = str(stop_queue_key or job_id).strip() or job_id
+    try:
+        stop_cleanup["cancelled_downloads"] = await cancel_download_worker_activity(stop_queue_key)
+        stop_cleanup["drained_queues"] = await dispose_job_queues(stop_queue_key)
+        logger.warning(
+            "[Stop][immediate_cancel] job_id=%s queue_key=%s cancelled_downloads=%s drained_queues=%s",
+            job_id,
+            stop_queue_key,
+            stop_cleanup["cancelled_downloads"],
+            stop_cleanup["drained_queues"],
+        )
+    except Exception:
+        logger.exception(
+            "[Stop][immediate_cancel_failed] job_id=%s queue_key=%s",
+            job_id,
+            stop_queue_key,
+        )
     # 전역 워커풀 모드라면, 해당 job_id에 대해 scan 소비/재투입을 즉시 막는다.
     # ✅ 중요: env로 전역 워커풀이 켜진 경우 workflow.use_global_pool 플래그가 누락될 수 있으므로,
     # 플래그에 의존하지 말고 best-effort로 항상 disable_scan을 시도한다.
@@ -1121,6 +1144,7 @@ async def stop_crawl(job_id: str):
                 "status": terminal_status,
                 "message": "Stop requested (workflow not found locally; redis stop flag recorded).",
                 "redis_stop_recorded": redis_stop_recorded,
+                "stop_cleanup": stop_cleanup,
             },
             status_code=200,
         )
@@ -1272,6 +1296,7 @@ async def stop_crawl(job_id: str):
             "message": "Stop requested (finishing save/study in background)",
             "db_update": db_update_success,
             "redis_stop_recorded": redis_stop_recorded,
+            "stop_cleanup": stop_cleanup,
         }
     )
 

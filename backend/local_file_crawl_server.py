@@ -34,7 +34,6 @@ DEFAULT_BRIDGE_DB = "f1_dev"
 LOCAL_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
-
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 

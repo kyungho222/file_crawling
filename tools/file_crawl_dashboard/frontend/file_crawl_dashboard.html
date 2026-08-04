@@ -104,7 +104,7 @@
             <div class="fields">
               <div><label for="db">DB</label><input id="db" value="newvit" placeholder="jongno"></div>
               <div><label for="bot">챗봇 ID</label><input id="bot" value="ad1d9dbf-5165-4ad7-af7d-bf1850e784ee" placeholder="chat_bot_id"></div>
-              <div class="wide"><label for="contentsUrl">탐색목록 기준 URL</label><textarea id="contentsUrl" placeholder="게시판 목록 URL 또는 LEARN_LIST content URL"></textarea></div>
+              <div class="wide"><label for="contentsUrl">탐색목록 기준 URL</label><textarea id="contentsUrl" placeholder="게시판 목록 URL 또는 LEARN_LIST content URL">https://www.suwon.go.kr/index.do</textarea></div>
             </div>
           </div>
           <div class="field-group optional">
@@ -127,10 +127,10 @@
             <label class="mode"><input type="radio" name="speed" value="aggressive" checked>공격형</label>
             <label class="mode"><input type="radio" name="speed" value="stable">안정형</label>
           </div>
-          <label class="toggle"><input id="dry" type="checkbox" checked>Dry-run (저장 및 학습 미반영)</label>
+          <label class="toggle"><input id="dry" type="checkbox">Dry-run (저장 및 학습 미반영)</label>
         </section>
         <section class="panel">
-          <div class="actions"><button id="preview" type="button">샘플링 실행 (최대 3건)</button><button id="run" type="button">선택 단계 실행</button><button id="stop" type="button" class="danger" disabled>작업 중단</button><button id="clear" type="button" class="secondary">로그 지우기</button></div>
+          <div class="actions"><button id="preview" type="button">샘플링 실행 (최대 3건)</button><button id="run" type="button">선택 단계 실행</button><button id="run30" type="button">30개 실행</button><button id="stop" type="button" class="danger" disabled>작업 중단</button><button id="clear" type="button" class="secondary">로그 지우기</button></div>
           <h2 class="section-title">요청 Payload</h2>
           <pre id="payload" class="payload section-content">{}</pre>
         </section>
@@ -173,7 +173,9 @@
   <script>
     const API_BASE = "/Ai_Pro_filecrawler";
     const STAGES = ["discover", "select", "save", "learn"];
-    const state = { rows: [], attachments: [], attachmentPostUrls: [] };
+    const RUN_30_LIMIT = 30;
+    const JOB_PROGRESS_POLL_MS = 500;
+    const state = { rows: [], attachments: [], attachmentPostUrls: [], attachmentLimit: null };
     let activeRequestController = null;
     let activeRemoteJobId = "";
 
@@ -219,11 +221,10 @@
       };
     }
 
-    function buildPreviewPayload() {
+    function buildPreviewPayload(limit = null) {
       const payload = readOptions();
       const hasContentsUrl = Boolean(payload.contents_url);
-
-      return {
+      const request = {
         ...payload,
         exploration_type: "post",
         active_only: true,
@@ -232,8 +233,9 @@
         scope_by_contents_learn_list_id: hasContentsUrl,
         contents: hasContentsUrl ? [payload.contents_url] : [],
       };
+      if (Number.isFinite(limit) && limit > 0) request.limit = limit;
+      return request;
     }
-
     function renderPayload(payload = readOptions()) {
       byId("payload").textContent = JSON.stringify(payload, null, 2);
     }
@@ -315,6 +317,22 @@
       return Array.from(grouped.values()).filter((item) => item.attachments.length > 0);
     }
 
+    function buildDetailStartUrls(targetUrls) {
+      return targetUrls.map((postUrl) => {
+        const row = rowByPostUrl(postUrl);
+        const title = firstValue(row, ["title", "subject", "web_title", "menu_title"]);
+        const startItem = { url: postUrl, type: "post", source: "contents_detail_direct" };
+        attachIfValue(startItem, "title", title);
+        attachIfValue(startItem, "subject", title);
+        attachIfValue(startItem, "reg_date", firstValue(row, ["reg_date", "reg_date_str", "published_at", "post_date", "created_at"]));
+        attachIfValue(startItem, "learn_list_id", firstValue(row, ["learn_list_id"]));
+        attachIfValue(startItem, "cate1", firstValue(row, ["cate1", "category1", "board_cate1", "store_cate1", "assigned_cate1"]));
+        attachIfValue(startItem, "cate2", firstValue(row, ["cate2", "category2", "board_cate2", "store_cate2", "assigned_cate2"]));
+        attachIfValue(startItem, "board_cate1_name", firstValue(row, ["board_cate1_name", "cate1_name", "category1_name"]));
+        attachIfValue(startItem, "board_cate2_name", firstValue(row, ["board_cate2_name", "cate2_name", "category2_name"]));
+        return startItem;
+      }).filter((item) => item.url);
+    }
     function markStage(stage) {
       STAGES.forEach((name) => {
         const element = byId(`s-${name}`);
@@ -455,17 +473,14 @@
     }
 
     async function previewTargets(limitOverride = null) {
-      const payload = buildPreviewPayload();
-      if (Number.isFinite(limitOverride) && limitOverride > 0) {
-        payload.limit = limitOverride;
-      }
+      const payload = buildPreviewPayload(limitOverride);
       validateConnection(payload);
       renderPayload(payload);
       appendLog("[선택옵션] 전체 대상 조회", payload, "option");
 
       const data = await post("/backend/file-dashboard/exploration-posts", payload, activeRequestController?.signal);
       state.rows = Array.isArray(data.rows) ? data.rows : [];
-      byId("scan").textContent = data.total ?? state.rows.length;
+      byId("scan").textContent = String(state.rows.length);
       renderRows();
       appendLog(
         "대상 조회 완료",
@@ -490,7 +505,7 @@
         .filter(Boolean);
     }
 
-    async function extractAttachmentUrls(payload, targetUrls) {
+    async function extractAttachmentUrls(payload, targetUrls, attachmentLimit = null) {
       if (!targetUrls.length) {
         throw new Error("첨부 URL을 추출할 상세페이지 대상이 없습니다.");
       }
@@ -500,6 +515,9 @@
       const failures = [];
       state.attachments = [];
       state.attachmentPostUrls = [];
+      state.attachmentLimit = Number.isFinite(attachmentLimit) && attachmentLimit > 0
+        ? Math.floor(attachmentLimit)
+        : null;
       renderAttachments();
       byId("select").textContent = "0";
 
@@ -524,13 +542,19 @@
           const row = rowByPostUrl(postUrl);
           const postTitle = result.title || firstValue(row, ["title", "subject", "web_title", "menu_title"]);
           succeeded += 1;
-          attachmentCount += attachments.length;
-          state.attachments.push(...attachments.map((item) => ({
+          const remaining = state.attachmentLimit === null
+            ? Infinity
+            : Math.max(0, state.attachmentLimit - state.attachments.length);
+          const selectedAttachments = Number.isFinite(remaining)
+            ? attachments.slice(0, remaining)
+            : attachments;
+          state.attachments.push(...selectedAttachments.map((item) => ({
             post_url: postUrl,
             name: item.name || item.title || "",
             url: item.href || item.url || "",
             post_title: postTitle,
           })));
+          attachmentCount = state.attachments.length;
           renderAttachments();
           byId("select").textContent = String(attachmentCount);
           appendLog(
@@ -546,6 +570,9 @@
             },
             "option",
           );
+          if (state.attachmentLimit !== null && attachmentCount >= state.attachmentLimit) {
+            break;
+          }
         } catch (error) {
           failures.push({ post_url: postUrl, error: error.message });
         }
@@ -619,61 +646,50 @@
       updatePlannedMetrics(payload);
 
       if (payload.stage === "select") {
-        await extractAttachmentUrls(payload, targetUrls);
+        await extractAttachmentUrls(payload, targetUrls, targetLimit);
         return;
       }
 
-      if (!attachmentExtractionCoversTargets(targetUrls)) {
-        appendLog("첨부 URL 미추출 대상 재추출", {
-          대상상세페이지수: targetUrls.length,
-          기존추출대상수: state.attachmentPostUrls.length,
-        }, "option");
-        await extractAttachmentUrls(payload, targetUrls);
+      const startUrls = buildDetailStartUrls(targetUrls);
+      if (!startUrls.length) {
+        throw new Error("백엔드에 전달할 상세페이지 URL이 없습니다.");
       }
-
-      const directStartUrls = buildDirectAttachmentStartUrls(targetUrls);
-      if (!directStartUrls.length) {
-        throw new Error("선별된 첨부 URL이 없어 저장 또는 학습을 시작할 수 없습니다.");
-      }
-
-      const directAttachmentCount = directStartUrls.reduce(
-        (total, item) => total + (Array.isArray(item.attachments) ? item.attachments.length : 0),
-        0,
-      );
 
       Object.assign(payload, {
         colle: "file",
         content_type: "file",
         file_dashboard: true,
-        contents_url: directStartUrls[0].url,
-        contents: directStartUrls.map((item) => item.url),
-        start_urls: directStartUrls,
-        start_urls_override: directStartUrls,
+        contents_url: startUrls[0].url,
+        contents: startUrls.map((item) => item.url),
+        start_urls: startUrls,
+        start_urls_override: startUrls,
         start_urls_override_source: "contents_detail_direct",
-        pre_explored_start_urls_count: directStartUrls.length,
-        selected_start_urls_count: directStartUrls.length,
-        actual_start_urls_count: directStartUrls.length,
-        file_dashboard_attachment_count: directAttachmentCount,
+        pre_explored_start_urls_count: startUrls.length,
+        selected_start_urls_count: startUrls.length,
+        actual_start_urls_count: startUrls.length,
+        file_dashboard_attachment_count: 0,
         file_pipeline_skip_learning: payload.stage === "save",
       });
       renderPayload(payload);
       appendLog("저장 또는 학습 워크플로우 시작", {
         단계: payload.stage,
         대상상세페이지수: targetUrls.length,
-        직접전달상세페이지수: directStartUrls.length,
-        직접전달첨부수: directAttachmentCount,
-        전달방식: "상세페이지 URL별 attachments 직접 전달",
+        백엔드상세페이지수: startUrls.length,
+        전달방식: "상세페이지 URL을 즉시 전달하고 백엔드에서 첨부 발견·큐등록",
         저장수행: payload.enable_db_save,
         학습수행: payload.enable_learning,
       }, "option");
 
       const data = await post("/backend/session/start", payload);
       activeRemoteJobId = payload.job_id;
+      byId("select").textContent = "0";
+      byId("save").textContent = "0";
+      byId("learn").textContent = "0";
       updateStopButton();
       appendLog("작업 시작 응답", data, "option");
     }
     async function withBusyState(task) {
-      const buttons = [byId("preview"), byId("run")];
+      const buttons = [byId("preview"), byId("run"), byId("run30")];
       activeRequestController = new AbortController();
       buttons.forEach((button) => { button.disabled = true; });
       updateStopButton();
@@ -719,6 +735,9 @@
     );
     byId("run").addEventListener("click", () =>
       withBusyState(runSelectedStage),
+    );
+    byId("run30").addEventListener("click", () =>
+      withBusyState(() => runSelectedStage({ targetLimit: RUN_30_LIMIT, forceAll: true })),
     );
     byId("stop").addEventListener("click", stopCurrentWork);
     byId("clear").addEventListener("click", () => {

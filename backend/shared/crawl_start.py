@@ -2236,6 +2236,7 @@ async def _run_accelerated_parse_selected(
                         display_name=str(result.get("title") or source_url),
                         post_reg_date=result.get("reg_date"),
                         preserve_created_at=False,
+                        mark_status_y_on_submit=False,
                     )
                     batch_submitted = str((submit_result or {}).get("status") or "") == "submitted"
                     embedding_batch_submitted_count += 1
@@ -5810,6 +5811,60 @@ async def _crawl_file_worker(data: Dict[str, Any], background_tasks: BackgroundT
             job_id,
             int((time.perf_counter() - worker_t0) * 1000),
         )
+        # Publish the DB exploration total before materializing every URL row.
+        # The later prepare step still owns the final, normalized start-url list.
+        if _worker_colle == "file":
+            early_count_t0 = time.perf_counter()
+            try:
+                early_contents_url = _resolve_primary_contents_url(data) or data.get("contents")
+                early_target_domains = data.get("target_domains")
+                if isinstance(early_target_domains, str):
+                    early_target_domains = [
+                        item.strip() for item in early_target_domains.split(",") if item.strip()
+                    ]
+                elif not isinstance(early_target_domains, list):
+                    early_target_domains = None
+
+                early_total = await count_exploration_post_urls(
+                    db_name=db_name,
+                    chat_bot_id=data.get("chat_bot_id"),
+                    target_domains=early_target_domains,
+                    contents_url=early_contents_url,
+                    scope_path_prefix=_resolve_requested_scope_path_prefix(data),
+                )
+                early_total = max(0, int(early_total or 0))
+                if early_total > 0:
+                    data["pre_explored_start_urls_count"] = early_total
+                    data["exploration_post_total_count"] = early_total
+                    data["exploration_display_count_fixed"] = True
+                    data["exploration_display_max_count"] = early_total
+                    await send_message_to_redis_sse(
+                        job_id=job_id,
+                        dbname=db_name,
+                        message={
+                            "status": "running",
+                            "event": "exploring",
+                            "scan_count": early_total,
+                            "total_count": early_total,
+                            "actual_scan_count": early_total,
+                            "h3": "crawl status",
+                            "source": "file_exploration_count",
+                        },
+                    )
+                logger.info(
+                    "[FileCrawlTrace][early_exploration_count] job_id=%s db=%s count=%s elapsed_ms=%s",
+                    job_id,
+                    db_name,
+                    early_total,
+                    int((time.perf_counter() - early_count_t0) * 1000),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[FileCrawlTrace][early_exploration_count_failed] job_id=%s db=%s err=%s",
+                    job_id,
+                    db_name,
+                    exc,
+                )
 
         # 1. URL/요청 정보 준비
         prepare_t0 = time.perf_counter()

@@ -338,33 +338,6 @@ def _light_attachment_scan_bytes() -> int:
         return 120000
 
 
-async def _fetch_direct_full_html(url: str, timeout_sec: float) -> str:
-    try:
-        import aiohttp  # type: ignore[import-not-found]
-    except Exception:
-        return ""
-    timeout = aiohttp.ClientTimeout(total=max(float(timeout_sec or 20), 1.0))
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": url,
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                if response.status != 200:
-                    return ""
-                content_type = str(response.headers.get("Content-Type", "") or "").lower()
-                disposition = str(response.headers.get("Content-Disposition", "") or "").lower()
-                if "attachment" in disposition or any(x in content_type for x in ("application/pdf", "application/zip", "application/octet-stream")):
-                    return ""
-                raw = await response.read()
-                return decode_html_response_bytes(raw, response.headers.get("Content-Type", ""))
-    except Exception:
-        return ""
-
 
 def _first_text(*values: Any) -> str:
     for value in values:
