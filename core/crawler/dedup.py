@@ -95,6 +95,24 @@ async def try_acquire_cross_job_claim(stage: str, db_name: str, url: str, job_id
         return True
 
 
+async def get_cross_job_claim_info(stage: str, db_name: str, url: str) -> tuple[str, int]:
+    """Return the current claim owner and remaining TTL for failure-only tracing."""
+    if not _cross_job_claim_enabled(stage) or not db_name or not url:
+        return "", 0
+    try:
+        from db.db_redis import get_redis
+
+        redis = await get_redis()
+        key = _cross_job_claim_key(stage, db_name, url)
+        owner = await redis.get(key)
+        ttl = await redis.ttl(key)
+        if isinstance(owner, bytes):
+            owner = owner.decode("utf-8", errors="replace")
+        return str(owner or "").strip(), max(0, int(ttl or 0))
+    except Exception:
+        return "", 0
+
+
 async def release_cross_job_claim(
     stage: str,
     db_name: str,

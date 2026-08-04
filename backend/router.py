@@ -2165,6 +2165,33 @@ async def debug_sse_publish_queue():
     return await debug_shared_sse_publish_queue()
 
 
+@router.post("/debug/breadcrumb_option_bridge")
+async def debug_breadcrumb_option_bridge(payload: Dict[str, Any]):
+    """Return breadcrumb selector context for the learning-service bridge."""
+    db_name = str((payload or {}).get("db_name") or "").strip()
+    if not db_name:
+        return JSONResponse(status_code=422, content={"detail": "db_name is required"})
+
+    raw_learn_list_id = (payload or {}).get("learn_list_id")
+    try:
+        learn_list_id = int(raw_learn_list_id) if raw_learn_list_id not in (None, "") else None
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=422, content={"detail": "learn_list_id must be an integer"})
+
+    try:
+        limit = max(1, min(int((payload or {}).get("limit") or 10), 50))
+    except (TypeError, ValueError):
+        limit = 10
+
+    from backend.shared.breadcrumb_option_bridge import fetch_breadcrumb_option_bridge_payload
+
+    return await fetch_breadcrumb_option_bridge_payload(
+        db_name=db_name,
+        learn_list_id=learn_list_id,
+        contents_url=str((payload or {}).get("contents_url") or "").strip(),
+        limit=limit,
+    )
+
 async def run_workflow_task(
     workflow: IntegratedWorkflow,
     start_urls: List[str],  # 탐색 시작 URL 목록 (query_links 또는 contents[0])

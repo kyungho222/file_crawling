@@ -836,15 +836,11 @@ class GlobalWorkerPool:
                 max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
             max_concurrent = max(1, max_concurrent)
 
-            normal_download_workers = 2
-            large_download_workers = 2
-            for i in range(normal_download_workers + large_download_workers):
-                worker_lane = "normal" if i < normal_download_workers else "large"
-                worker_queue = (
-                    self.collection_batch_queue
-                    if worker_lane == "normal"
-                    else self.large_collection_batch_queue
-                )
+            normal_download_workers = int(os.getenv("FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", "2") or "2")
+            normal_download_workers = max(1, normal_download_workers)
+            for i in range(normal_download_workers):
+                worker_lane = "normal"
+                worker_queue = self.collection_batch_queue
                 t = asyncio.create_task(
                     download_worker(
                         worker_queue,
@@ -856,7 +852,7 @@ class GlobalWorkerPool:
                         browser_releaser=self.release_browser,
                         worker_id=i + 1,
                         worker_lane=worker_lane,
-                        large_download_queue=self.large_collection_batch_queue,
+                        large_download_queue=None,
                         browser_relauncher=self._relaunch_browser,
                     ),
                     name=f"global-download-{worker_lane}-worker-{i+1}",

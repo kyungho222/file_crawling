@@ -1,4 +1,4 @@
-﻿"""
+"""
 ?숈뒿 ?쒕퉬??紐⑤뱢
 - ?뚯씪 ????꾨즺 ??媛쒕퀎 ?숈뒿 泥섎━
 - LEARN_LIST.status = 'Y' ?낅뜲?댄듃
@@ -1499,7 +1499,7 @@ class LearningService:
                     ),
                 )
                 if ok:
-                    logger.info(f"[Learning] 理쒖쥌 ?낅뜲?댄듃 ?꾨즺 via update_learn_list_status_board: ID={db_id}, status=Y, chunk={final_chunks}")
+                    logger.info(f"[Learning] 최종 상태 업데이트 완료 via update_learn_list_status_board: ID={db_id}, status=Y, chunk={final_chunks}")
                 else:
                     logger.warning(f"[Learning] 理쒖쥌 ?곹깭 ?낅뜲?댄듃 ?ㅽ뙣 (update_learn_list_status_board returned False): ID={db_id}")
                     return False
@@ -1510,7 +1510,7 @@ class LearningService:
             web_title = ""
 
             display_subject = subject or filename
-            success_msg = f"???숈뒿 ?꾨즺 | ID={db_id} | {display_subject} | status=Y | chunk={final_chunks}"
+            success_msg = f"파일 학습 완료 | ID={db_id} | {display_subject} | status=Y | chunk={final_chunks}"
             logger.info(f"[Learning] {success_msg}")
             self._write_log(success_msg)
             

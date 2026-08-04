@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import random
@@ -2703,6 +2704,18 @@ def _extract_web_title_from_html(html: str, url: str = "") -> str:
         if BeautifulSoup:
             try:
                 soup = BeautifulSoup(html, "html.parser")  # type: ignore[operator]
+                try:
+                    if url and "k-cohesion.go.kr" in (url or "").lower() and "/pcnc/contents/" in (url or "").lower():
+                        detail_title = soup.select_one(".board_detail_wrap .detail_tit")
+                        if detail_title:
+                            detail_title = copy.copy(detail_title)
+                            for category in detail_title.select(".category"):
+                                category.decompose()
+                            kcohesion_title = _clean_title(detail_title.get_text(" ", strip=True))
+                            if kcohesion_title and not _is_noise_web_title(kcohesion_title):
+                                return kcohesion_title
+                except Exception:
+                    pass
                 try:
                     scored_title = extract_title_with_scores(soup, url=url or "")
                     parser_title = _clean_title(scored_title.get("title") or "")
@@ -26460,39 +26473,39 @@ class BoardContentWorkflow:
                     )
                     for summary_index, (summary_label, summary_value) in enumerate(trust_summary_log_items):
                         if summary_index == 0:
-                            logger.warning(
+                            logger.info(
                                 "[FileCrawlTrustSummary] 신뢰도 요약: job_id=%s %s=%s",
                                 self.job_id,
                                 summary_label,
                                 summary_value,
                             )
                         else:
-                            logger.warning(
+                            logger.info(
                                 "[FileCrawlTrustSummary] %s=%s",
                                 summary_label,
                                 summary_value,
                             )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 파일크롤링 상세 no_html 원인분포 | job_id=%s no_html=%s reasons=%s samples=%s",
                         self.job_id,
                         no_html,
                         no_html_reasons,
                         no_html_samples,
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 큐등록 후보제외 원인분포 | job_id=%s skipped=%s reasons=%s",
                         self.job_id,
                         enqueue_candidate_skipped,
                         enqueue_candidate_skip_reason_text,
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 큐등록 실제누락 원인분포 | job_id=%s missing=%s reasons=%s samples=%s",
                         self.job_id,
                         enqueue_missing,
                         enqueue_missing_reason_text,
                         enqueue_missing_samples,
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 큐투입 처리정산 | job_id=%s enqueued=%s saved=%s save_done=%s skipped=%s unaccounted=%s",
                         self.job_id,
                         enqueue_enqueued,
@@ -26501,21 +26514,21 @@ class BoardContentWorkflow:
                         download_skipped,
                         download_unaccounted,
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 다운로드 스킵 원인분포 | job_id=%s skipped=%s reasons=%s samples=%s",
                         self.job_id,
                         download_skipped,
                         download_skip_reason_text,
                         list(self.stats.get("file_download_skipped_samples") or [])[:10],
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 파일학습 스킵 원인분포 | job_id=%s skipped=%s reasons=%s samples=%s",
                         self.job_id,
                         study_skipped,
                         study_skip_reason_text,
                         study_skip_samples,
                     )
-                    logger.warning(
+                    logger.info(
                         "[FileCrawlTrustSummary] 파일학습 실패 원인분포 | job_id=%s failed=%s reasons=%s samples=%s",
                         self.job_id,
                         study_failed,

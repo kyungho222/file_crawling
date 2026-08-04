@@ -2758,7 +2758,12 @@ def _try_extract_k_cohesion_post(soup, url: str) -> Optional[BoardPostExtract]:
         return None
 
     title_el = view.select_one(".detail_tit")
-    title = _collapse_ws(title_el.get_text(" ", strip=True)) if title_el else ""
+    title = ""
+    if title_el:
+        title_node = copy.copy(title_el)
+        for category in title_node.select(".category"):
+            category.decompose()
+        title = _collapse_ws(title_node.get_text(" ", strip=True))
     if not title:
         title = (_extract_title(soup, view) or "").strip()
     if not title:

@@ -42,6 +42,7 @@ from utils.file import (
 )
 from utils.rrn_pattern_guard import learning_blocked_by_rrn_pattern, mask_rrn_like_patterns
 from utils.url import canonicalize_url_for_dedup, extract_download_url_from_js
+from core.crawler.dedup import get_cross_job_claim_info, try_acquire_cross_job_claim
 from backend.board.anseong_file import (
     extract_anseong_attachment_key_candidates,
     resolve_anseong_yhlib_download_url,
@@ -739,10 +740,10 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         study_workers = 1
     study_workers = max(1, min(study_workers, 4))
     try:
-        download_workers = int(os.getenv("FILE_CRAWL_DOWNLOAD_WORKERS", "4") or "4")
+        download_workers = int(os.getenv("FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", "2") or "2")
     except Exception:
-        download_workers = 1
-    download_workers = max(1, min(download_workers, 4))
+        download_workers = 2
+    download_workers = max(1, min(download_workers, 16))
     return {
         "scan_workers": 1,
         "collection_workers": collection_workers,
@@ -1696,8 +1697,8 @@ class BoardContentFilePipelineMixin:
             file_url: str,
             file_name: str,
         ) -> None:
-            lane = str(item.get("download_lane") or "normal")
-            target_queue = large_collection_batch_queue if lane == "large" else collection_batch_queue
+            lane = "normal"
+            target_queue = collection_batch_queue
             before = _collection_queue_trace_snapshot(target_queue)
             started_at = time.monotonic()
             if before["full"]:
@@ -2293,8 +2294,63 @@ class BoardContentFilePipelineMixin:
                 (post_url or "")[:220],
             )
 
-        dup_flags = [False for _ in candidates]
-        duplicate_count = 0
+        try:
+            conc = int(os.getenv("FILE_CRAWL_DUP_CHECK_CONCURRENCY", "4") or "4")
+        except Exception:
+            conc = 4
+        conc = max(1, min(conc, 8))
+        dup_bundle = await self._ensure_file_dup_sql_bundle()
+        dup_check_semaphore = asyncio.Semaphore(conc)
+
+        async def _check_candidate_duplicate(candidate: Tuple[Dict[str, Any], str, str, str, List[str]]) -> bool:
+            _, candidate_url, _, _, _ = candidate
+            async with dup_check_semaphore:
+                return await self._apply_file_dup_query(
+                    candidate_url,
+                    post_url,
+                    effective_job_id,
+                    dup_bundle,
+                    new_cate1=nc1,
+                    new_cate2=nc2,
+                )
+
+        dup_results = await asyncio.gather(
+            *(_check_candidate_duplicate(candidate) for candidate in candidates),
+            return_exceptions=True,
+        )
+        dup_flags = []
+        for result in dup_results:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "[Duplicate][file] pre-queue exact URL check failed open | job_id=%s post=%s err=%s",
+                    effective_job_id,
+                    (post_url or "")[:220],
+                    result,
+                )
+                dup_flags.append(False)
+            else:
+                dup_flags.append(bool(result))
+        # Keep every post-candidate duplicate path in this summary count so a
+        # deliberately skipped item cannot later be reported as queue missing.
+        duplicate_count = sum(1 for flag in dup_flags if flag)
+        runtime_duplicate_reason_counts: Dict[str, int] = {}
+
+        def _record_runtime_duplicate_skip(reason: str, file_url: str, file_name: str) -> None:
+            nonlocal duplicate_count
+            normalized_reason = str(reason or "runtime_duplicate")
+            duplicate_count += 1
+            runtime_duplicate_reason_counts[normalized_reason] = int(
+                runtime_duplicate_reason_counts.get(normalized_reason, 0) or 0
+            ) + 1
+            logger.info(
+                "[FileCrawlTrace][enqueue_duplicate_skip] job_id=%s post_url=%s file_url=%s reason=%s file=%s",
+                effective_job_id,
+                (post_url or "")[:300],
+                (file_url or "")[:300],
+                normalized_reason,
+                (file_name or "")[:160],
+            )
+
         try:
             selected_after_db_duplicate = sum(1 for flag in dup_flags if not flag)
             async with self._stats_lock:
@@ -2394,6 +2450,64 @@ class BoardContentFilePipelineMixin:
                     )
                 continue
 
+            claim_url = file_url_key or file_url
+            claim_acquired = await try_acquire_cross_job_claim(
+                "file_download",
+                str(getattr(self, "db_name", "") or ""),
+                claim_url,
+                effective_job_id,
+            )
+            if not claim_acquired:
+                claim_owner, claim_ttl_sec = await get_cross_job_claim_info(
+                    "file_download",
+                    str(getattr(self, "db_name", "") or ""),
+                    claim_url,
+                )
+                claim_reason = (
+                    "duplicate_same_job_claim"
+                    if claim_owner and claim_owner == str(effective_job_id or "")
+                    else "duplicate_other_job_claim"
+                )
+                _record_runtime_duplicate_skip(
+                    claim_reason,
+                    file_url,
+                    file_name,
+                )
+                _count_candidate_skip(claim_reason)
+                logger.info(
+                    "[FileCrawlTrace][enqueue_claim_conflict] job_id=%s claim_owner=%s claim_ttl_sec=%s post_url=%s file_url=%s file=%s",
+                    effective_job_id,
+                    claim_owner or "unknown",
+                    claim_ttl_sec,
+                    (post_url or "")[:300],
+                    (file_url or "")[:300],
+                    (file_name or "")[:160],
+                )
+                self._record_job_result_stage(
+                    url=claim_url,
+                    stage="file_attachment",
+                    status="skipped",
+                    reason=claim_reason,
+                    source_url=post_url,
+                    file_url=file_url,
+                    file_name=file_name,
+                )
+                _log_file_url_status(
+                    stage="candidate_select",
+                    status="skipped",
+                    process_url=file_url or post_url,
+                    post_url=post_url,
+                    file_url=file_url,
+                    selected="no",
+                    saved="no",
+                    learn="skipped",
+                    reason=claim_reason,
+                    name=file_name,
+                    job_id=effective_job_id,
+                    db_name=getattr(self, "db_name", ""),
+                )
+                continue
+
             if _dup_log:
                 _dup_log(
                     'candidate selected | job_id=%s task=%s file_url=%s post=%s',
@@ -2425,7 +2539,7 @@ class BoardContentFilePipelineMixin:
             )
             if file_meta:
                 file_meta["declared_file_size_bytes"] = int(attach.get("_declared_file_size_bytes") or 0)
-                file_meta["download_lane"] = "large" if is_large_download_item(file_meta) else "normal"
+                file_meta["download_lane"] = "normal"
             if not file_meta:
                 _track_enqueue_missing(
                     "file_meta_empty",
@@ -2497,6 +2611,11 @@ class BoardContentFilePipelineMixin:
                         )
                         break
                     if any(k in self._seen_file_urls for k in dedup_keys):
+                        _record_runtime_duplicate_skip(
+                            "seen_before_enqueue",
+                            file_url,
+                            file_name,
+                        )
                         _count_candidate_skip("seen_before_enqueue")
                         _file_dashboard_download_debug(
                             "enqueue.skip reason=seen_before_enqueue job_id=%s post=%s name=%s url=%s keys=%s",
@@ -2548,6 +2667,11 @@ class BoardContentFilePipelineMixin:
                     )
                     break
                 if any(k in self._seen_file_urls for k in dedup_keys):
+                    _record_runtime_duplicate_skip(
+                        "seen_before_enqueue",
+                        file_url,
+                        file_name,
+                    )
                     _count_candidate_skip("seen_before_enqueue")
                     _file_dashboard_download_debug(
                         "enqueue.skip reason=seen_before_enqueue job_id=%s post=%s name=%s url=%s keys=%s",
@@ -2610,6 +2734,20 @@ class BoardContentFilePipelineMixin:
                         samples.extend(enqueue_missing_samples[: max(0, 10 - len(samples))])
             except Exception:
                 logger.debug("[파일크롤링추적][큐누락] 사유 통계 기록 실패", exc_info=True)
+
+        if runtime_duplicate_reason_counts:
+            try:
+                async with self._stats_lock:
+                    reason_counts = self.stats.setdefault(
+                        "file_attachment_enqueue_runtime_duplicate_reason_counts", {}
+                    )
+                    if not isinstance(reason_counts, dict):
+                        reason_counts = {}
+                        self.stats["file_attachment_enqueue_runtime_duplicate_reason_counts"] = reason_counts
+                    for reason, count in runtime_duplicate_reason_counts.items():
+                        reason_counts[reason] = int(reason_counts.get(reason, 0) or 0) + int(count or 0)
+            except Exception:
+                logger.debug("[FileCrawlTrace][enqueue_duplicate_skip] reason stats update failed", exc_info=True)
 
         if enqueued:
             try:
@@ -3785,12 +3923,11 @@ class BoardContentFilePipelineMixin:
         new_cate2: Optional[str] = None,
         author_meta: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Speed-first file crawl keeps pre-queue DB duplicate checks disabled."""
-        return False
+        """Check an existing LEARN_LIST row before scheduling a file download."""
         if not dup_bundle:
             if (
                 getattr(self, "is_attachment_file_crawl_workflow", False)
-                and str(os.getenv("FILE_CRAWL_DUP_CHECK_FAIL_OPEN_ON_BUNDLE_MISS", "1") or "1").strip().lower()
+                and str(os.getenv("FILE_CRAWL_DUP_CHECK_FAIL_OPEN_ON_BUNDLE_MISS", "0") or "1").strip().lower()
                 in ("1", "true", "yes", "on")
             ):
                 logger.debug(

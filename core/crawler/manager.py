@@ -273,15 +273,11 @@ class WorkerManager:
             max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
         max_concurrent = max(1, max_concurrent)
 
-        normal_workers = 2
-        large_workers = 2
-        for i in range(normal_workers + large_workers):
-            worker_lane = "normal" if i < normal_workers else "large"
-            worker_queue = (
-                self.job_queues.collection_batch_queue
-                if worker_lane == "normal"
-                else self.job_queues.large_collection_batch_queue
-            )
+        normal_workers = int(os.getenv("FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", "2") or "2")
+        normal_workers = max(1, normal_workers)
+        for i in range(normal_workers):
+            worker_lane = "normal"
+            worker_queue = self.job_queues.collection_batch_queue
             t = asyncio.create_task(
                 download_worker(
                     worker_queue,
@@ -294,7 +290,7 @@ class WorkerManager:
                     browser_relauncher=self._relaunch_browser,
                     worker_id=i + 1,
                     worker_lane=worker_lane,
-                    large_download_queue=self.job_queues.large_collection_batch_queue,
+                    large_download_queue=None,
                 )
             )
             self.download_tasks.append(t)

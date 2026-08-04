@@ -86,6 +86,19 @@ def _clear_download_activity(token: str) -> None:
     _ACTIVE_DOWNLOAD_ITEMS.pop(token, None)
 
 
+def _set_download_activity_phase(file_meta: Any, phase: str) -> None:
+    """Expose the currently awaited download phase to queue diagnostics."""
+    if not isinstance(file_meta, dict):
+        return
+    now = time.monotonic()
+    file_meta["_download_trace_phase"] = str(phase or "unknown")
+    file_meta["_download_trace_phase_started_at"] = now
+    token = str(file_meta.get("_download_activity_token") or "")
+    if token and token in _ACTIVE_DOWNLOAD_ITEMS:
+        _ACTIVE_DOWNLOAD_ITEMS[token]["phase"] = file_meta["_download_trace_phase"]
+        _ACTIVE_DOWNLOAD_ITEMS[token]["phase_started_at"] = now
+
+
 def get_download_worker_activity_snapshot(*, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
     expected_job_id = str(job_id or "").strip()
     now = time.monotonic()
@@ -102,6 +115,8 @@ def get_download_worker_activity_snapshot(*, job_id: Optional[str] = None) -> Li
                 "url": state.get("url"),
                 "post_url": state.get("post_url"),
                 "name": state.get("name"),
+                "phase": state.get("phase") or "unknown",
+                "phase_elapsed_sec": round(max(0.0, now - float(state.get("phase_started_at") or state.get("started_at") or now)), 1),
             }
         )
     return sorted(active, key=lambda item: float(item.get("elapsed_sec") or 0.0), reverse=True)
@@ -200,7 +215,17 @@ def _write_download_url_trace(record: Dict[str, Any]) -> None:
 
 
 async def _append_download_url_trace(record: Dict[str, Any]) -> None:
-    await asyncio.to_thread(_write_download_url_trace, record)
+    task = asyncio.create_task(
+        asyncio.to_thread(_write_download_url_trace, record),
+        name="download-url-trace-write",
+    )
+    task.add_done_callback(_consume_download_url_trace_task_result)
+
+def _consume_download_url_trace_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception as exc:
+        logger.debug("[DownloadUrlTrace] background write failed | err=%s", exc)
 
 FLOW_DEBUG = os.getenv("CRAWL_DEBUG_FLOW", "0") == "1"
 if FLOW_DEBUG:
@@ -509,6 +534,13 @@ def _is_component_direct_download_url(u: str) -> bool:
         return False
     return path.endswith("/component/file/nd_filedownload.do")
 
+def _is_server_side_direct_download_url(u: str) -> bool:
+    """Return whether an opaque server-side route directly streams an attachment."""
+    try:
+        path = (urlparse(str(u or "")).path or "").lower()
+    except Exception:
+        return False
+    return any(marker in path for marker in ("/afile/fileopen/", "/afile/filedownload/"))
 _STATIC_DIRECT_DOCUMENT_EXTENSIONS = frozenset(str(ext or "").lower() for ext in DOC_EXTENSIONS)
 
 
@@ -600,6 +632,14 @@ _DOWNLOAD_DOMAIN_SEMAPHORES: Dict[Tuple[int, str, str, int], asyncio.Semaphore] 
 
 def _host_env_key(host: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(host or "").strip().upper()).strip("_")
+
+
+def _download_transport_slow_log_sec() -> float:
+    try:
+        value = float(os.getenv("DOWNLOAD_TRANSPORT_SLOW_LOG_SEC", "3") or "3")
+    except Exception:
+        value = 3.0
+    return max(0.5, min(value, 60.0))
 
 
 def _download_domain_default_concurrency() -> int:
@@ -1787,6 +1827,24 @@ def _is_weak_download_filename(filename: Any) -> bool:
     return not collapsed
 
 
+def _is_opaque_download_route_filename(filename: Any, url: str) -> bool:
+    """True when a response filename is merely the final opaque route token."""
+    try:
+        parsed = urlparse(str(url or ""))
+        route_token = os.path.basename(unquote(parsed.path or "")).strip()
+        candidate = os.path.splitext(os.path.basename(str(filename or "").strip()))[0]
+        if not route_token or not candidate or candidate.lower() != route_token.lower():
+            return False
+        # A real filename normally has an extension in the URL or carries
+        # readable separators. Compact alphanumeric route tokens do not.
+        return bool(
+            "." not in route_token
+            and re.fullmatch(r"[A-Za-z0-9]{4,64}", route_token)
+        )
+    except Exception:
+        return False
+
+
 def _normalize_download_filename_candidate(value: Any) -> str:
     text = str(value or "").strip().strip("\"'")
     if not text:
@@ -1924,6 +1982,12 @@ def _best_download_filename(
             decoded_candidates.append(decoded)
     meta_candidates = _filename_candidates_from_meta(file_meta)
     url_candidates = _filename_candidates_from_url(url)
+
+    if not prefer_meta and meta_candidates:
+        prefer_meta = any(
+            _is_opaque_download_route_filename(candidate, url)
+            for candidate in decoded_candidates
+        )
 
     if prefer_meta:
         ordered.extend(meta_candidates)
@@ -3983,8 +4047,9 @@ async def download_worker(
         domain_lock_acquired = False
         host = ""
         last_err_msg = ""
-        
+
         async with sem:
+            _set_download_activity_phase(file_meta, "url_resolve")
             source_page = _resolve_source_page_from_file_meta(file_meta)
             if source_page:
                 file_meta["source_page"] = source_page
@@ -4052,6 +4117,13 @@ async def download_worker(
                     pass
                 return None
             file_meta["url"] = url
+            logger.info(
+                "[DownloadTrace][url_resolved] job_id=%s worker=%s url=%s post_url=%s",
+                file_meta.get("job_id"),
+                worker_id,
+                _short(url, 220),
+                _short(source_page, 220),
+            )
             if _is_viewer_convert_url(url):
                 file_meta["_download_empty_reason"] = "viewer_convert_url"
                 logger.debug(
@@ -4107,8 +4179,9 @@ async def download_worker(
                 per_item_http_retries = 1
                 per_item_http_timeout = min(per_item_http_timeout, _portal_direct_http_timeout_sec())
             is_component_direct_fast = _is_component_direct_download_url(url)
+            is_server_side_direct = _is_server_side_direct_download_url(url)
             is_static_direct_document = _is_static_direct_document_url(url)
-            is_http_only_direct = is_component_direct_fast or is_static_direct_document
+            is_http_only_direct = is_component_direct_fast or is_server_side_direct or is_static_direct_document
             is_suwon_component_direct = _is_suwon_component_direct_download_url(url)
             if is_component_direct_fast:
                 per_item_pw_attempts = 0
@@ -4136,7 +4209,7 @@ async def download_worker(
                         per_item_http_timeout,
                         _short(url, 220),
                     )
-            elif is_static_direct_document:
+            elif is_server_side_direct or is_static_direct_document:
                 per_item_pw_attempts = 0
                 per_item_http_retries = max(
                     1,
@@ -4147,7 +4220,7 @@ async def download_worker(
                     min(_env_float("DOWNLOAD_STATIC_DIRECT_HTTP_TIMEOUT_SEC", 15.0), 30.0),
                 )
                 logger.info(
-                    "[Download][Worker %s] static document HTTP-only policy | http_timeout=%.1fs retries=%s url=%s",
+                    "[Download][Worker %s] direct attachment HTTP-only policy | http_timeout=%.1fs retries=%s url=%s",
                     worker_id,
                     per_item_http_timeout,
                     per_item_http_retries,
@@ -4218,6 +4291,16 @@ async def download_worker(
                         job_id=str(file_meta.get("job_id") or ""),
                     )
                     domain_lock_wait_started = time.monotonic()
+                    _set_download_activity_phase(file_meta, "domain_slot_wait")
+                    logger.info(
+                        "[DownloadTrace][domain_wait] job_id=%s worker=%s host=%s limit=%s url=%s post_url=%s",
+                        file_meta.get("job_id"),
+                        worker_id,
+                        host,
+                        domain_limit,
+                        _short(url, 220),
+                        _short(source_page, 220),
+                    )
                     logger.info(
                         "[Download][Worker %s] domain lock waiting | host=%s limit=%s url=%s post_url=%s",
                         worker_id,
@@ -4281,6 +4364,16 @@ async def download_worker(
                     else:
                         await domain_sem.acquire()
                     domain_lock_acquired = True
+                    _set_download_activity_phase(file_meta, "download_path_prepare")
+                    logger.info(
+                        "[DownloadTrace][domain_acquired] job_id=%s worker=%s host=%s limit=%s wait_sec=%.3f url=%s",
+                        file_meta.get("job_id"),
+                        worker_id,
+                        host,
+                        domain_limit,
+                        max(0.0, time.monotonic() - domain_lock_wait_started),
+                        _short(url, 220),
+                    )
                     logger.info(
                         "[Download][Worker %s] domain lock acquired | host=%s limit=%s wait_sec=%.3f url=%s",
                         worker_id,
@@ -4323,6 +4416,7 @@ async def download_worker(
                     if not can_try_direct_http:
                         break
                     try:
+                        file_meta["_download_http_attempt"] = attempt
                         req_headers = _build_request_headers(headers, source_page=source_page)
                         cookie_header = _cookie_header_from_file_meta(file_meta)
                         manual_cookie_header = "; ".join(
@@ -4337,6 +4431,7 @@ async def download_worker(
                         if _is_suwon_culture_direct_download_url(url) or is_http_only_direct:
                             prewarm_enabled = False
                         if source_page and prewarm_enabled:
+                            _set_download_activity_phase(file_meta, "source_page_prewarm")
                             await _prime_source_page_http_session(
                                 session,
                                 source_page=source_page,
@@ -4407,12 +4502,15 @@ async def download_worker(
                                 "direct_attachment": is_http_only_direct,
                             }
                         )
+                        _set_download_activity_phase(file_meta, "http_response_headers_wait")
+                        request_started_at = time.monotonic()
                         async with session.get(
                             safe_url,
                             timeout=request_timeout,
                             allow_redirects=True,
                             headers=req_headers,
                         ) as response:
+                            _set_download_activity_phase(file_meta, "http_response_headers_received")
                             await _append_download_url_trace(
                                 {
                                     "event": "target_response",
@@ -4428,6 +4526,22 @@ async def download_worker(
                                     "http_attempt": attempt,
                                 }
                             )
+                            _set_download_activity_phase(file_meta, "http_response_metadata")
+                            response_header_elapsed_sec = max(0.0, time.monotonic() - request_started_at)
+                            if response_header_elapsed_sec >= _download_transport_slow_log_sec():
+                                logger.info(
+                                    "[DownloadTrace][transport_headers_slow] job_id=%s worker=%s host=%s elapsed_sec=%.3f "
+                                    "status=%s content_length=%s content_type=%s url=%s post_url=%s",
+                                    file_meta.get("job_id"),
+                                    worker_id,
+                                    host or "-",
+                                    response_header_elapsed_sec,
+                                    response.status,
+                                    response.headers.get("content-length", ""),
+                                    response.headers.get("content-type", ""),
+                                    _short(url, 220),
+                                    _short(source_page, 220),
+                                )
                             if response.status != 200:
                                 file_meta["_download_empty_reason"] = f"http_status_{response.status}"
                                 logger.debug(
@@ -4562,11 +4676,26 @@ async def download_worker(
                                     url_filename = url_path.split('/')[-1]
                                     if url_filename and '.' in url_filename: final_filename = url_filename
                                 
+                                response_filename = final_filename
+                                response_filename_is_opaque = _is_opaque_download_route_filename(
+                                    response_filename,
+                                    url,
+                                )
+                                if response_filename_is_opaque:
+                                    logger.info(
+                                        "[DownloadTrace][filename_opaque_route_token] job_id=%s worker=%s response_filename=%s attachment_filename=%s url=%s",
+                                        file_meta.get("job_id"),
+                                        worker_id,
+                                        _short(response_filename, 160),
+                                        _short(file_meta.get("name") or file_meta.get("attachment_name"), 160),
+                                        _short(url, 220),
+                                    )
                                 final_filename = _best_download_filename(
-                                    final_filename,
+                                    response_filename,
                                     url=url,
                                     file_meta=file_meta,
-                                    default=file_meta.get('name', 'unknown'),
+                                    default=file_meta.get("name", "unknown"),
+                                    prefer_meta=response_filename_is_opaque,
                                 )
                                 _filename_debug_log(
                                     "http_response_filename",
@@ -4596,6 +4725,7 @@ async def download_worker(
                                     file_meta["download_lane"] = "large"
                                     file_meta["_large_lane_requeued"] = True
                                     try:
+                                        _set_download_activity_phase(file_meta, "large_lane_enqueue_wait")
                                         await large_download_queue.put(file_meta)
                                         await large_download_queue.flush()
                                     except Exception as defer_exc:
@@ -4618,6 +4748,7 @@ async def download_worker(
                                             _short(url, 220),
                                             _short(source_page, 220),
                                         )
+                                        _set_download_activity_phase(file_meta, "progress_queue_enqueue_wait")
                                         await progress_queue.put(
                                             {
                                                 "type": "download_deferred",
@@ -4662,10 +4793,44 @@ async def download_worker(
                                 if os.path.exists(filepath):
                                     pass
 
-                                file_size, head = await _stream_http_response_to_file(
-                                    response,
-                                    tmp_filepath,
-                                )
+                                _set_download_activity_phase(file_meta, "http_body_stream")
+                                body_stream_started_at = time.monotonic()
+                                try:
+                                    file_size, head = await _stream_http_response_to_file(
+                                        response,
+                                        tmp_filepath,
+                                    )
+                                except Exception as stream_exc:
+                                    logger.warning(
+                                        "[DownloadTrace][transport_body_failed] job_id=%s worker=%s host=%s header_elapsed_sec=%.3f "
+                                        "body_elapsed_sec=%.3f url=%s post_url=%s err_type=%s err=%s err_repr=%r",
+                                        file_meta.get("job_id"),
+                                        worker_id,
+                                        host or "-",
+                                        response_header_elapsed_sec,
+                                        max(0.0, time.monotonic() - body_stream_started_at),
+                                        _short(url, 220),
+                                        _short(source_page, 220),
+                                        type(stream_exc).__name__,
+                                        stream_exc,
+                                        stream_exc,
+                                    )
+                                    raise
+                                body_stream_elapsed_sec = max(0.0, time.monotonic() - body_stream_started_at)
+                                if body_stream_elapsed_sec >= _download_transport_slow_log_sec():
+                                    logger.info(
+                                        "[DownloadTrace][transport_body_slow] job_id=%s worker=%s host=%s header_elapsed_sec=%.3f "
+                                        "body_elapsed_sec=%.3f bytes=%s expected_bytes=%s url=%s post_url=%s",
+                                        file_meta.get("job_id"),
+                                        worker_id,
+                                        host or "-",
+                                        response_header_elapsed_sec,
+                                        body_stream_elapsed_sec,
+                                        file_size,
+                                        response.headers.get("content-length", ""),
+                                        _short(url, 220),
+                                        _short(source_page, 220),
+                                    )
                                 file_size = await wait_for_file_ready(
                                     tmp_filepath,
                                     timeout_sec=_download_temp_ready_timeout_sec(),
@@ -5382,11 +5547,29 @@ async def download_worker(
                     async def _download_item_with_activity(item: Any) -> Any:
                         item_meta = item if isinstance(item, dict) else {}
                         activity_token = _register_download_activity(worker_id, item, worker_lane)
+                        if isinstance(item_meta, dict):
+                            item_meta["_download_activity_token"] = activity_token
+                            _set_download_activity_phase(item_meta, "item_enter")
                         started_at = time.monotonic()
                         hard_timeout_sec = _download_item_hard_timeout_sec(item_meta)
+                        logger.info(
+                            "[DownloadTrace][item_enter] job_id=%s worker=%s lane=%s timeout_sec=%.1f url=%s post_url=%s name=%s",
+                            item_meta.get("job_id"),
+                            worker_id,
+                            worker_lane,
+                            hard_timeout_sec,
+                            _short(item_meta.get("url") or item_meta.get("_raw_url"), 220),
+                            _short(item_meta.get("source_page") or item_meta.get("source_url"), 220),
+                            _short(item_meta.get("name") or item_meta.get("subject"), 160),
+                        )
+                        download_task: Optional[asyncio.Task] = None
                         try:
-                            result = await asyncio.wait_for(
+                            download_task = asyncio.create_task(
                                 download_item(session, item),
+                                name=f"download-item-{worker_id}",
+                            )
+                            result = await asyncio.wait_for(
+                                asyncio.shield(download_task),
                                 timeout=hard_timeout_sec,
                             )
                             if result and result.get("deferred_to_large_lane"):
@@ -5398,16 +5581,34 @@ async def download_worker(
                                 item_meta["_url_trace_outcome"] = "skipped"
                             return result
                         except asyncio.TimeoutError:
+                            if download_task is not None and not download_task.done():
+                                stack = [
+                                    f"{frame.f_code.co_filename}:{frame.f_lineno}:{frame.f_code.co_name}"
+                                    for frame in download_task.get_stack(limit=12)
+                                ]
+                                logger.warning(
+                                    "[DownloadTrace][item_hard_timeout_stack] job_id=%s worker=%s stack=%s",
+                                    item_meta.get("job_id"),
+                                    worker_id,
+                                    stack or ["<no-python-frame>"],
+                                )
+                                download_task.cancel()
+                                await asyncio.gather(download_task, return_exceptions=True)
                             reason = f"item_hard_timeout:{hard_timeout_sec:.0f}s"
                             if isinstance(item, dict):
                                 item["_download_empty_reason"] = reason
                                 item["_download_last_error"] = reason
+                            timeout_phase = str(item_meta.get("_download_trace_phase") or "unknown")
+                            timeout_phase_started_at = float(item_meta.get("_download_trace_phase_started_at") or started_at)
                             logger.warning(
                                 "[DownloadTrace][item_hard_timeout] job_id=%s worker=%s timeout_sec=%.1f "
-                                "url=%s post_url=%s name=%s",
+                                "elapsed_sec=%.3f phase=%s phase_elapsed_sec=%.3f url=%s post_url=%s name=%s",
                                 item_meta.get("job_id"),
                                 worker_id,
                                 hard_timeout_sec,
+                                max(0.0, time.monotonic() - started_at),
+                                timeout_phase,
+                                max(0.0, time.monotonic() - timeout_phase_started_at),
                                 _short(item_meta.get("url") or item_meta.get("_raw_url"), 220),
                                 _short(item_meta.get("source_page") or item_meta.get("source_url"), 220),
                                 _short(item_meta.get("name") or item_meta.get("subject"), 160),
@@ -5441,9 +5642,14 @@ async def download_worker(
                                 item["_url_trace_error"] = f"{type(exc).__name__}: {exc}"
                             raise
                         finally:
+                            if download_task is not None and not download_task.done():
+                                download_task.cancel()
+                                await asyncio.gather(download_task, return_exceptions=True)
                             if isinstance(item, dict):
                                 item["_download_elapsed_sec"] = max(0.0, time.monotonic() - started_at)
                             _clear_download_activity(activity_token)
+                            if isinstance(item_meta, dict):
+                                item_meta.pop("_download_activity_token", None)
                             try:
                                 await _append_download_url_trace(
                                     {
@@ -5489,12 +5695,32 @@ async def download_worker(
                                     )
                                     for task in pending_tasks
                                 ][:5]
+                                pending_details = []
+                                now_mono = time.monotonic()
+                                for task in pending_tasks:
+                                    pending_item = batch_items[task_to_index[task]]
+                                    pending_meta = pending_item if isinstance(pending_item, dict) else {}
+                                    phase_started_at = float(
+                                        pending_meta.get("_download_trace_phase_started_at") or now_mono
+                                    )
+                                    pending_details.append(
+                                        {
+                                            "url": _short(pending_meta.get("url") or pending_item, 180),
+                                            "phase": pending_meta.get("_download_trace_phase") or "unknown",
+                                            "phase_elapsed_sec": round(max(0.0, now_mono - phase_started_at), 3),
+                                            "http_attempt": pending_meta.get("_download_http_attempt") or 0,
+                                        }
+                                    )
+                                first_pending = batch_items[task_to_index[next(iter(pending_tasks))]]
+                                first_pending_meta = first_pending if isinstance(first_pending, dict) else {}
                                 logger.info(
-                                    "[Download][Worker %s] batch still waiting | pending=%s batch_size=%s urls=%s",
+                                    "[DownloadTrace][batch_waiting] job_id=%s worker=%s pending=%s batch_size=%s urls=%s details=%s",
+                                    first_pending_meta.get("job_id") or "",
                                     worker_id,
                                     len(pending_tasks),
                                     len(batch_items),
                                     pending_urls,
+                                    pending_details[:5],
                                 )
                                 continue
                             for task in completed:
