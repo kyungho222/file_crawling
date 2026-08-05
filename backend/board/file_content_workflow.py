@@ -785,6 +785,13 @@ def _file_learn_list_ensure_timeout_sec() -> float:
     return max(30.0, min(value, 900.0))
 
 
+def _file_learn_list_db_operation_timeout_sec() -> float:
+    try:
+        value = float(os.getenv("FILE_LEARN_LIST_DB_OPERATION_TIMEOUT_SEC", "45") or "45")
+    except Exception:
+        value = 45.0
+    return max(5.0, min(value, 120.0))
+
 def _file_crawl_learn_completion_window_default() -> int:
     default_window = max(
         _file_crawl_pipeline_concurrency_default(),
@@ -4943,38 +4950,69 @@ class BoardContentFilePipelineMixin:
                         getattr(self, "job_id", None),
                         (url or "")[:160],
                     )
-                return await insert_into_learn_list(
-                    chat_bot_id=str(cid),
-                    db_name=str(dbn),
-                    file_info=file_info,
-                )
-
+                operation_timeout_sec = _file_learn_list_db_operation_timeout_sec()
+                insert_started = time.perf_counter()
+                try:
+                    row_id = await asyncio.wait_for(
+                        insert_into_learn_list(
+                            chat_bot_id=str(cid),
+                            db_name=str(dbn),
+                            file_info=file_info,
+                        ),
+                        timeout=operation_timeout_sec,
+                    )
+                except asyncio.TimeoutError:
+                    info["_learn_list_ensure_failure_reason"] = "insert_timeout"
+                    logger.error(
+                        "[FilePersist][insert_timeout] job_id=%s db=%s timeout_sec=%.1f post_url=%s file_url=%s file=%s",
+                        getattr(self, "job_id", None), str(dbn), operation_timeout_sec,
+                        str(file_info.get("source_url") or "")[:220], str(url or "")[:220], str(file_name or "")[:160],
+                    )
+                    return None
+                elapsed_sec = time.perf_counter() - insert_started
+                if elapsed_sec >= 1.0:
+                    logger.warning(
+                        "[FilePersist][insert_slow] job_id=%s db=%s elapsed_sec=%.3f file=%s",
+                        getattr(self, "job_id", None), str(dbn), elapsed_sec, str(file_name or "")[:160],
+                    )
+                return row_id
         async def _lookup_or_insert_file_row() -> Tuple[Any, bool, str]:
             if duplicate_cache_key in duplicate_cache:
                 cached = duplicate_cache.get(duplicate_cache_key)
                 if isinstance(cached, tuple) and len(cached) >= 2:
                     return cached[0], True, str(cached[1] or "")
             elif duplicate_cache_key is not None:
+                operation_timeout_sec = _file_learn_list_db_operation_timeout_sec()
+                lookup_started = time.perf_counter()
                 try:
-                    account_identifier = await get_account_identifier_from_chatbot_setup(
-                        str(cid),
-                        str(dbn),
+                    account_identifier = await asyncio.wait_for(
+                        get_account_identifier_from_chatbot_setup(str(cid), str(dbn)),
+                        timeout=operation_timeout_sec,
                     )
                     learn_table = get_learn_list_table_name(account_identifier)
-                    duplicate_rows = await mysql_execute_query(
-                        f"""
-                        SELECT `id`, `status`
-                        FROM `{learn_table}`
-                        WHERE `subject` = %s
-                          AND `size` = %s
-                          AND `content_type` = 'file'
-                        LIMIT 1
-                        """,
-                        (file_name, size_for_duplicate),
-                        fetch=True,
-                        dbname=str(dbn),
-                        op_name="file_duplicate_subject_size_lookup",
+                    duplicate_rows = await asyncio.wait_for(
+                        mysql_execute_query(
+                            f"""
+                            SELECT `id`, `status`
+                            FROM `{learn_table}`
+                            WHERE `subject` = %s
+                              AND `size` = %s
+                              AND `content_type` = 'file'
+                            LIMIT 1
+                            """,
+                            (file_name, size_for_duplicate),
+                            fetch=True,
+                            dbname=str(dbn),
+                            op_name="file_duplicate_subject_size_lookup",
+                        ),
+                        timeout=operation_timeout_sec,
                     )
+                    lookup_elapsed_sec = time.perf_counter() - lookup_started
+                    if lookup_elapsed_sec >= 1.0:
+                        logger.warning(
+                            "[FilePersist][duplicate_lookup_slow] job_id=%s db=%s elapsed_sec=%.3f file=%s size=%s",
+                            getattr(self, "job_id", None), str(dbn), lookup_elapsed_sec, str(file_name or "")[:160], size_for_duplicate,
+                        )
                     if duplicate_rows:
                         duplicate_row = duplicate_rows[0]
                         duplicate_id = (
@@ -4993,6 +5031,14 @@ class BoardContentFilePipelineMixin:
                         )
                         return duplicate_id, True, str(duplicate_status or "")
                     duplicate_cache[duplicate_cache_key] = None
+                except asyncio.TimeoutError:
+                    info["_learn_list_ensure_failure_reason"] = "duplicate_lookup_timeout"
+                    logger.error(
+                        "[FilePersist][duplicate_lookup_timeout] job_id=%s db=%s timeout_sec=%.1f post_url=%s file_url=%s file=%s size=%s",
+                        getattr(self, "job_id", None), str(dbn), operation_timeout_sec,
+                        str(file_info.get("source_url") or "")[:220], str(url or "")[:220], str(file_name or "")[:160], size_for_duplicate,
+                    )
+                    return None, False, ""
                 except Exception as dup_exc:
                     logger.debug(
                         "[Duplicate][file] LEARN_LIST subject+size lookup failed open | job_id=%s file=%s size=%s source=%s err=%s",
@@ -5002,7 +5048,6 @@ class BoardContentFilePipelineMixin:
                         str(file_info.get("source_url") or info.get("source_page") or info.get("source_url") or "")[:180],
                         dup_exc,
                     )
-
             inserted_row_id = await _insert_file_row()
             if duplicate_cache_key is not None:
                 try:
