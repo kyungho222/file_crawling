@@ -740,7 +740,7 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         study_workers = 1
     study_workers = max(1, min(study_workers, 4))
     try:
-        download_workers = int(os.getenv("FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", "2") or "2")
+        download_workers = int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", 4) or 4)
     except Exception:
         download_workers = 2
     download_workers = max(1, min(download_workers, 16))

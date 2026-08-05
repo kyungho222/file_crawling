@@ -264,6 +264,25 @@ def _env_bool(key: str, default: str = "1") -> bool:
 def _filename_debug_log(location: str, **data: Any) -> None:
     emit_file_name_debug(component="download", location=location, data=data, logger=logger)
 
+def _trace_filename_resolution(file_meta: Optional[Dict[str, Any]], *, worker_id: int, url: str, stage: str, response_filename: Any, selected_filename: Any) -> None:
+    """Log a filename decision only when response and source metadata differ."""
+    if not isinstance(file_meta, dict):
+        return
+    source_filename = str(
+        file_meta.get("attachment_name")
+        or file_meta.get("original_name")
+        or file_meta.get("name")
+        or ""
+    ).strip()
+    response_name = str(response_filename or "").strip()
+    selected_name = str(selected_filename or "").strip()
+    if not source_filename or (source_filename == response_name == selected_name):
+        return
+    logger.info(
+        "[DownloadTrace][filename_resolution] job_id=%s worker=%s stage=%s source_filename=%s response_filename=%s selected_filename=%s url=%s",
+        file_meta.get("job_id"), worker_id, stage, _short(source_filename, 180), _short(response_name, 180), _short(selected_name, 180), _short(url, 220),
+    )
+
 
 def _env_float(key: str, default: float) -> float:
     try:
@@ -1944,17 +1963,20 @@ def _filename_candidates_from_meta(file_meta: Optional[Dict[str, Any]]) -> list[
     if not isinstance(file_meta, dict):
         return []
     out: list[str] = []
+    # Page/API attachment metadata is the source-of-truth. Keep it ahead of
+    # generic display labels and response headers for opaque download routes.
     keys = (
+        "attachment_name",
+        "original_name",
+        "original_filename",
+        "org_file_nm",
+        "user_file_nm",
         "name",
         "subject",
         "filename",
         "file_name",
         "display_name",
         "title",
-        "attachment_name",
-        "original_filename",
-        "org_file_nm",
-        "user_file_nm",
         "sys_file_nm",
     )
     for key in keys:
@@ -1987,7 +2009,7 @@ def _best_download_filename(
         prefer_meta = any(
             _is_opaque_download_route_filename(candidate, url)
             for candidate in decoded_candidates
-        )
+        ) or _is_server_side_direct_download_url(url)
 
     if prefer_meta:
         ordered.extend(meta_candidates)
@@ -2940,6 +2962,7 @@ async def _download_with_playwright(browser, file_meta: Dict, download_dir: str,
             file_meta=file_meta,
             default=final_filename,
         )
+        _trace_filename_resolution(file_meta, worker_id=worker_id, url=req_url, stage="playwright_request", response_filename=_filename_from_content_disposition(cd) or suggested_name, selected_filename=final_filename)
         _filename_debug_log(
             "playwright_response_filename",
             suggested_name=suggested_name,
@@ -3624,12 +3647,14 @@ async def _download_with_playwright(browser, file_meta: Dict, download_dir: str,
             if '.pdf' in url.lower(): ext = '.pdf'
             elif '.hwp' in url.lower(): ext = '.hwp'
             suggested_path = f"file_{uuid4().hex[:8]}{ext}"
+        response_suggested_path = suggested_path
         suggested_path = _best_download_filename(
             suggested_path,
             url=url,
             file_meta=file_meta,
             default=suggested_path,
         )
+        _trace_filename_resolution(file_meta, worker_id=worker_id, url=url, stage="playwright_download", response_filename=response_suggested_path, selected_filename=suggested_path)
         suggested_path = _strip_partial_download_suffix(suggested_path)
         
         # PHP ?듭씪: ?붿뒪?ъ뿉??md5(subject+time+uniqid).ext, DB subject?먮뒗 ?먮낯紐?
@@ -4171,7 +4196,8 @@ async def download_worker(
                     return None
                 recent_access_denied_urls.pop(url, None)
             per_item_pw_attempts = pw_attempts
-            is_portal_direct_fast = _is_portal_direct_file_url(url) and _portal_direct_fail_fast_enabled()
+            is_portal_direct = _is_portal_direct_file_url(url)
+            is_portal_direct_fast = is_portal_direct and _portal_direct_fail_fast_enabled()
             per_item_http_retries = http_retries
             per_item_http_timeout = http_timeout
             if is_portal_direct_fast:
@@ -4181,7 +4207,12 @@ async def download_worker(
             is_component_direct_fast = _is_component_direct_download_url(url)
             is_server_side_direct = _is_server_side_direct_download_url(url)
             is_static_direct_document = _is_static_direct_document_url(url)
-            is_http_only_direct = is_component_direct_fast or is_server_side_direct or is_static_direct_document
+            is_http_only_direct = (
+                is_portal_direct
+                or is_component_direct_fast
+                or is_server_side_direct
+                or is_static_direct_document
+            )
             is_suwon_component_direct = _is_suwon_component_direct_download_url(url)
             if is_component_direct_fast:
                 per_item_pw_attempts = 0
@@ -4209,7 +4240,7 @@ async def download_worker(
                         per_item_http_timeout,
                         _short(url, 220),
                     )
-            elif is_server_side_direct or is_static_direct_document:
+            elif is_portal_direct or is_server_side_direct or is_static_direct_document:
                 per_item_pw_attempts = 0
                 per_item_http_retries = max(
                     1,
@@ -4681,21 +4712,60 @@ async def download_worker(
                                     response_filename,
                                     url,
                                 )
+                                server_side_direct = _is_server_side_direct_download_url(url)
+                                response_filename_prefers_attachment = (
+                                    response_filename_is_opaque or server_side_direct
+                                )
                                 if response_filename_is_opaque:
                                     logger.info(
                                         "[DownloadTrace][filename_opaque_route_token] job_id=%s worker=%s response_filename=%s attachment_filename=%s url=%s",
                                         file_meta.get("job_id"),
                                         worker_id,
                                         _short(response_filename, 160),
-                                        _short(file_meta.get("name") or file_meta.get("attachment_name"), 160),
+                                        _short(file_meta.get("attachment_name") or file_meta.get("original_name") or file_meta.get("name"), 160),
                                         _short(url, 220),
                                     )
+                                attachment_filename = str(
+                                    file_meta.get("attachment_name")
+                                    or file_meta.get("name")
+                                    or file_meta.get("subject")
+                                    or ""
+                                ).strip()
+                                meta_filename_candidates = _filename_candidates_from_meta(file_meta)[:5]
+                                url_filename_candidates = _filename_candidates_from_url(url)[:5]
                                 final_filename = _best_download_filename(
                                     response_filename,
                                     url=url,
                                     file_meta=file_meta,
                                     default=file_meta.get("name", "unknown"),
-                                    prefer_meta=response_filename_is_opaque,
+                                    prefer_meta=response_filename_prefers_attachment,
+                                )
+                                _trace_filename_resolution(file_meta, worker_id=worker_id, url=url, stage="http_response", response_filename=response_filename, selected_filename=final_filename)
+                                if response_filename_is_opaque:
+                                    filename_selection_reason = "opaque_response_route_token_prefer_attachment"
+                                elif server_side_direct:
+                                    filename_selection_reason = "server_side_direct_prefer_attachment"
+                                elif response_filename:
+                                    filename_selection_reason = "response_filename_preferred"
+                                else:
+                                    filename_selection_reason = "attachment_or_url_fallback"
+                                logger.info(
+                                    "[DownloadTrace][filename_compare] job_id=%s worker=%s url=%s "
+                                    "header_present=%s response_filename=%s attachment_filename=%s "
+                                    "meta_candidates=%s url_candidates=%s opaque_route_token=%s server_side_direct=%s "
+                                    "selected_filename=%s reason=%s",
+                                    file_meta.get("job_id"),
+                                    worker_id,
+                                    _short(url, 220),
+                                    bool(cd),
+                                    _short(response_filename, 160),
+                                    _short(attachment_filename, 160),
+                                    meta_filename_candidates,
+                                    url_filename_candidates,
+                                    response_filename_is_opaque,
+                                    server_side_direct,
+                                    _short(final_filename, 160),
+                                    filename_selection_reason,
                                 )
                                 _filename_debug_log(
                                     "http_response_filename",
@@ -4801,6 +4871,10 @@ async def download_worker(
                                         tmp_filepath,
                                     )
                                 except Exception as stream_exc:
+                                    if _is_timeout_download_error(stream_exc):
+                                        file_meta["_download_empty_reason"] = (
+                                            f"http_body_timeout:{per_item_http_timeout:.1f}s"
+                                        )
                                     logger.warning(
                                         "[DownloadTrace][transport_body_failed] job_id=%s worker=%s host=%s header_elapsed_sec=%.3f "
                                         "body_elapsed_sec=%.3f url=%s post_url=%s err_type=%s err=%s err_repr=%r",
@@ -5400,7 +5474,11 @@ async def download_worker(
                     _short(url, 220),
                     _short(source_page, 220),
                     _short(file_meta.get("name") or file_meta.get("subject"), 160),
-                    _short(file_meta.get("_download_empty_reason") or "http_and_playwright_no_file", 180),
+                    _short(
+                        file_meta.get("_download_empty_reason")
+                        or ("http_no_file" if per_item_pw_attempts <= 0 else "http_and_playwright_no_file"),
+                        180,
+                    ),
                     _short(last_err_msg or file_meta.get("_download_last_error") or "-", 240),
                     per_item_http_retries,
                     per_item_pw_attempts,
@@ -5440,7 +5518,7 @@ async def download_worker(
                     empty_reason = (
                         file_meta.get("_download_empty_reason")
                         or (f"last_error:{_short(last_err_msg, 160)}" if last_err_msg else "")
-                        or "http_and_playwright_no_file"
+                        or ("http_no_file" if per_item_pw_attempts <= 0 else "http_and_playwright_no_file")
                     )
                     file_meta["_download_empty_reason"] = empty_reason
                     skip_reason = "websync_failed" if str(empty_reason or "").startswith("websync_failed") else "download_failed"

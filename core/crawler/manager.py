@@ -273,7 +273,7 @@ class WorkerManager:
             max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
         max_concurrent = max(1, max_concurrent)
 
-        normal_workers = int(os.getenv("FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", "2") or "2")
+        normal_workers = int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", 4) or 4)
         normal_workers = max(1, normal_workers)
         for i in range(normal_workers):
             worker_lane = "normal"

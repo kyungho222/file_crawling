@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -1850,12 +1851,7 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 ) as resp:
                     if resp.status != 200:
                         continue
-                    try:
-                        rows = await resp.json(content_type=None)
-                    except Exception:
-                        import json
-
-                        rows = json.loads(await resp.text())
+                    rows = json.loads((await resp.read()).decode("utf-8-sig"))
             except Exception as exc:
                 logger.debug(
                     "[FileProbeDebug][kcohesion.filelist] request failed | url=%s api=%s err=%s",
@@ -1888,7 +1884,15 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 if key in seen_urls:
                     continue
                 seen_urls.add(key)
-                out.append({"href": full, "name": name or "attachment"})
+                original_name = name or "attachment"
+                out.append(
+                    {
+                        "href": full,
+                        "name": original_name,
+                        "attachment_name": original_name,
+                        "original_name": original_name,
+                    }
+                )
 
         return out
 
@@ -2646,12 +2650,25 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             pass
         attachments = self._extract_attachment_links_generic(html, base_url=url)
         kcohesion_ajax_attachments = []
-        if not attachments:
+        if "k-cohesion.go.kr" in str(url or "").lower():
             try:
                 kcohesion_ajax_attachments = await self._extract_kcohesion_filelist_attachments(html, base_url=url)
             except Exception:
                 kcohesion_ajax_attachments = []
         if kcohesion_ajax_attachments:
+            def _kcohesion_file_token(value: Any) -> str:
+                try:
+                    path = urlparse(str(value or "")).path or ""
+                    match = re.search(r"(?i)/afile/(?:fileopen/(?:pdf|hwp|hwpx)/|filedownload/)([A-Za-z0-9_-]+)$", path)
+                    return str(match.group(1) or "").lower() if match else ""
+                except Exception:
+                    return ""
+
+            token_to_index = {
+                _kcohesion_file_token((attachment or {}).get("href")): index
+                for index, attachment in enumerate(attachments or [])
+                if isinstance(attachment, dict) and _kcohesion_file_token(attachment.get("href"))
+            }
             seen_attachment_keys = {
                 canonicalize_url_for_dedup(str(a.get("href") or "")) or str(a.get("href") or "").strip().lower()
                 for a in (attachments or [])
@@ -2660,7 +2677,14 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             for attach in kcohesion_ajax_attachments:
                 href = str((attach or {}).get("href") or "").strip()
                 key = canonicalize_url_for_dedup(href) or href.lower()
-                if key and key not in seen_attachment_keys:
+                token = _kcohesion_file_token(href)
+                existing_index = token_to_index.get(token)
+                if existing_index is not None:
+                    # The AJAX payload is authoritative for the original filename
+                    # and direct download route; generic HTML exposes only a token.
+                    attachments[existing_index] = dict(attach)
+                    seen_attachment_keys.add(key)
+                elif key and key not in seen_attachment_keys:
                     attachments.append(attach)
                     seen_attachment_keys.add(key)
         try:
