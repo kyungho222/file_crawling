@@ -273,8 +273,9 @@ class WorkerManager:
             max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
         max_concurrent = max(1, max_concurrent)
 
-        normal_workers = int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", 4) or 4)
+        normal_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
         normal_workers = max(1, normal_workers)
+        shared_download_semaphore = asyncio.Semaphore(normal_workers)
         for i in range(normal_workers):
             worker_lane = "normal"
             worker_queue = self.job_queues.collection_batch_queue
@@ -291,6 +292,7 @@ class WorkerManager:
                     worker_id=i + 1,
                     worker_lane=worker_lane,
                     large_download_queue=None,
+                    shared_download_semaphore=shared_download_semaphore,
                 )
             )
             self.download_tasks.append(t)

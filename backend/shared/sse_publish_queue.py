@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from backend.shared.crawl_shared import send_sse_message
 from backend.shared.crawl_trace import crawl_trace, elapsed_ms as trace_elapsed_ms
+from backend.shared.crawl_redis_keys import crawl_progress_channel
 
 logger = logging.getLogger("backend.shared.sse_publish_queue")
 
@@ -193,7 +194,7 @@ async def _run_redis_publish_task(
     redis_published = False
     redis_t0 = time.perf_counter()
     publish_task: Optional[asyncio.Task] = None
-    channel = f"crawl:{db_name}:{job_id}:progress"
+    channel = crawl_progress_channel(db_name, job_id)
     crawl_trace(
         logger,
         phase="redis",

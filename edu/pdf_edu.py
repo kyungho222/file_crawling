@@ -40,6 +40,10 @@ PROGRESS_UPDATE_INTERVAL = 10  # 진행률 업데이트 간격 (페이지 단위
 CONCURRENT_BATCHES = 2  # 동시 처리할 배치 수 
 
 OCR_CONCURRENCY_DEFAULT = 2
+PDF_PLAIN_TEXT_SUBPROCESS_CONCURRENCY = 2
+_pdf_plain_text_subprocess_semaphore = asyncio.Semaphore(
+    PDF_PLAIN_TEXT_SUBPROCESS_CONCURRENCY
+)
 
 
 def _normalize_optional_timeout_sec(value) -> float | None:
@@ -719,6 +723,32 @@ def _pdf_plain_text_subprocess_entry() -> None:
 
 
 async def extract_pdf_plain_text_like_process_pdf_async(
+    file_path: str,
+    content: str | None = None,
+    personal_info_filter: str = "N",
+    timeout_sec: float | None = None,
+    fail_on_timeout: bool = False,
+) -> str:
+    """Extract PDF text while limiting CPU-heavy subprocesses per process."""
+    queued_at = time.perf_counter()
+    async with _pdf_plain_text_subprocess_semaphore:
+        wait_sec = time.perf_counter() - queued_at
+        if wait_sec >= 1.0:
+            logger.info(
+                "[PDFPlainTextSubprocessQueue] wait_ms=%s limit=%s file=%s",
+                int(wait_sec * 1000),
+                PDF_PLAIN_TEXT_SUBPROCESS_CONCURRENCY,
+                file_path,
+            )
+        return await _extract_pdf_plain_text_like_process_pdf_async_unlimited(
+            file_path,
+            content,
+            personal_info_filter,
+            timeout_sec,
+            fail_on_timeout,
+        )
+
+async def _extract_pdf_plain_text_like_process_pdf_async_unlimited(
     file_path: str,
     content: str | None = None,
     personal_info_filter: str = "N",

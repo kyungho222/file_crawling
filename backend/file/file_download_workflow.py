@@ -178,8 +178,12 @@ def _compact_text(value: Any) -> str:
 
 
 def _file_crawl_fast_front_concurrency(kwargs: Dict[str, Any]) -> int:
-    # Keep the initial attachment extraction load bounded across all sites.
-    return 3
+    # File crawling uses one shared concurrency baseline for discovery and download.
+    try:
+        value = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
+    except Exception:
+        value = 4
+    return max(1, min(value, 16))
 
 def _file_crawl_detail_fetch_timeout_sec(kwargs: Dict[str, Any]) -> float:
     raw = (

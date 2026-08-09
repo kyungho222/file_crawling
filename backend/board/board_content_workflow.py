@@ -4312,7 +4312,17 @@ class BoardContentWorkflow:
         if not url_key:
             return False
         self._debug_worker_chain("learning_pipeline_enter", url=url_key, learn_list_id=learn_list_id)
+        learn_sem_wait_started = time.perf_counter()
         async with self._learn_sem:
+            learn_sem_wait_sec = time.perf_counter() - learn_sem_wait_started
+            if learn_sem_wait_sec >= 1.0:
+                logger.warning(
+                    "[FileLearnTrace][learning_slot_wait] job_id=%s wait_sec=%.3f learn_list_id=%s url=%s",
+                    self.job_id,
+                    learn_sem_wait_sec,
+                    learn_list_id,
+                    (url or "")[:220],
+                )
             try:
                 fail_reason: str | None = None
                 table_name = await self._ensure_pg_table_name()
@@ -10762,12 +10772,11 @@ class BoardContentWorkflow:
             return True
         type_val = str(row.get("type") or "").strip().lower()
         status_val = str(row.get("status") or "").strip()
-        study_status_val = str(row.get("study_status") or "").strip()
         chat_bot_id_val = str(row.get("chat_bot_id") or "").strip()
         is_active_val = row.get("is_active")
         if type_val != "post":
             return True
-        if not status_val or not study_status_val:
+        if not status_val:
             return True
         if self.chat_bot_id and not chat_bot_id_val:
             return True
@@ -13729,146 +13738,8 @@ class BoardContentWorkflow:
         source_url: str,
         row_hint: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        from db.mysql_db_config import mysql_execute_query
-
-        if not (self.db_name and self.chat_bot_id and source_url):
-            logger.info(
-                "[중복보정][탐색] 즉시 점검 스킵 | job_id=%s 사유=기본정보부족",
-                self.job_id,
-            )
-            return self._merge_duplicate_exploration_shadow_row(row_hint)
-        ctx = await self._get_exploration_shadow_context()
-        if not ctx:
-            logger.info(
-                "[중복보정][탐색] 즉시 점검 스킵 | job_id=%s 사유=탐색테이블컨텍스트없음",
-                self.job_id,
-            )
-            return self._merge_duplicate_exploration_shadow_row(row_hint)
-        table_name = str(ctx.get("table_name") or "")
-        cols = set(ctx.get("cols") or set())
-        if not table_name or "url" not in cols:
-            logger.info(
-                "[중복보정][탐색] 즉시 점검 스킵 | job_id=%s 사유=url컬럼없음",
-                self.job_id,
-            )
-            return self._merge_duplicate_exploration_shadow_row(row_hint)
-
-        row = dict(row_hint or {}) if isinstance(row_hint, dict) else None
-        if not isinstance(row, dict) or not row:
-            row = await self._find_duplicate_exploration_row(
-                table_name=table_name,
-                cols=cols,
-                source_url=source_url,
-            )
-        needs_sync = self._duplicate_exploration_row_needs_sync(row)
-        logger.info(
-            "[중복보정][탐색] 판정 | job_id=%s url=%s row_id=%s type=%r status=%r study_status=%r chat_bot_id=%r is_active=%r needs_sync=%s",
-            self.job_id,
-            (source_url or "")[:180],
-            (row or {}).get("id") if isinstance(row, dict) else None,
-            (row or {}).get("type") if isinstance(row, dict) else None,
-            (row or {}).get("status") if isinstance(row, dict) else None,
-            (row or {}).get("study_status") if isinstance(row, dict) else None,
-            (row or {}).get("chat_bot_id") if isinstance(row, dict) else None,
-            (row or {}).get("is_active") if isinstance(row, dict) else None,
-            needs_sync,
-        )
-        if not needs_sync:
-            logger.info(
-                "[중복보정][탐색] 변경 없음 | job_id=%s url=%s",
-                self.job_id,
-                (source_url or "")[:180],
-            )
-            return self._merge_duplicate_exploration_shadow_row(row, {"url": source_url})
-
-        defaults: Dict[str, Any] = {}
-        if "url" in cols:
-            defaults["url"] = source_url
-        if "type" in cols:
-            defaults["type"] = "post"
-        if "status" in cols:
-            defaults["status"] = "N"
-        if "study_status" in cols:
-            defaults["study_status"] = "auto"
-        if "chat_bot_id" in cols and self.chat_bot_id:
-            defaults["chat_bot_id"] = str(self.chat_bot_id)
-        if "is_active" in cols:
-            defaults["is_active"] = 1
-        if "merge_status" in cols:
-            defaults["merge_status"] = ""
-
-        if row and row.get("id"):
-            update_data: Dict[str, Any] = {}
-            if "type" in defaults and str(row.get("type") or "").strip().lower() != "post":
-                update_data["type"] = defaults["type"]
-            if "status" in defaults and not str(row.get("status") or "").strip():
-                update_data["status"] = defaults["status"]
-            if "study_status" in defaults and not str(row.get("study_status") or "").strip():
-                update_data["study_status"] = defaults["study_status"]
-            if "chat_bot_id" in defaults and not str(row.get("chat_bot_id") or "").strip():
-                update_data["chat_bot_id"] = defaults["chat_bot_id"]
-            if "is_active" in defaults and str(row.get("is_active")).strip() in {"", "0", "none", "null"}:
-                update_data["is_active"] = defaults["is_active"]
-            if update_data:
-                logger.info(
-                    "[중복보정][탐색] UPDATE 시도 | job_id=%s exploration_id=%s fields=%s url=%s",
-                    self.job_id,
-                    row.get("id"),
-                    sorted(update_data.keys()),
-                    (source_url or "")[:180],
-                )
-                set_sql = ", ".join(f"`{key}` = %s" for key in update_data.keys())
-                from backend.shared.db_write_queue import run_db_write
-
-                await run_db_write(
-                    "duplicate_repair.exploration_shadow_update",
-                    lambda: mysql_execute_query(
-                        f"UPDATE `{table_name}` SET {set_sql} WHERE id = %s",
-                        tuple(update_data.values()) + (row["id"],),
-                        dbname=self.db_name,
-                    ),
-                )
-                logger.info(
-                    "[ShadowExploration] duplicate exploration row updated | job_id=%s exploration_id=%s url=%s fields=%s",
-                    self.job_id,
-                    row.get("id"),
-                    source_url[:180],
-                    sorted(update_data.keys()),
-                )
-                row.update(update_data)
-            return self._merge_duplicate_exploration_shadow_row(row, {"url": source_url})
-
-        if not defaults:
-            logger.info(
-                "[중복보정][탐색] INSERT 스킵 | job_id=%s 사유=기본값없음 url=%s",
-                self.job_id,
-                (source_url or "")[:180],
-            )
-            return self._merge_duplicate_exploration_shadow_row(row_hint, {"url": source_url})
-        columns = list(defaults.keys())
-        placeholders = ", ".join(["%s"] * len(columns))
-        logger.debug(
-            "[중복보정][탐색] INSERT 시도 | job_id=%s columns=%s url=%s",
-            self.job_id,
-            columns,
-            (source_url or "")[:180],
-        )
-        from backend.shared.db_write_queue import run_db_write
-
-        await run_db_write(
-            "duplicate_repair.exploration_shadow_insert",
-            lambda: mysql_execute_query(
-                f"INSERT INTO `{table_name}` ({', '.join(f'`{c}`' for c in columns)}) VALUES ({placeholders})",
-                tuple(defaults[c] for c in columns),
-                dbname=self.db_name,
-            ),
-        )
-        logger.debug(
-            "[ShadowExploration] duplicate exploration row inserted | job_id=%s url=%s",
-            self.job_id,
-            source_url[:180],
-        )
-        return self._merge_duplicate_exploration_shadow_row(row_hint, defaults)
+        """Keep duplicate-repair callers read-only for exploration rows."""
+        return self._merge_duplicate_exploration_shadow_row(row_hint, {"url": source_url})
 
     async def _run_duplicate_shadow_summary(
         self,
@@ -26794,7 +26665,6 @@ class BoardContentWorkflow:
         except Exception as e:
             logger.error(f"[SummaryAPI] 호출 실패: {e}") # 에러 로그 기록
         return None
-
 
 
 

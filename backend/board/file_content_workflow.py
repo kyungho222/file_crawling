@@ -91,6 +91,20 @@ except Exception:
 
 logger = logging.getLogger("backend.board.file_content_workflow")
 FILE_DASHBOARD_DOWNLOAD_DEBUG_PREFIX = "[FILE_DASHBOARD_DOWNLOAD_DEBUG]"
+_FILE_PDF_LARGE_FILE_BYTES = 50 * 1024 * 1024
+_FILE_PDF_TEXT_EXTRACT_TIMEOUT_SEC = 180.0
+_FILE_PDF_LARGE_TEXT_EXTRACT_TIMEOUT_SEC = 600.0
+
+
+def _file_pdf_text_extract_timeout_sec(path: str) -> float:
+    """Use a longer bounded budget only for genuinely large PDF files."""
+    try:
+        size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+    except OSError:
+        size = 0
+    if size >= _FILE_PDF_LARGE_FILE_BYTES:
+        return _FILE_PDF_LARGE_TEXT_EXTRACT_TIMEOUT_SEC
+    return _FILE_PDF_TEXT_EXTRACT_TIMEOUT_SEC
 
 
 def _clip_log_value(value: Any, limit: int = 240) -> str:
@@ -740,7 +754,7 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         study_workers = 1
     study_workers = max(1, min(study_workers, 4))
     try:
-        download_workers = int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", 4) or 4)
+        download_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
     except Exception:
         download_workers = 2
     download_workers = max(1, min(download_workers, 16))
@@ -1460,9 +1474,7 @@ class BoardContentFilePipelineMixin:
             if not getattr(self, "_file_pipeline_review_logged", False):
                 try:
                     domain_concurrency = int(
-                        os.getenv("DOWNLOAD_DOMAIN_MAX_CONCURRENT")
-                        or os.getenv("FILE_CRAWL_DOMAIN_MAX_CONCURRENT")
-                        or "4"
+                        getattr(settings, "DOWNLOAD_WORKERS", 4) or 4
                     )
                 except Exception:
                     domain_concurrency = 4
@@ -3777,7 +3789,13 @@ class BoardContentFilePipelineMixin:
             sql = f"SELECT {sel_sql} FROM `{learn_table}` WHERE `{target_col}` = %s{type_filter_sql} LIMIT 1"
             params = (lookup_key, *params_suffix)
 
-            rows = await mysql_execute_query(sql, params, fetch=True, dbname=self.db_name)
+            rows = await mysql_execute_query(
+                sql,
+                params,
+                fetch=True,
+                dbname=self.db_name,
+                op_name=f"file_prequeue_url_duplicate_lookup:job={effective_job_id or '-'}",
+            )
 
             if rows and isinstance(rows[0], dict):
                 return await self._resolve_file_learn_list_duplicate_row(
@@ -3970,7 +3988,11 @@ class BoardContentFilePipelineMixin:
             else:
                 params = (key,)
             rows = await mysql_execute_query(
-                dup_bundle["sql"], params, fetch=True, dbname=self.db_name
+                dup_bundle["sql"],
+                params,
+                fetch=True,
+                dbname=self.db_name,
+                op_name=f"file_prequeue_url_duplicate_lookup:job={effective_job_id or '-'}",
             )
             if rows and isinstance(rows[0], dict):
                 learn_table = dup_bundle.get("learn_table") or ""
@@ -4256,14 +4278,15 @@ class BoardContentFilePipelineMixin:
                 )
                 return ""
             extract_timeout_sec: float | None = None
-            timeout_env = "FILE_PDF_TEXT_EXTRACT_TIMEOUT_SEC" if ext == ".pdf" else "FILE_TEXT_EXTRACT_TIMEOUT_SEC"
-            timeout_default = "180" if ext == ".pdf" else "1800"
-            try:
-                guarded_timeout_sec = float(
-                    os.getenv(timeout_env, timeout_default) or timeout_default
-                )
-            except Exception:
-                guarded_timeout_sec = 1800.0
+            if ext == ".pdf":
+                guarded_timeout_sec = _file_pdf_text_extract_timeout_sec(path)
+            else:
+                try:
+                    guarded_timeout_sec = float(
+                        os.getenv("FILE_TEXT_EXTRACT_TIMEOUT_SEC", "1800") or "1800"
+                    )
+                except Exception:
+                    guarded_timeout_sec = 1800.0
             guarded_timeout_sec = max(0.0, min(guarded_timeout_sec, 24 * 3600.0))
             if guarded_timeout_sec > 0:
                 buffer_sec = min(60.0, max(5.0, guarded_timeout_sec * 0.1))
@@ -4352,10 +4375,13 @@ class BoardContentFilePipelineMixin:
                 os.getenv(timeout_env, timeout_default),
                 os.getenv("FILE_TEXT_EXTRACT_HEARTBEAT_SEC"),
             )
-        try:
-            timeout_sec = float(os.getenv(timeout_env, timeout_default) or timeout_default)
-        except Exception:
-            timeout_sec = 1800.0
+        if ext == ".pdf":
+            timeout_sec = _file_pdf_text_extract_timeout_sec(path)
+        else:
+            try:
+                timeout_sec = float(os.getenv(timeout_env, timeout_default) or timeout_default)
+            except Exception:
+                timeout_sec = 1800.0
         try:
             heartbeat_sec = float(os.getenv("FILE_TEXT_EXTRACT_HEARTBEAT_SEC", "60") or "60")
         except Exception:
@@ -5003,7 +5029,10 @@ class BoardContentFilePipelineMixin:
                             (file_name, size_for_duplicate),
                             fetch=True,
                             dbname=str(dbn),
-                            op_name="file_duplicate_subject_size_lookup",
+                            op_name=(
+                                "file_duplicate_subject_size_lookup:job="
+                                f"{getattr(self, 'job_id', None) or '-'}"
+                            ),
                         ),
                         timeout=operation_timeout_sec,
                     )
@@ -5504,6 +5533,16 @@ class BoardContentFilePipelineMixin:
                 )
             account_id = await get_account_identifier_from_chatbot_setup(self.chat_bot_id, self.db_name)
             learn_table = get_learn_list_table_name(account_id)
+            account_lookup_elapsed_sec = time.perf_counter() - t_as0
+            if account_lookup_elapsed_sec >= 3.0:
+                logger.warning(
+                    "[FileLearnTrace][account_table_resolve_slow] job_id=%s elapsed_sec=%.3f db=%s learn_list_id=%s file_url=%s",
+                    getattr(self, "job_id", None),
+                    account_lookup_elapsed_sec,
+                    getattr(self, "db_name", None),
+                    pre_learn_list_id,
+                    (url or "")[:220],
+                )
             info_cate1 = str(info.get("cate1") or "").strip()
             info_cate2 = str(info.get("cate2") or "").strip()
 
@@ -5544,6 +5583,17 @@ class BoardContentFilePipelineMixin:
                     tuple(check_params),
                     fetch=True,
                     dbname=self.db_name,
+                )
+            duplicate_check_elapsed_sec = time.perf_counter() - t_dup0
+            if duplicate_check_elapsed_sec >= 3.0:
+                logger.warning(
+                    "[FileLearnTrace][learn_duplicate_check_slow] job_id=%s elapsed_sec=%.3f db=%s learn_list_id=%s enabled=%s file_url=%s",
+                    getattr(self, "job_id", None),
+                    duplicate_check_elapsed_sec,
+                    getattr(self, "db_name", None),
+                    pre_learn_list_id,
+                    reuse_dup_check,
+                    (url or "")[:220],
                 )
             if _file_pipeline_bottleneck_log_enabled():
                 logger.debug(
@@ -5641,6 +5691,16 @@ class BoardContentFilePipelineMixin:
                 (file_path or "")[:220],
             )
             upload_path = await self._copy_file_to_upload_path(file_path)
+            copy_elapsed_sec = time.perf_counter() - t_cp0
+            if copy_elapsed_sec >= 3.0:
+                logger.warning(
+                    "[FileLearnTrace][upload_copy_slow] job_id=%s elapsed_sec=%.3f learn_list_id=%s src=%s dst=%s",
+                    getattr(self, "job_id", None),
+                    copy_elapsed_sec,
+                    pre_learn_list_id,
+                    (file_path or "")[:220],
+                    (upload_path or "")[:220],
+                )
             if _file_pipeline_bottleneck_log_enabled():
                 logger.debug(
                     "[Bottleneck][after_save] copy_to_upload %sms ok=%s",
@@ -5697,6 +5757,18 @@ class BoardContentFilePipelineMixin:
                         url=url,
                         file_name=file_subject,
                     )
+                    extract_elapsed_sec = time.perf_counter() - t_ex0
+                    if extract_elapsed_sec >= 3.0:
+                        logger.warning(
+                            "[FileLearnTrace][text_extract_slow] job_id=%s elapsed_sec=%.3f learn_list_id=%s ext=%s chars=%s file_url=%s file=%s",
+                            getattr(self, "job_id", None),
+                            extract_elapsed_sec,
+                            pre_learn_list_id,
+                            ext_hint,
+                            len((extracted_text or "").strip()),
+                            (url or "")[:220],
+                            file_subject[:160],
+                        )
                     logger.debug(
                         "[LearningTrace][board_file.after_extract] job_id=%s db=%s url=%s elapsed_ms=%s chars=%s ext=%s",
                         getattr(self, "job_id", None),
@@ -6860,21 +6932,36 @@ class BoardContentFilePipelineMixin:
                         except OSError:
                             file_size = 0
                     if file_path and path_ok:
+                        file_ready_started = time.perf_counter()
+                        logger.info(
+                            "[FilePersist][file_ready_check_begin] job_id=%s file_url=%s path=%s",
+                            getattr(self, "job_id", None),
+                            (url or "")[:220],
+                            (file_path or "")[:260],
+                        )
                         try:
                             file_size = await wait_for_file_ready(file_path, timeout_sec=30.0, check_partial_siblings=False)
+                            logger.info(
+                                "[FilePersist][file_ready_check_done] job_id=%s file_url=%s elapsed_ms=%s size=%s",
+                                getattr(self, "job_id", None),
+                                (url or "")[:220],
+                                int((time.perf_counter() - file_ready_started) * 1000),
+                                file_size,
+                            )
                         except Exception as exc:
                             path_ok = False
                             file_size = 0
-                            logger.debug(
-                                "[board][file] save_stage file not ready | job_id=%s url=%s path=%s err=%s",
+                            logger.warning(
+                                "[FilePersist][file_ready_check_failed] job_id=%s file_url=%s path=%s elapsed_ms=%s err=%s",
                                 getattr(self, "job_id", None),
                                 (url or "")[:200],
                                 (file_path or "")[:300],
+                                int((time.perf_counter() - file_ready_started) * 1000),
                                 exc,
                             )
                     if file_path and not path_ok:
-                        logger.debug(
-                            "[file_crawl][board][file] save_stage path missing after download | job_id=%s url=%s path=%s",
+                        logger.warning(
+                            "[FilePersist][file_path_unavailable] job_id=%s file_url=%s path=%s",
                             getattr(self, "job_id", None),
                             (url or "")[:200],
                             (file_path or "")[:300],
@@ -7285,7 +7372,18 @@ class BoardContentFilePipelineMixin:
                                 _pre_extracted_text: Optional[str] = pre_extracted_text,
                             ) -> None:
                                 try:
+                                    sem_wait_started = time.perf_counter()
                                     async with sem:
+                                        sem_wait_sec = time.perf_counter() - sem_wait_started
+                                        if sem_wait_sec >= 1.0:
+                                            logger.warning(
+                                                "[FileLearnTrace][pipeline_slot_wait] job_id=%s wait_sec=%.3f limit=%s file_url=%s file=%s",
+                                                getattr(self, "job_id", None),
+                                                sem_wait_sec,
+                                                _file_crawl_learn_concurrency_default(),
+                                                (_url or "")[:220],
+                                                (_file_name or "")[:160],
+                                            )
                                         await self._file_run_saved_file_learn_after_save(
                                             info=_info,
                                             url=_url,

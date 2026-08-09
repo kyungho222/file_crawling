@@ -33,6 +33,34 @@ def _short_warning_value(value: Any, limit: int = 240) -> str:
     return text[:limit] + "..."
 
 
+def _format_running_task_snapshot(*, limit: int = 64) -> str:
+    """Capture suspended asyncio tasks after an unexpectedly slow pool acquire."""
+    try:
+        current = asyncio.current_task()
+        tasks = [task for task in asyncio.all_tasks() if not task.done()]
+    except RuntimeError:
+        return "unavailable:no_running_loop"
+
+    entries = []
+    for task in sorted(tasks, key=lambda item: item.get_name())[:limit]:
+        try:
+            stack = task.get_stack(limit=1)
+            if stack:
+                frame = stack[-1]
+                location = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}:{frame.f_code.co_name}"
+            else:
+                location = "no_python_frame"
+            entries.append(
+                f"{task.get_name()}:{'current' if task is current else 'waiting'}:{location}"
+            )
+        except Exception:
+            entries.append("task_snapshot_error")
+    remaining = max(0, len(tasks) - len(entries))
+    if remaining:
+        entries.append(f"more={remaining}")
+    return " | ".join(entries) or "none"
+
+
 def _content_author_warning_context(query: Any, params: Any) -> Dict[str, Any]:
     values = list(params or ()) if isinstance(params, (list, tuple)) else []
     context: Dict[str, Any] = {"param_count": len(values)}
@@ -1471,6 +1499,30 @@ async def _run_mariadb_operation_with_retry(
                         )
             total_ms = (time.perf_counter() - attempt_t0) * 1000.0
             slow_ms = _get_operation_slow_log_ms()
+            op_name_text = str(op_name or "")
+            is_file_subject_size_lookup = op_name_text.startswith(
+                "file_duplicate_subject_size_lookup"
+            )
+            if op_ok and is_file_subject_size_lookup:
+                bottleneck = _classify_mariadb_slow(
+                    connect_ms=connect_ms,
+                    executor_ms=executor_ms,
+                    release_ms=release_ms,
+                )
+                logger.info(
+                    "[MariaDB][file_duplicate_lookup] db=%s op=%s attempt=%s/%s total_ms=%.1f connect_ms=%s executor_ms=%s release_ms=%s bottleneck=%s pool=%s discard=%s",
+                    dbname,
+                    op_name_text,
+                    attempt,
+                    DB_MAX_RETRY_ATTEMPTS,
+                    total_ms,
+                    f"{connect_ms:.1f}" if connect_ms is not None else "-",
+                    f"{executor_ms:.1f}" if executor_ms is not None else "-",
+                    f"{release_ms:.1f}" if release_ms is not None else "-",
+                    bottleneck,
+                    _current_pool_snapshot(dbname),
+                    discard_conn,
+                )
             if op_ok and slow_ms >= 0 and total_ms >= slow_ms:
                 bottleneck = _classify_mariadb_slow(
                     connect_ms=connect_ms,
@@ -1478,7 +1530,10 @@ async def _run_mariadb_operation_with_retry(
                     release_ms=release_ms,
                 )
                 pool_snapshot = _current_pool_snapshot(dbname)
-                logger.debug(
+                # Slow DB operations need their full timing breakdown in
+                # operational logs; conn_hold_slow alone cannot distinguish
+                # pool acquisition from SQL execution.
+                logger.warning(
                     "[MariaDB][op_slow] db=%s op=%s attempt=%s/%s total_ms=%.1f connect_ms=%s executor_ms=%s release_ms=%s bottleneck=%s pool=%s discard=%s",
                     dbname,
                     op_name,
@@ -1502,13 +1557,25 @@ async def mariadb_connect(dbname=None):
     db_name = _normalize_dbname(dbname)
     last_exc: Optional[Exception] = None
     recovery_reason: Optional[str] = None
+    connect_started = time.perf_counter()
+    pool_get_ms = 0.0
+    job_share_ms = 0.0
+    pool_acquire_ms = 0.0
+    pre_ping_ms = 0.0
+    validation_failed_stage = ""
+    validation_failed_stage_ms = 0.0
+    validation_refresh_ms = 0.0
+    acquire_before_pool = "pool=unknown"
+    acquire_before_holders = "none"
 
     for attempt in range(1, 3):
         pool = None
         stage = "get_pool"
         refreshed_during_attempt = False
         try:
+            pool_get_started = time.perf_counter()
             pool = await MariaDBPool.get_pool(db_name)
+            pool_get_ms += (time.perf_counter() - pool_get_started) * 1000.0
             if pool is None:
                 stage = "no_usable_pool"
                 raise RuntimeError("No usable MariaDB pool before acquire")
@@ -1523,8 +1590,11 @@ async def mariadb_connect(dbname=None):
                 conn = None
                 slot_granted = False
                 stage = "job_share"
+                stage_started = time.perf_counter()
                 try:
+                    job_share_started = time.perf_counter()
                     share_snapshot, slot_granted = await _acquire_job_share_slot(db_name, acquire_timeout)
+                    job_share_ms += (time.perf_counter() - job_share_started) * 1000.0
 
                     latest_pool = await MariaDBPool.get_pool(db_name)
                     if latest_pool is not pool:
@@ -1583,7 +1653,25 @@ async def mariadb_connect(dbname=None):
                             )
 
                     stage = "acquire"
+                    acquire_before_pool = _format_pool_snapshot(db_name, pool, time.time())
+                    acquire_before_holders = _format_active_holder_snapshot(db_name)
+                    stage_started = time.perf_counter()
+                    pool_acquire_started = time.perf_counter()
                     conn = await asyncio.wait_for(pool.acquire(), timeout=acquire_timeout)
+                    acquire_elapsed_ms = (time.perf_counter() - pool_acquire_started) * 1000.0
+                    pool_acquire_ms += acquire_elapsed_ms
+                    if acquire_elapsed_ms >= 1000.0:
+                        logger.warning(
+                            "[MariaDB][acquire_task_snapshot] db=%s acquire_ms=%.1f attempt=%s/2 validate=%s/%s before_pool=%s before_holders=%s tasks=%s",
+                            db_name,
+                            acquire_elapsed_ms,
+                            attempt,
+                            validation_attempt,
+                            validation_retries,
+                            acquire_before_pool,
+                            acquire_before_holders,
+                            _format_running_task_snapshot(),
+                        )
                     setattr(conn, "_pool", pool)
                     setattr(conn, "_pool_dbname", db_name)
                     setattr(conn, "_job_share_slot_granted", slot_granted)
@@ -1626,13 +1714,37 @@ async def mariadb_connect(dbname=None):
                         )
 
                     stage = "health_check"
+                    stage_started = time.perf_counter()
                     if not _is_connection_healthy(conn):
                         raise ConnectionError("unhealthy maria connection")
 
                     stage = "pre_ping"
+                    stage_started = time.perf_counter()
+                    pre_ping_started = time.perf_counter()
                     await _ping_connection(conn)
+                    pre_ping_ms += (time.perf_counter() - pre_ping_started) * 1000.0
                     stage = "ready"
                     MariaDBPool._touch_pool(db_name)
+                    connect_total_ms = (time.perf_counter() - connect_started) * 1000.0
+                    if connect_total_ms >= _get_operation_slow_log_ms():
+                        logger.warning(
+                            "[MariaDB][connect_slow] db=%s total_ms=%.1f get_pool_ms=%.1f job_share_ms=%.1f acquire_ms=%.1f pre_ping_ms=%.1f validation_failed_stage=%s validation_failed_stage_ms=%.1f refresh_ms=%.1f attempt=%s/2 validate=%s/%s acquire_before_pool=%s acquire_before_holders=%s pool=%s",
+                            db_name,
+                            connect_total_ms,
+                            pool_get_ms,
+                            job_share_ms,
+                            pool_acquire_ms,
+                            pre_ping_ms,
+                            validation_failed_stage or "-",
+                            validation_failed_stage_ms,
+                            validation_refresh_ms,
+                            attempt,
+                            validation_attempt,
+                            validation_retries,
+                            acquire_before_pool,
+                            acquire_before_holders,
+                            _format_pool_snapshot(db_name, pool, time.time()),
+                        )
                     if recovery_reason:
                         logger.info(
                             "[MariaDB][recovered_after_%s] db=%s attempt=%s/2 validate=%s/%s snapshot=%s",
@@ -1647,6 +1759,10 @@ async def mariadb_connect(dbname=None):
                     return conn
                 except Exception as exc:
                     last_exc = exc if isinstance(exc, Exception) else Exception(str(exc))
+                    failed_stage_elapsed_ms = max(
+                        0.0,
+                        (time.perf_counter() - stage_started) * 1000.0,
+                    )
                     metrics = _get_pool_metrics(pool) if pool is not None else {}
                     share_metrics = _get_job_share_snapshot(db_name)
                     err_code = _extract_error_code(last_exc)
@@ -1665,7 +1781,21 @@ async def mariadb_connect(dbname=None):
                         else "acquire_failed"
                     )
                     if is_validation_stage:
+                        validation_failed_stage = stage
+                        validation_failed_stage_ms += failed_stage_elapsed_ms
                         if validation_attempt < validation_retries:
+                            logger.warning(
+                                "[MariaDB][connect_validation_retry] db=%s attempt=%s/2 validate=%s/%s stage=%s stage_elapsed_ms=%.1f error_type=%s error=%s pool=%s",
+                                db_name,
+                                attempt,
+                                validation_attempt,
+                                validation_retries,
+                                stage,
+                                failed_stage_elapsed_ms,
+                                type(last_exc).__name__,
+                                _short_warning_value(last_exc, 240),
+                                _format_pool_snapshot(db_name, pool, time.time()) if pool is not None else "missing",
+                            )
                             logger.debug(
                                 "[MariaDB][%s] MariaDB ??寃?寃?????? DB=%s ????%s/2 寃??%s/%s ??怨?%s "
                                 "??寃??????湲곗떆??%.2f?????????湲곗떆??%.2f??"
@@ -1807,8 +1937,19 @@ async def mariadb_connect(dbname=None):
                                 f"connect:attempt={attempt}:validate={validation_attempt}:"
                                 f"stage={stage}:{type(last_exc).__name__}"
                             )
+                            refresh_started = time.perf_counter()
                             refreshed_during_attempt = await _refresh_pool_for_retry(
                                 db_name,
+                                refresh_reason,
+                            )
+                            refresh_elapsed_ms = (time.perf_counter() - refresh_started) * 1000.0
+                            validation_refresh_ms += refresh_elapsed_ms
+                            logger.warning(
+                                "[MariaDB][connect_validation_refresh] db=%s stage=%s refresh_ms=%.1f refreshed=%s reason=%s",
+                                db_name,
+                                stage,
+                                refresh_elapsed_ms,
+                                refreshed_during_attempt,
                                 refresh_reason,
                             )
                             if refreshed_during_attempt and stage in {"no_usable_pool", "stale_pool", "empty_pool", "acquire", "health_check", "pre_ping"}:

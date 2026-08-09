@@ -662,11 +662,10 @@ def _download_transport_slow_log_sec() -> float:
 
 
 def _download_domain_default_concurrency() -> int:
-    raw = os.getenv("DOWNLOAD_DOMAIN_MAX_CONCURRENT") or os.getenv("FILE_CRAWL_DOMAIN_MAX_CONCURRENT") or "4"
     try:
-        value = int(raw)
+        value = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
     except Exception:
-        value = 2
+        value = 4
     return max(1, min(value, 8))
 
 
@@ -3837,6 +3836,7 @@ async def download_worker(
     worker_id: int = 0,
     worker_lane: str = 'normal',
     large_download_queue: Optional[BatchQueue] = None,
+    shared_download_semaphore: Optional[asyncio.Semaphore] = None,
 ):
     """
     Download Worker (real-time):
@@ -3858,7 +3858,7 @@ async def download_worker(
         'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
     }
     
-    sem = asyncio.Semaphore(max_concurrent)
+    sem = shared_download_semaphore or asyncio.Semaphore(max_concurrent)
     # ?꾨찓?몃퀎 ?숈떆???쒖뼱(怨듦났留?WAF 誘쇨컧 ?꾨찓??蹂댄샇)
     strict_hosts_raw = (os.getenv("DOWNLOAD_STRICT_DOMAIN_HOSTS") or "gwangjin.go.kr,gwangjin.eminwon.seoul.kr").strip()
     strict_hosts = {h.strip().lower() for h in strict_hosts_raw.split(",") if h.strip()}

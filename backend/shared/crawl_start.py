@@ -35,6 +35,7 @@ from backend.shared.crawl_shared import (
     publish_client_redis_heartbeat,
     resolve_stream_matched_rules_only,
     swallow_task_exception,
+    state_key,
 )
 from backend.shared.duplicate_category_only_mode import ignore_period_enabled
 from backend.shared.summary_only_mode import (
@@ -4741,7 +4742,7 @@ async def crawl_start(request: Request, background_tasks: BackgroundTasks):
         await cache_job_metadata(job_id, db_name)
         
         # [시작 상태 2] 이전 상태를 지우고 새 크롤링 시작 상태를 기록한다.
-        await redis.delete(f"crawl:{db_name}:{job_id}:state")
+        await redis.delete(state_key(db_name, job_id))
         initial_start_payload = {
             "status": "start",
             "event": "crawl_requested",
@@ -4910,7 +4911,7 @@ async def crawl_accelerated_start(request: Request):
         )
         redis = await get_redis()
         await cache_job_metadata(job_id, db_name)
-        await redis.delete(f"crawl:{db_name}:{job_id}:state")
+        await redis.delete(state_key(db_name, job_id))
         started_payload = {
             "status": "start",
             "event": "accelerated_start_urls",

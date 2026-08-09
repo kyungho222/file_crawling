@@ -21,6 +21,7 @@ from backend.board.board_content_workflow import BoardContentWorkflow
 from backend.shared.stop_service import stop_active_crawl
 from config.settings import settings
 from db.db_redis import get_redis, describe_redis_connection
+from backend.shared.crawl_redis_keys import crawl_progress_channel, crawl_state_key, crawl_state_scan_pattern, db_name_from_crawl_state_key
 from db.crawl_db_manager import update_crawling_log_counters
 from backend.shared.redis_sse_service import send_message_to_redis_sse, get_last_publish_meta
 from backend.shared.sse_utils import format_sse
@@ -744,7 +745,7 @@ async def _resolve_db_name(job_id: str, provided: Optional[str] = None) -> Optio
 
     # 상태 키를 통해 역으로 DB명을 찾는 fallback
     try:
-        async for key in redis.scan_iter(match=f"crawl:*:{job_id}:state", count=5):
+        async for key in redis.scan_iter(match=crawl_state_scan_pattern(job_id), count=5):
             decoded_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
             parts = decoded_key.split(":")
             if len(parts) >= 3:
@@ -893,7 +894,7 @@ def _normalize_status_for_sse(status: Optional[str]) -> str:
 
 
 def _state_key(db_name: str, job_id: str) -> str:
-    return f"crawl:{db_name}:{job_id}:state"
+    return crawl_state_key(db_name, job_id)
 
 
 def _build_sse_cors_headers(request: Request) -> Dict[str, str]:
@@ -1336,7 +1337,7 @@ async def sse_endpoint(job_id: str, request: Request, db_name: str = None):
             conn_desc = describe_redis_connection(redis)
             
             state_key = _state_key(db_name, job_id)
-            channel = f"crawl:{db_name}:{job_id}:progress"
+            channel = crawl_progress_channel(db_name, job_id)
 
             # --- SSE 안정성 강화 ---
             # - Redis Pub/Sub 연결은 네트워크/Redis 리스타트 등으로 중간에 끊길 수 있다.
@@ -2120,7 +2121,7 @@ async def debug_redis_state(db_name: str, job_id: str):
     state = await redis.hgetall(state_key)
     job_meta = await redis.hgetall(job_meta_key)
     ttl = await redis.ttl(state_key)
-    channel = f"crawl:{db_name}:{job_id}:progress"
+    channel = crawl_progress_channel(db_name, job_id)
 
     return {
         "redis_connection": conn_desc,

@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from backend.file.fast_attachment_extractor import extract_fast_attachments, infer_attachment_extension
 from backend.shared.crawl_shared import cache_job_metadata
+from backend.shared.crawl_redis_keys import crawl_state_key
 from backend.shared.crawl_start import _crawl_file_worker
 from backend.shared.crawler_state import crawler_state
 from backend.shared.redis_sse_service import get_redis, update_state_only
@@ -446,7 +447,7 @@ async def _schedule_payload(payload: Dict[str, Any], background_tasks: Backgroun
         await cache_job_metadata(job_id, db_name)
         try:
             redis = await get_redis()
-            await redis.delete(f"crawl:{db_name}:{job_id}:state")
+            await redis.delete(crawl_state_key(db_name, job_id))
         except Exception:
             logger.debug("[LocalFileCrawl] redis state reset skipped", exc_info=True)
         await update_state_only(

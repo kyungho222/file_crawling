@@ -21,6 +21,7 @@ from backend.shared.crawl_shared import (
 from backend.shared.sse_publish_queue import enqueue_sse_message, await_sse_publish_idle
 from backend.shared.redis_sse_service import update_state_only, get_last_publish_meta
 from backend.shared.crawl_trace import crawl_trace, elapsed_ms
+from backend.shared.crawl_redis_keys import crawl_client_heartbeat_key, crawl_state_key
 from db.crawl_db_manager import update_crawling_log_counters
 try:
     from db.mariadb_save_update import begin_crawl_db_cache, end_crawl_db_cache, prewarm_crawl_db_cache
@@ -198,8 +199,8 @@ async def _inspect_duplicate_lock_owner(
     existing_job_id: str,
 ) -> Dict[str, Any]:
     local = _local_workflow_owner_snapshot(existing_job_id)
-    state_key = f"crawl:{db_name}:{existing_job_id}:state"
-    heartbeat_key = f"crawl:{db_name}:{existing_job_id}:client_heartbeat"
+    state_key = crawl_state_key(db_name, existing_job_id)
+    heartbeat_key = crawl_client_heartbeat_key(db_name, existing_job_id)
     state: Dict[str, str] = {}
     heartbeat_present = False
     heartbeat_ttl = None

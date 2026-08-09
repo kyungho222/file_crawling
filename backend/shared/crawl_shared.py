@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Optional
 
 from config.settings import settings
 from db.db_redis import get_redis
+from backend.shared.crawl_redis_keys import (
+    crawl_client_heartbeat_key,
+    crawl_state_key,
+    crawl_state_scan_pattern,
+    db_name_from_crawl_state_key,
+)
 
 from backend.shared.redis_sse_service import send_message_to_redis_sse, get_last_publish_meta
 from backend.shared.crawler_state import crawler_state
@@ -217,7 +223,7 @@ def normalize_status_for_sse(status: Optional[str]) -> str:
 
 
 def state_key(db_name: str, job_id: str) -> str:
-    return f"crawl:{db_name}:{job_id}:state"
+    return crawl_state_key(db_name, job_id)
 
 
 async def resolve_db_name(job_id: str, provided: Optional[str] = None) -> Optional[str]:
@@ -254,7 +260,7 @@ async def resolve_db_name(job_id: str, provided: Optional[str] = None) -> Option
 
     # 상태 키를 통해 역으로 DB명을 찾는 fallback
     try:
-        async for key in redis.scan_iter(match=f"crawl:*:{job_id}:state", count=5):
+        async for key in redis.scan_iter(match=crawl_state_scan_pattern(job_id), count=5):
             decoded_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
             parts = decoded_key.split(":")
             if len(parts) >= 3:
@@ -354,7 +360,7 @@ async def publish_client_redis_heartbeat(job_id: str, db_name: str) -> Dict[str,
     except Exception:
         ttl = 600
     ttl = max(120, min(ttl, 86400))
-    hb_key = f"crawl:{db_name}:{job_id}:client_heartbeat"
+    hb_key = crawl_client_heartbeat_key(db_name, job_id)
     payload = json.dumps(
         {"ts": datetime.utcnow().isoformat() + "Z", "job_id": job_id, "db_name": db_name},
         ensure_ascii=False,

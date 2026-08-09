@@ -14,6 +14,7 @@ from redis.asyncio.client import Redis
 
 from db.db_redis import get_redis
 from backend.shared.crawl_trace import crawl_trace, elapsed_ms
+from backend.shared.crawl_redis_keys import crawl_progress_channel, crawl_state_key
 
 try:
     from config import Config  # type: ignore
@@ -311,8 +312,8 @@ class RedisSSEPublishResponse(BaseModel):
     state_updated: bool = False
 
 def _now_iso() -> str: return datetime.now(timezone.utc).isoformat()
-def _channel_name(account_name: str, job_id: str) -> str: return f"crawl:{account_name}:{job_id}:progress"
-def _state_key(account_name: str, job_id: str) -> str: return f"crawl:{account_name}:{job_id}:state"
+def _channel_name(account_name: str, job_id: str) -> str: return crawl_progress_channel(account_name, job_id)
+def _state_key(account_name: str, job_id: str) -> str: return crawl_state_key(account_name, job_id)
 def _normalize_status_for_sse(status: Optional[str]) -> str:
     normalized = (status or "running").strip().lower()
     if normalized in STOP_STATUSES: return "cancelled"

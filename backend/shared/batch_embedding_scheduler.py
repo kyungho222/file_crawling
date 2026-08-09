@@ -1493,6 +1493,7 @@ async def submit_crawled_url_embedding_batch(
             "post_reg_date": post_reg_date,
             "preserve_created_at": bool(preserve_created_at),
             "status_y_on_submit": status_y_on_submit,
+            "submitted_at_epoch": time.time(),
         },
     )
 
@@ -1538,6 +1539,18 @@ async def submit_crawled_url_embedding_batch(
         callback_url or "-",
         source_url,
     )
+    submit_elapsed_sec = time.perf_counter() - submit_started
+    if submit_elapsed_sec >= 3.0:
+        logger.warning(
+            "[FileLearnTrace][batch_submit_slow] job_id=%s batch_id=%s db=%s elapsed_sec=%.3f chunks=%s service=%s source=%s",
+            job_id,
+            batch_id,
+            db_name,
+            submit_elapsed_sec,
+            len(rows),
+            service_name,
+            source_url[:220],
+        )
     return {
         "status": "submitted",
         "batch_id": batch_id,
@@ -1760,6 +1773,22 @@ async def process_embedding_callback(payload: Dict[str, Any]) -> Dict[str, Any]:
         _flow_debug("callback.missing_context", batch_id=batch_id)
         _decrement_pending_embedding_callback(batch_id=batch_id, reason="missing_context")
         return {"status": "missing_context", "batch_id": batch_id}
+
+    try:
+        submitted_at_epoch = float(context.get("submitted_at_epoch") or 0.0)
+    except (TypeError, ValueError):
+        submitted_at_epoch = 0.0
+    callback_lag_sec = max(0.0, time.time() - submitted_at_epoch) if submitted_at_epoch else 0.0
+    if callback_lag_sec >= 10.0:
+        logger.warning(
+            "[FileLearnTrace][batch_callback_slow] job_id=%s batch_id=%s db=%s lag_sec=%.3f learn_list_id=%s chunks=%s",
+            context.get("workflow_job_id") or context.get("job_id"),
+            batch_id,
+            context.get("db_name"),
+            callback_lag_sec,
+            context.get("learn_list_id"),
+            len(context.get("rows") or []),
+        )
 
     rows = list(context.get("rows") or [])
     results = _extract_results_from_callback_payload(payload)
@@ -2090,4 +2119,3 @@ __all__ = [
     "_extract_results_from_callback_payload",
     "_resolve_result_size_bytes",
 ]
-

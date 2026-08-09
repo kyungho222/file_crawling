@@ -191,6 +191,7 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
         job = await queue.get()
         _active += 1
         started_at = time.monotonic()
+        queue_wait_sec = max(0.0, started_at - job.enqueued_at)
         _active_jobs[worker_id] = {
             "label": job.label,
             "queue": "log" if log_queue else "default",
@@ -199,6 +200,17 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
             "started_ago_sec": 0.0,
         }
         token = _IN_DB_WRITE_WORKER.set(True)
+        slow_sec = _db_write_queue_job_slow_sec()
+        if queue_wait_sec >= slow_sec:
+            logger.warning(
+                "[DBWriteQueue] slow queue wait | worker=%s label=%s queue=%s wait=%.3fs slow=%.3fs pending=%s",
+                worker_id,
+                job.label,
+                "log" if log_queue else "default",
+                queue_wait_sec,
+                slow_sec,
+                queue.qsize(),
+            )
         try:
             result = job.callback()
             if inspect.isawaitable(result):
@@ -215,7 +227,6 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
                     started_at - job.enqueued_at,
                     run_sec,
                 )
-            slow_sec = _db_write_queue_job_slow_sec()
             if run_sec >= slow_sec:
                 logger.warning(
                     "[DBWriteQueue] slow job completed | worker=%s label=%s queue_wait=%.3fs run=%.3fs slow=%.3fs",

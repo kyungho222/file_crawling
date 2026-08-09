@@ -836,8 +836,9 @@ class GlobalWorkerPool:
                 max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
             max_concurrent = max(1, max_concurrent)
 
-            normal_download_workers = int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", 4) or 4)
+            normal_download_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
             normal_download_workers = max(1, normal_download_workers)
+            shared_download_semaphore = asyncio.Semaphore(normal_download_workers)
             for i in range(normal_download_workers):
                 worker_lane = "normal"
                 worker_queue = self.collection_batch_queue
@@ -854,6 +855,7 @@ class GlobalWorkerPool:
                         worker_lane=worker_lane,
                         large_download_queue=None,
                         browser_relauncher=self._relaunch_browser,
+                        shared_download_semaphore=shared_download_semaphore,
                     ),
                     name=f"global-download-{worker_lane}-worker-{i+1}",
                 )

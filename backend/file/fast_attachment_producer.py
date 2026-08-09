@@ -704,27 +704,53 @@ async def run_fast_file_attachment_front(
     timeout_sec: float = 20.0,
     enqueue: bool = True,
 ) -> Dict[str, Any]:
-    items = [x for x in (normalize_fast_file_post_item(item) for item in (post_items or [])) if x]
+    raw_items = [
+        item
+        for item in (normalize_fast_file_post_item(value) for value in (post_items or []))
+        if item
+    ]
+    seen_post_urls: set[str] = set()
+    items: List[FastFilePostItem] = []
+    source_url_duplicate_count = 0
+    for item in raw_items:
+        try:
+            from utils.url import canonicalize_url_for_dedup
+
+            post_key = canonicalize_url_for_dedup(item.url) or str(item.url or "").strip().lower()
+        except Exception:
+            post_key = str(item.url or "").split("#", 1)[0].strip().lower()
+        if post_key and post_key in seen_post_urls:
+            source_url_duplicate_count += 1
+            continue
+        if post_key:
+            seen_post_urls.add(post_key)
+        items.append(item)
     limit = max(1, min(int(concurrency or 1), 64))
     fetch_delay_sec = _file_fetch_enqueue_delay_sec(workflow)
-    fetch_gate_lock = asyncio.Lock()
-    last_fetch_started_at = 0.0
+    last_fetch_started_at_by_worker: Dict[int, float] = {}
     sem = asyncio.Semaphore(limit)
+    work_queue: asyncio.Queue[Optional[FastFilePostItem]] = asyncio.Queue(
+        maxsize=max(2, limit * 2)
+    )
     results: List[Dict[str, Any]] = []
     counters = {
-        "post_count": len(items),
+        "post_count": len(raw_items),
+        "post_unique_count": len(items),
+        "post_duplicate_skipped_count": source_url_duplicate_count,
         "post_success_count": 0,
         "post_error_count": 0,
         "attachment_count": 0,
         "enqueued_count": 0,
     }
     logger.info(
-        "[file-fast][config] posts=%s concurrency=%s fetch_enqueue_delay_sec=%.3f enqueue=%s source_url_dup_skip=%s",
+        "[file-fast][config] posts=%s unique_posts=%s duplicate_posts_skipped=%s concurrency=%s worker_queue_max=%s fetch_enqueue_delay_sec=%.3f fetch_delay_scope=per_worker enqueue=%s source_url_dedup=enabled",
+        len(raw_items),
         len(items),
+        source_url_duplicate_count,
         limit,
+        work_queue.maxsize,
         fetch_delay_sec,
         bool(enqueue),
-        os.getenv("FILE_SOURCE_URL_DUP_SKIP_ENABLED", "0"),
     )
 
     def _workflow_stop_requested() -> bool:
@@ -736,26 +762,26 @@ async def run_fast_file_attachment_front(
         except Exception:
             return False
 
-    async def _wait_before_fetch(url: str, reason: str) -> None:
-        nonlocal last_fetch_started_at
+    async def _wait_before_fetch(url: str, reason: str, worker_no: int) -> None:
         if fetch_delay_sec <= 0:
             return
-        async with fetch_gate_lock:
-            now = time.monotonic()
-            wait_sec = 0.0
-            if last_fetch_started_at > 0:
-                wait_sec = max(0.0, fetch_delay_sec - max(0.0, now - last_fetch_started_at))
-            if wait_sec > 0:
-                logger.debug(
-                    "[file-fast][fetch_delay] reason=%s wait_sec=%.3f post=%s",
-                    reason,
-                    wait_sec,
-                    url,
-                )
-                await asyncio.sleep(wait_sec)
-            last_fetch_started_at = time.monotonic()
+        now = time.monotonic()
+        previous_started_at = float(last_fetch_started_at_by_worker.get(worker_no, 0.0) or 0.0)
+        wait_sec = 0.0
+        if previous_started_at > 0:
+            wait_sec = max(0.0, fetch_delay_sec - max(0.0, now - previous_started_at))
+        if wait_sec > 0:
+            logger.debug(
+                "[file-fast][fetch_delay] worker=%s reason=%s wait_sec=%.3f post=%s",
+                worker_no,
+                reason,
+                wait_sec,
+                url,
+            )
+            await asyncio.sleep(wait_sec)
+        last_fetch_started_at_by_worker[worker_no] = time.monotonic()
 
-    async def process(item: FastFilePostItem) -> None:
+    async def process(item: FastFilePostItem, worker_no: int) -> None:
         async with sem:
             try:
                 if _workflow_stop_requested():
@@ -802,7 +828,7 @@ async def run_fast_file_attachment_front(
                         }
                     )
                     return
-                await _wait_before_fetch(item.url, "detail")
+                await _wait_before_fetch(item.url, "detail", worker_no)
                 if _workflow_stop_requested():
                     logger.debug("[file-fast][stop_skip] stage=before_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                     return
@@ -1133,7 +1159,38 @@ async def run_fast_file_attachment_front(
                 )
                 results.append({"url": item.url, "error": str(exc)})
 
-    await asyncio.gather(*(process(item) for item in items))
+    async def worker(worker_no: int) -> None:
+        while True:
+            item = await work_queue.get()
+            try:
+                if item is None:
+                    return
+                await process(item, worker_no)
+            finally:
+                work_queue.task_done()
+
+    workers = [
+        asyncio.create_task(
+            worker(worker_no),
+            name=f"file-fast-attachment-worker-{getattr(workflow, 'job_id', 'unknown')}-{worker_no}",
+        )
+        for worker_no in range(1, limit + 1)
+    ]
+    try:
+        for item in items:
+            if _workflow_stop_requested():
+                break
+            await work_queue.put(item)
+        await work_queue.join()
+    except BaseException:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    else:
+        for _ in workers:
+            await work_queue.put(None)
+        await asyncio.gather(*workers)
     return {**counters, "results": results}
 
 

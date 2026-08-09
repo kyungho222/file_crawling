@@ -324,47 +324,8 @@ async def mark_exploration_url_as_post_for_temporary_category_match(
     raw_url: Optional[str] = None,
     source: str = "board",
 ) -> bool:
-    """CATEGORY url/query rules temporarily promoted an empty-type exploration URL to post."""
-    dbn = str(db_name or "").strip()
-    cid = str(chat_bot_id or "").strip()
-    normalized_url = str(url or "").strip()
-    original_url = str(raw_url or "").strip()
-    if not (dbn and cid and normalized_url):
-        return False
-
-    params: List[Any]
-    url_condition = "`url` = %s"
-    params = ["post", cid, normalized_url]
-    if original_url and original_url != normalized_url:
-        url_condition = "(`url` = %s OR `url` = %s)"
-        params = ["post", cid, normalized_url, original_url]
-    query = (
-        "UPDATE ASADAL_CRAWLING_EXPLORATION "
-        "SET `type` = %s "
-        "WHERE chat_bot_id = %s "
-        f"AND {url_condition} "
-        "AND COALESCE(TRIM(CAST(`type` AS CHAR)), '') = ''"
-    )
-    try:
-        await maria_execute_query(query, tuple(params), dbname=dbn)
-        logger.info(
-            "[START_URLS_TEMP_POST] exploration type updated | source=%s db=%s chat_bot_id=%s url=%s",
-            source,
-            dbn,
-            cid,
-            normalized_url[:220],
-        )
-        return True
-    except Exception as exc:
-        logger.warning(
-            "[START_URLS_TEMP_POST] exploration type update failed | source=%s db=%s chat_bot_id=%s url=%s err=%s",
-            source,
-            dbn,
-            cid,
-            normalized_url[:220],
-            exc,
-        )
-        return False
+    """Exploration writes are disabled; retain the caller contract."""
+    return False
 
 
 def _resolve_stream_matched_rules_only_kwargs(kwargs: Dict[str, Any], *, default: bool = False) -> bool:
