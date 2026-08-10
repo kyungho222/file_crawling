@@ -49,13 +49,13 @@ def build_exploration_conditions(spec: ExplorationQuerySpec) -> ExplorationQuery
     """Build current and legacy WHERE conditions for exploration URL queries."""
 
     base_type_condition = (
-        "(type IN ('post') OR COALESCE(TRIM(CAST(`type` AS CHAR)), '') = '')"
+        "(`type` = 'post' OR `type` IS NULL OR `type` = '')"
         if spec.include_empty_type
-        else "type IN ('post')"
+        else "`type` = 'post'"
     )
     legacy_base_condition = (
         base_type_condition
-        + " AND COALESCE(LOWER(TRIM(CAST(`study_status` AS CHAR))), '') <> 'delete'"
+        + " AND (`study_status` IS NULL OR `study_status` <> 'delete')"
     )
 
     chat_bot_id = str(spec.chat_bot_id or "").strip()
@@ -66,9 +66,11 @@ def build_exploration_conditions(spec: ExplorationQuerySpec) -> ExplorationQuery
 
     base_condition = legacy_base_condition
     if spec.dedupe_urls:
-        base_condition += " AND COALESCE(LOWER(merge_status), '') <> 'duplicate'"
+        base_condition += " AND (`merge_status` IS NULL OR `merge_status` <> 'duplicate')"
     if spec.require_active:
-        base_condition += " AND COALESCE(is_active, 0) = 1"
+        # NULL is excluded by the old COALESCE expression as well, so this
+        # direct predicate keeps the same result while remaining index-friendly.
+        base_condition += " AND is_active = 1"
 
     date_condition = str(spec.date_condition or "").strip()
     if date_condition:

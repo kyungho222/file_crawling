@@ -42,6 +42,8 @@ from core.crawler.workers.study import study_worker
 from core.crawler.dedup import CollectionDeduplicator
 from core.crawler.browser_launch import (
     BROWSER_LAUNCH_SEMAPHORE,
+    MAX_RETIRED_BROWSERS,
+    RETIRED_BROWSER_FORCE_CLOSE_SECONDS,
     get_default_launch_args,
     filter_launch_args,
     get_default_navigation_timeout_ms,
@@ -497,6 +499,7 @@ class GlobalWorkerPool:
         self._browser_use_count: Dict[int, int] = {}
         self._retired_browsers: Dict[int, Browser] = {}
         self._retired_browser_cleanup_tasks: set[asyncio.Task] = set()
+        self._retired_browser_force_cleanup_tasks: set[asyncio.Task] = set()
 
         self._tasks: list[asyncio.Task] = []
         self._flush_task: Optional[asyncio.Task] = None
@@ -930,6 +933,34 @@ class GlobalWorkerPool:
         self._retired_browser_cleanup_tasks.add(task)
         task.add_done_callback(self._retired_browser_cleanup_tasks.discard)
 
+    def _schedule_retired_browser_force_close(self, browser: Optional[Browser]) -> None:
+        if browser is None:
+            return
+        key = id(browser)
+
+        async def _force_close() -> None:
+            try:
+                await asyncio.sleep(RETIRED_BROWSER_FORCE_CLOSE_SECONDS)
+                retired = self._retired_browsers.pop(key, None)
+                if retired is None:
+                    return
+                logger.warning(
+                    "[PlaywrightDiag][retired_force_close] scope=global browser_id=%s lease_count=%s grace_sec=%.1f",
+                    key,
+                    self._browser_use_count.get(key, 0),
+                    RETIRED_BROWSER_FORCE_CLOSE_SECONDS,
+                )
+                self._browser_use_count.pop(key, None)
+                await self._close_browser_instance(retired)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[PlaywrightDiag] retired force-close failed | browser_id=%s err=%s", key, exc)
+
+        task = asyncio.create_task(_force_close(), name=f"global-retired-browser-force-close-{key}")
+        self._retired_browser_force_cleanup_tasks.add(task)
+        task.add_done_callback(self._retired_browser_force_cleanup_tasks.discard)
+
     async def _close_browser_instance(self, browser: Optional[Browser]) -> None:
         if browser is None:
             return
@@ -950,6 +981,25 @@ class GlobalWorkerPool:
     async def _relaunch_browser(self) -> Browser:
         async with self._relaunch_lock:
             old_browser = self._browser
+            if len(self._retired_browsers) >= MAX_RETIRED_BROWSERS:
+                retired = list(self._retired_browsers.values())
+                self._retired_browsers.clear()
+                logger.warning(
+                    "[PlaywrightDiag][retired_limit_reached] scope=global retired=%s limit=%s action=force_close_before_relaunch",
+                    len(retired),
+                    MAX_RETIRED_BROWSERS,
+                )
+                for stale_browser in retired:
+                    self._browser_use_count.pop(id(stale_browser), None)
+                    await self._close_browser_instance(stale_browser)
+            logger.warning(
+                "[PlaywrightDiag][relaunch] scope=global current_browser_id=%s connected=%s current_leases=%s retired=%s jobs=%s",
+                id(old_browser) if old_browser else None,
+                bool(old_browser and old_browser.is_connected()),
+                self._browser_use_count.get(id(old_browser), 0) if old_browser else 0,
+                len(self._retired_browsers),
+                len(self._jobs),
+            )
             try:
                 new_browser = await self._launch_browser()
             except Exception:
@@ -958,6 +1008,8 @@ class GlobalWorkerPool:
             if old_browser and old_browser is not new_browser:
                 self._retired_browsers[id(old_browser)] = old_browser
                 self._schedule_retired_browser_cleanup(old_browser)
+                if id(old_browser) in self._retired_browsers:
+                    self._schedule_retired_browser_force_close(old_browser)
             return new_browser
                     
     async def _periodic_flush(self) -> None:
@@ -1036,6 +1088,11 @@ class GlobalWorkerPool:
             pass
         finally:
             try:
+                force_cleanup_tasks = list(self._retired_browser_force_cleanup_tasks)
+                for task in force_cleanup_tasks:
+                    task.cancel()
+                if force_cleanup_tasks:
+                    await asyncio.gather(*force_cleanup_tasks, return_exceptions=True)
                 cleanup_tasks = list(self._retired_browser_cleanup_tasks)
                 if cleanup_tasks:
                     await asyncio.gather(*cleanup_tasks, return_exceptions=True)

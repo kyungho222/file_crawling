@@ -1660,8 +1660,8 @@ async def mariadb_connect(dbname=None):
                     conn = await asyncio.wait_for(pool.acquire(), timeout=acquire_timeout)
                     acquire_elapsed_ms = (time.perf_counter() - pool_acquire_started) * 1000.0
                     pool_acquire_ms += acquire_elapsed_ms
-                    if acquire_elapsed_ms >= 1000.0:
-                        logger.warning(
+                    if acquire_elapsed_ms >= 1000.0 and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
                             "[MariaDB][acquire_task_snapshot] db=%s acquire_ms=%.1f attempt=%s/2 validate=%s/%s before_pool=%s before_holders=%s tasks=%s",
                             db_name,
                             acquire_elapsed_ms,

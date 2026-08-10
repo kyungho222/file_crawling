@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 
 from config.constants import DOC_EXTENSIONS, ARCHIVE_EXTENSIONS, IMG_EXTENSIONS
 from utils.file import strip_trailing_file_size
@@ -133,9 +133,17 @@ def should_skip_attachment_at_scan(file_url: str, display_name: str = "") -> boo
             out.append(dn)
         try:
             u = unquote((file_url or "").strip())
-            path = (urlparse(u).path or "").rstrip("/")
+            parsed = urlparse(u)
+            path = (parsed.path or "").rstrip("/")
             if path:
                 out.append(os.path.basename(path))
+            # Preview handlers often end with .do, while the actual image path
+            # is carried in imgSrc/imageSrc. Treat that embedded value as the
+            # candidate filename before it can occupy a download worker.
+            if "imgpreview" in path.lower() or "imagepreview" in path.lower():
+                query = parse_qs(parsed.query or "", keep_blank_values=True)
+                for key in ("imgSrc", "imageSrc", "imgUrl", "imageUrl"):
+                    out.extend(str(value or "") for value in query.get(key, []) if value)
         except Exception:
             pass
         return out

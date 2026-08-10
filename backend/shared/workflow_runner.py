@@ -638,6 +638,12 @@ def _file_workflow_saved_learning_accounted(workflow: Any) -> bool:
     if not _is_file_mode_workflow(workflow):
         return False
     try:
+        dispatch_complete = getattr(workflow, "file_learning_request_dispatch_complete", None)
+        if callable(dispatch_complete) and bool(dispatch_complete()):
+            return True
+    except Exception:
+        pass
+    try:
         stats = workflow.get_stats() if hasattr(workflow, "get_stats") else {}
     except Exception:
         stats = {}
@@ -685,11 +691,17 @@ def _collect_background_async_tasks(workflow: Any) -> List[asyncio.Task]:
         file_learning_accounted = _file_workflow_saved_learning_accounted(workflow)
     except Exception:
         file_learning_accounted = False
+    try:
+        dedicated_file_request_dispatch = callable(
+            getattr(workflow, "file_learning_request_dispatch_complete", None)
+        )
+    except Exception:
+        dedicated_file_request_dispatch = False
     for _attr in ("_file_progress_task", "_file_worker_task"):
         try:
             _t = getattr(workflow, _attr, None)
             if isinstance(_t, asyncio.Task) and not _t.done():
-                if file_learning_accounted:
+                if file_learning_accounted or dedicated_file_request_dispatch:
                     continue
                 out.append(_t)
         except Exception:
@@ -790,9 +802,35 @@ def _file_job_queues_have_pending_work(workflow: Any) -> bool:
 
 
 def _workflow_has_pending_pipeline_work(workflow: Any) -> bool:
+    try:
+        dispatch_complete = getattr(workflow, "file_learning_request_dispatch_complete", None)
+        if callable(dispatch_complete) and not bool(dispatch_complete()):
+            return True
+    except Exception:
+        pass
     if _workflow_has_pending_background_tasks(workflow):
         return True
     return _file_job_queues_have_pending_work(workflow)
+
+
+def _file_learning_request_dispatch_pending(workflow: Any) -> bool:
+    if not _is_file_mode_workflow(workflow):
+        return False
+    try:
+        dispatch_complete = getattr(workflow, "file_learning_request_dispatch_complete", None)
+        return callable(dispatch_complete) and not bool(dispatch_complete())
+    except Exception:
+        return False
+
+
+def _file_learning_callbacks_detached(workflow: Any) -> bool:
+    if not _is_file_mode_workflow(workflow):
+        return False
+    try:
+        detached = getattr(workflow, "file_learning_callbacks_detached", None)
+        return callable(detached) and bool(detached())
+    except Exception:
+        return False
 
 
 def _file_workflow_save_stage_complete(workflow: Any) -> bool:
@@ -1350,7 +1388,15 @@ async def _cleanup_workflow_state_after_finish(
             pending_max_wait_sec = 600
         pending_max_wait_sec = max(0, min(pending_max_wait_sec, 7200))
         pending_waited_sec = 0
-        while callable(get_pending_embedding_callback_count):
+        wait_for_embedding_callback = not _file_learning_callbacks_detached(workflow)
+        if not wait_for_embedding_callback:
+            logger.info(
+                "[FileLearnRequest][callback_wait_detached] job_id=%s db=%s history_detail=%s",
+                job_id,
+                db_name,
+                history_detail,
+            )
+        while wait_for_embedding_callback and callable(get_pending_embedding_callback_count):
             try:
                 pending_embedding = int(get_pending_embedding_callback_count(job_id) or 0)
             except Exception:
@@ -2534,6 +2580,7 @@ async def run_workflow_task(
         file_frontend_complete_now = (
             _file_workflow_save_stage_complete(workflow)
             and _workflow_has_pending_pipeline_work(workflow)
+            and not _file_learning_request_dispatch_pending(workflow)
         )
         if file_frontend_complete_now:
             asyncio.create_task(
@@ -3433,9 +3480,6 @@ async def run_workflow_task(
                     delay_sec=delay_sec,
                     history_detail="auto_cleanup_after_finish_fallback",
                 )
-
-
-
 
 
 

@@ -77,6 +77,9 @@ def _file_study_debug_enabled() -> bool:
 _FILE_STUDY_INFO_EVENTS = {
     "batch_callback_received",
     "batch_callback_pg_upsert_done",
+    "callback_progress_active_log_synced",
+    "callback_progress_late_study_increment",
+    "callback_progress_late_sse_skipped",
 }
 
 
@@ -988,12 +991,27 @@ async def _sync_workflow_progress_after_callback(
         )
         workflow = None
 
+    terminal_history_statuses = {
+        "completed",
+        "ok",
+        "error",
+        "failed",
+        "stop",
+        "stopped",
+        "cancelled",
+        "interrupted",
+        "download_stop",
+        "coll_stop",
+    }
+    workflow_is_active = bool(workflow) and history_status.strip().lower() not in terminal_history_statuses
+
     _file_study_debug(
         "callback_progress_workflow_lookup",
         job_id=job_id,
         db=db_name,
         lookup_job_id=job_id,
         workflow_found=bool(workflow),
+        workflow_active=workflow_is_active,
         has_mark_study_done=bool(workflow and hasattr(workflow, "_mark_study_done")),
         registry_size=registry_size,
         registry_keys=",".join(registry_keys[:20]),
@@ -1010,7 +1028,7 @@ async def _sync_workflow_progress_after_callback(
         source_url=source_url,
     )
 
-    if workflow and hasattr(workflow, "_mark_study_done"):
+    if workflow_is_active and workflow and hasattr(workflow, "_mark_study_done"):
         try:
             count_key = None
             if hasattr(workflow, "_build_stats_counter_key"):
@@ -1079,6 +1097,32 @@ async def _sync_workflow_progress_after_callback(
                 exc,
             )
 
+    if not workflow_is_active and learning_ok:
+        # The workflow may already have sent its terminal event before an external
+        # embedding callback returns. Count this callback directly in the durable
+        # crawl log instead of relying on in-memory workflow stats.
+        try:
+            from db.crawl_db_manager import increment_crawling_log_study
+
+            increment_started = time.perf_counter()
+            incremented = await increment_crawling_log_study(job_id, dbname=db_name)
+            _file_study_debug(
+                "callback_progress_late_study_increment",
+                job_id=job_id,
+                db=db_name,
+                learn_list_id=learn_list_id,
+                incremented=incremented,
+                elapsed_ms=int((time.perf_counter() - increment_started) * 1000),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BatchEmbedding] late callback study counter update failed | job_id=%s db=%s learn_list_id=%s err=%s",
+                job_id,
+                db_name,
+                learn_list_id,
+                exc,
+            )
+
     if payload is None:
         payload = {}
         try:
@@ -1111,7 +1155,38 @@ async def _sync_workflow_progress_after_callback(
                 error=str(exc)[:240],
             )
 
-    if payload:
+    if workflow_is_active and payload:
+        # Keep the DB counter current even when the queued SSE write is delayed.
+        # status=None deliberately preserves any terminal state already recorded.
+        try:
+            from db.crawl_db_manager import update_crawling_log_counters
+
+            await update_crawling_log_counters(
+                job_id,
+                scan=payload.get("scan_count"),
+                collection=payload.get("collection_count"),
+                saved=payload.get("save_count"),
+                study=payload.get("study_count"),
+                pages=payload.get("pages"),
+                colle=payload.get("colle"),
+                dbname=db_name,
+                force=True,
+            )
+            _file_study_debug(
+                "callback_progress_active_log_synced",
+                job_id=job_id,
+                db=db_name,
+                payload_study=payload.get("study_count"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BatchEmbedding] active callback crawl log update failed | job_id=%s db=%s err=%s",
+                job_id,
+                db_name,
+                exc,
+            )
+
+    if workflow_is_active and payload:
         try:
             from backend.shared.sse_publish_queue import enqueue_sse_message
 
@@ -1141,6 +1216,16 @@ async def _sync_workflow_progress_after_callback(
                 db_name,
                 source_url,
                 exc,
+            )
+    elif payload:
+        # A late callback must not enqueue a status-less SSE event: the queue turns
+        # that into `start` and can overwrite a completed/stopped crawl state.
+        _file_study_debug(
+            "callback_progress_late_sse_skipped",
+            job_id=job_id,
+            db=db_name,
+            history_status=history_status or "missing",
+            payload_study=payload.get("study_count"),
         )
 
 
@@ -1296,7 +1381,6 @@ async def submit_crawled_url_embedding_batch(
                 len(rows),
                 exc,
             )
-
     submit_payload = {
         "type": "embedding",
         "service_name": service_name,

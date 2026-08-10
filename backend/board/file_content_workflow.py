@@ -1072,6 +1072,130 @@ class BoardContentFilePipelineMixin:
         if queue is not None:
             await queue.join()
 
+    def _file_learning_request_worker_count(self) -> int:
+        return _file_crawl_learn_concurrency_default()
+
+    async def _ensure_file_learning_request_workers(self) -> None:
+        """Run file parsing and external batch submission outside save workers."""
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if queue is None:
+            workers = self._file_learning_request_worker_count()
+            queue = asyncio.Queue(maxsize=max(2, workers * 2))
+            self._file_learning_request_queue = queue
+
+        tasks = getattr(self, "_file_learning_request_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+        alive = {task for task in tasks if isinstance(task, asyncio.Task) and not task.done()}
+        workers = self._file_learning_request_worker_count()
+        missing = max(0, workers - len(alive))
+        if missing:
+            start_index = len(alive)
+            alive.update(
+                asyncio.create_task(
+                    self._run_file_learning_request_worker(index + start_index + 1),
+                    name=f"file-learning-request-{getattr(self, 'job_id', 'unknown')}-{index + start_index + 1}",
+                )
+                for index in range(missing)
+            )
+            logger.info(
+                "[FileLearnRequest][workers_ready] job_id=%s workers=%s queue_max=%s",
+                getattr(self, "job_id", None),
+                len(alive),
+                queue.maxsize,
+            )
+        self._file_learning_request_tasks = alive
+
+    async def _enqueue_file_learning_request(self, item: Dict[str, Any]) -> None:
+        await self._ensure_file_learning_request_workers()
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if queue is None:
+            raise RuntimeError("file_learning_request_queue_unavailable")
+        await queue.put(item)
+        logger.info(
+            "[FileLearnRequest][queued] job_id=%s learn_list_id=%s file_url=%s pending=%s",
+            getattr(self, "job_id", None),
+            item.get("pre_learn_list_id"),
+            str(item.get("url") or "")[:220],
+            int(getattr(queue, "_unfinished_tasks", 0) or 0),
+        )
+
+    async def _run_file_learning_request_worker(self, worker_id: int) -> None:
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if queue is None:
+            return
+        while True:
+            item = await queue.get()
+            try:
+                if not isinstance(item, dict) or self.stop_event.is_set():
+                    continue
+                started = time.perf_counter()
+                sem = self._get_file_pipeline_learn_semaphore()
+                async with sem:
+                    await self._file_run_saved_file_learn_after_save(**item)
+                save_key = str(item.get("save_key") or "").strip()
+                outcome = self._file_study_outcome_for_key(save_key) if save_key else ""
+                if save_key and outcome == "failed":
+                    self._schedule_file_learning_retry(dict(item), attempt=0)
+                logger.info(
+                    "[FileLearnRequest][submitted] job_id=%s worker=%s learn_list_id=%s file_url=%s elapsed_ms=%s outcome=%s",
+                    getattr(self, "job_id", None),
+                    worker_id,
+                    item.get("pre_learn_list_id"),
+                    str(item.get("url") or "")[:220],
+                    int((time.perf_counter() - started) * 1000),
+                    outcome or "pending_callback",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "[FileLearnRequest][worker_failed] job_id=%s worker=%s learn_list_id=%s file_url=%s err=%s",
+                    getattr(self, "job_id", None),
+                    worker_id,
+                    item.get("pre_learn_list_id") if isinstance(item, dict) else None,
+                    str(item.get("url") or "")[:220] if isinstance(item, dict) else "",
+                    exc,
+                )
+            finally:
+                queue.task_done()
+
+    def file_learning_request_dispatch_complete(self) -> bool:
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if queue is not None and int(getattr(queue, "_unfinished_tasks", 0) or 0) > 0:
+            return False
+        retries = getattr(self, "_file_parallel_learn_tasks", set()) or set()
+        return not any(isinstance(task, asyncio.Task) and not task.done() for task in retries)
+
+    def file_learning_callbacks_detached(self) -> bool:
+        """A file crawl completes after external learning requests are accepted."""
+        return True
+
+    async def _wait_for_file_learning_request_drain(self) -> None:
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if queue is not None:
+            await queue.join()
+        retries = [
+            task
+            for task in (getattr(self, "_file_parallel_learn_tasks", set()) or set())
+            if isinstance(task, asyncio.Task) and not task.done()
+        ]
+        if retries:
+            await asyncio.gather(*retries, return_exceptions=True)
+
+    async def _stop_file_learning_request_workers(self, *, graceful: bool) -> None:
+        queue = getattr(self, "_file_learning_request_queue", None)
+        if graceful and queue is not None:
+            await self._wait_for_file_learning_request_drain()
+        tasks = list(getattr(self, "_file_learning_request_tasks", set()) or set())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._file_learning_request_tasks = set()
+        self._file_learning_request_queue = None
+
     async def _stop_file_progress_workers(self) -> None:
         tasks = set(getattr(self, "_file_progress_dispatch_tasks", set()) or set())
         tasks.update(set(getattr(self, "_file_progress_tasks", set()) or set()))
@@ -1465,6 +1589,7 @@ class BoardContentFilePipelineMixin:
                 logger.debug("[file_crawl][board][file] file pipeline started | job_id=%s", self.job_id)
             await self._ensure_file_local_finalize_workers()
             await self._ensure_file_progress_workers()
+            await self._ensure_file_learning_request_workers()
             if not getattr(self, "_file_queue_watchdog_task", None) or self._file_queue_watchdog_task.done():
                 self._file_queue_watchdog_task = asyncio.create_task(
                     self._run_file_queue_watchdog(),
@@ -4516,7 +4641,12 @@ class BoardContentFilePipelineMixin:
             self.stats["collection_count"] = int(self.stats.get("save_count", 0) or 0)
 
     async def await_background_completion(self) -> None:
-        """Wait for file background tasks before workflow_runner emits terminal Redis/SSE state."""
+        """Wait until every saved file has completed its external learning request."""
+        await self._wait_for_file_local_finalize_drain()
+        await self._wait_for_file_save_drain()
+        await self._wait_for_file_learning_request_drain()
+        if self.file_learning_request_dispatch_complete():
+            return
         try:
             stats = self.get_stats() if hasattr(self, "get_stats") else dict(getattr(self, "stats", {}) or {})
         except Exception:
@@ -4621,6 +4751,14 @@ class BoardContentFilePipelineMixin:
         except Exception:
             logger.exception(
                 "[FileCrawlTrace][save_workers_shutdown_failed] job_id=%s graceful=%s",
+                getattr(self, "job_id", None),
+                graceful,
+            )
+        try:
+            await self._stop_file_learning_request_workers(graceful=graceful)
+        except Exception:
+            logger.exception(
+                "[FileLearnRequest][workers_shutdown_failed] job_id=%s graceful=%s",
                 getattr(self, "job_id", None),
                 graceful,
             )
@@ -7355,98 +7493,19 @@ class BoardContentFilePipelineMixin:
                             )
                             continue
 
-                        sem = self._get_file_pipeline_learn_semaphore()
-                        if self._file_parallel_learn_enabled():
-                            skip_pq_task_done = True
-                            pq = save_queue
-
-                            async def _runner(
-                                _info: Dict[str, Any] = info,
-                                _url: str = url,
-                                _url_key: str = url_key,
-                                _file_path: str = file_path,
-                                _save_key: str = save_key,
-                                _file_name: str = file_name,
-                                _file_size: int = file_size,
-                                _pre_id: Optional[int] = pre_learn_list_id,
-                                _pre_extracted_text: Optional[str] = pre_extracted_text,
-                            ) -> None:
-                                try:
-                                    sem_wait_started = time.perf_counter()
-                                    async with sem:
-                                        sem_wait_sec = time.perf_counter() - sem_wait_started
-                                        if sem_wait_sec >= 1.0:
-                                            logger.warning(
-                                                "[FileLearnTrace][pipeline_slot_wait] job_id=%s wait_sec=%.3f limit=%s file_url=%s file=%s",
-                                                getattr(self, "job_id", None),
-                                                sem_wait_sec,
-                                                _file_crawl_learn_concurrency_default(),
-                                                (_url or "")[:220],
-                                                (_file_name or "")[:160],
-                                            )
-                                        await self._file_run_saved_file_learn_after_save(
-                                            info=_info,
-                                            url=_url,
-                                            url_key=_url_key,
-                                            file_path=_file_path,
-                                            save_key=_save_key,
-                                            file_name=_file_name,
-                                            file_size=_file_size,
-                                            pre_learn_list_id=_pre_id,
-                                            pre_extracted_text=_pre_extracted_text,
-                                        )
-                                        if self._file_study_outcome_for_key(_save_key) == "failed":
-                                            self._schedule_file_learning_retry(
-                                                {
-                                                    "info": _info,
-                                                    "url": _url,
-                                                    "url_key": _url_key,
-                                                    "file_path": _file_path,
-                                                    "save_key": _save_key,
-                                                    "file_name": _file_name,
-                                                    "file_size": _file_size,
-                                                    "pre_learn_list_id": _pre_id,
-                                                    "pre_extracted_text": None,
-                                                },
-                                                attempt=0,
-                                            )
-                                finally:
-                                    try:
-                                        pq.task_done()
-                                    except Exception:
-                                        pass
-
-                            _lt = asyncio.create_task(_runner())
-                            self._register_file_parallel_learn_task(_lt)
-                            continue
-
-                        async with sem:
-                            await self._file_run_saved_file_learn_after_save(
-                                info=info,
-                                url=url,
-                                url_key=url_key,
-                                file_path=file_path,
-                                save_key=save_key,
-                                file_name=file_name,
-                                file_size=file_size,
-                                pre_learn_list_id=pre_learn_list_id,
-                                pre_extracted_text=pre_extracted_text,
-                            )
-                            if self._file_study_outcome_for_key(save_key) == "failed":
-                                self._schedule_file_learning_retry(
-                                    {
-                                        "info": info,
-                                        "url": url,
-                                        "url_key": url_key,
-                                        "file_path": file_path,
-                                        "save_key": save_key,
-                                        "file_name": file_name,
-                                        "file_size": file_size,
-                                        "pre_learn_list_id": pre_learn_list_id,
-                                        "pre_extracted_text": None,
-                                    },
-                                    attempt=0,
-                                )
+                        await self._enqueue_file_learning_request(
+                            {
+                                "info": info,
+                                "url": url,
+                                "url_key": url_key,
+                                "file_path": file_path,
+                                "save_key": save_key,
+                                "file_name": file_name,
+                                "file_size": file_size,
+                                "pre_learn_list_id": pre_learn_list_id,
+                                "pre_extracted_text": pre_extracted_text,
+                            }
+                        )
                 elif evt_type == "download_deferred":
                     logger.info(
                         "[FileCrawlTrace][download_deferred_to_large_lane] job_id=%s item_job=%s url=%s post_url=%s size=%s worker=%s",

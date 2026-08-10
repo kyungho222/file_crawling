@@ -20,6 +20,11 @@ except Exception:
 _max = max(1, min(_max, 64))
 BROWSER_LAUNCH_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(_max)
 
+# A relaunch can leave an old Browser alive while an in-flight fallback releases
+# its lease. Keep one retired browser at most so Chromium processes cannot pile up.
+MAX_RETIRED_BROWSERS = 1
+RETIRED_BROWSER_FORCE_CLOSE_SECONDS = 30.0
+
 # 허용된 Chromium launch 인자만 사용 (제한 추가, Zombie 방지 포함)
 ALLOWED_CHROMIUM_LAUNCH_ARGS: frozenset = frozenset({
     "--no-sandbox",

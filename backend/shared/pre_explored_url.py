@@ -3665,7 +3665,7 @@ async def stream_asadal_urls_from_db(
     if use_url_rule_scope and isinstance(filters_obj_for_cate, dict):
         sql_rule_condition, sql_rule_meta = _build_exploration_rule_sql_condition(filters_obj_for_cate, column_name="url")
         if sql_rule_condition:
-            typed_or_matched_empty = f"(type IN ('post') OR (COALESCE(TRIM(CAST(`type` AS CHAR)), '') = '' AND ({sql_rule_condition})))"
+            typed_or_matched_empty = f"(`type` = 'post' OR ((`type` IS NULL OR `type` = '') AND ({sql_rule_condition})))"
             condition += f" AND {typed_or_matched_empty}"
             legacy_condition += f" AND {typed_or_matched_empty}"
         logger.info(

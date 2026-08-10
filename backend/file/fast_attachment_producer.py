@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from backend.board.board_meta_extractor import extract_author_info_from_html
@@ -703,6 +703,7 @@ async def run_fast_file_attachment_front(
     concurrency: int = 32,
     timeout_sec: float = 20.0,
     enqueue: bool = True,
+    prequeue_skip_check: Optional[Callable[[FastFilePostItem], Awaitable[bool] | bool]] = None,
 ) -> Dict[str, Any]:
     raw_items = [
         item
@@ -732,23 +733,28 @@ async def run_fast_file_attachment_front(
     work_queue: asyncio.Queue[Optional[FastFilePostItem]] = asyncio.Queue(
         maxsize=max(2, limit * 2)
     )
+    prequeue_check_queue: asyncio.Queue[Optional[FastFilePostItem]] = asyncio.Queue(
+        maxsize=max(2, limit * 2)
+    )
     results: List[Dict[str, Any]] = []
     counters = {
         "post_count": len(raw_items),
         "post_unique_count": len(items),
         "post_duplicate_skipped_count": source_url_duplicate_count,
+        "post_prequeue_duplicate_skipped_count": 0,
         "post_success_count": 0,
         "post_error_count": 0,
         "attachment_count": 0,
         "enqueued_count": 0,
     }
     logger.info(
-        "[file-fast][config] posts=%s unique_posts=%s duplicate_posts_skipped=%s concurrency=%s worker_queue_max=%s fetch_enqueue_delay_sec=%.3f fetch_delay_scope=per_worker enqueue=%s source_url_dedup=enabled",
+        "[file-fast][config] posts=%s unique_posts=%s duplicate_posts_skipped=%s concurrency=%s worker_queue_max=%s prequeue_dedup=%s fetch_enqueue_delay_sec=%.3f fetch_delay_scope=per_worker enqueue=%s source_url_dedup=enabled",
         len(raw_items),
         len(items),
         source_url_duplicate_count,
         limit,
         work_queue.maxsize,
+        bool(prequeue_skip_check),
         fetch_delay_sec,
         bool(enqueue),
     )
@@ -1169,6 +1175,44 @@ async def run_fast_file_attachment_front(
             finally:
                 work_queue.task_done()
 
+    async def prequeue_check_worker(worker_no: int) -> None:
+        while True:
+            item = await prequeue_check_queue.get()
+            try:
+                if item is None:
+                    return
+                should_skip = False
+                if prequeue_skip_check is not None:
+                    result = prequeue_skip_check(item)
+                    if hasattr(result, "__await__"):
+                        result = await result
+                    should_skip = bool(result)
+                if should_skip:
+                    counters["post_prequeue_duplicate_skipped_count"] += 1
+                    _log_file_url_status(
+                        stage="detail_visit",
+                        status="skipped",
+                        process_url=item.url,
+                        post_url=item.url,
+                        selected="no",
+                        saved="no",
+                        learn="not_started",
+                        reason="learned_source_duplicate",
+                        count=0,
+                        job_id=getattr(workflow, "job_id", ""),
+                        db_name=getattr(workflow, "db_name", ""),
+                    )
+                    logger.debug(
+                        "[FileStartDedup][skip] job_id=%s worker=%s post_url=%s",
+                        getattr(workflow, "job_id", ""),
+                        worker_no,
+                        item.url,
+                    )
+                    continue
+                await work_queue.put(item)
+            finally:
+                prequeue_check_queue.task_done()
+
     workers = [
         asyncio.create_task(
             worker(worker_no),
@@ -1176,16 +1220,28 @@ async def run_fast_file_attachment_front(
         )
         for worker_no in range(1, limit + 1)
     ]
+    prequeue_worker_count = min(limit, 2) if prequeue_skip_check is not None else 1
+    prequeue_workers = [
+        asyncio.create_task(
+            prequeue_check_worker(worker_no),
+            name=f"file-start-dedup-worker-{getattr(workflow, 'job_id', 'unknown')}-{worker_no}",
+        )
+        for worker_no in range(1, prequeue_worker_count + 1)
+    ]
     try:
         for item in items:
             if _workflow_stop_requested():
                 break
-            await work_queue.put(item)
+            await prequeue_check_queue.put(item)
+        await prequeue_check_queue.join()
+        for _ in prequeue_workers:
+            await prequeue_check_queue.put(None)
+        await asyncio.gather(*prequeue_workers)
         await work_queue.join()
     except BaseException:
-        for task in workers:
+        for task in [*prequeue_workers, *workers]:
             task.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*prequeue_workers, *workers, return_exceptions=True)
         raise
     else:
         for _ in workers:

@@ -468,9 +468,9 @@ def _source_extract_request_timeout_ms() -> int:
 
 def _portal_direct_http_timeout_sec() -> float:
     try:
-        v = float(os.getenv("DOWNLOAD_PORTAL_DIRECT_HTTP_TIMEOUT_SEC", "15") or "15")
+        v = float(os.getenv("DOWNLOAD_PORTAL_DIRECT_HTTP_TIMEOUT_SEC", "30") or "30")
     except Exception:
-        v = 15.0
+        v = 30.0
     return max(5.0, min(float(v), 60.0))
 
 
@@ -3878,9 +3878,9 @@ async def download_worker(
     cooldown_min_sec = max(0.0, min(cooldown_min_sec, 3600.0))
     cooldown_max_sec = max(cooldown_min_sec, min(cooldown_max_sec, 3600.0))
     try:
-        http_timeout = float(os.getenv("DOWNLOAD_HTTP_TIMEOUT_SEC", "15") or "15")
+        http_timeout = float(os.getenv("DOWNLOAD_HTTP_TIMEOUT_SEC", "30") or "30")
     except Exception:
-        http_timeout = 15.0
+        http_timeout = 30.0
     http_timeout = max(5.0, min(http_timeout, 60.0))
     try:
         http_retries = int(os.getenv("DOWNLOAD_HTTP_RETRIES", "2") or "2")
@@ -4219,7 +4219,7 @@ async def download_worker(
                 per_item_http_retries = 1
                 per_item_http_timeout = min(
                     per_item_http_timeout,
-                    max(3.0, min(_env_float("DOWNLOAD_COMPONENT_DIRECT_HTTP_TIMEOUT_SEC", 10.0), 30.0)),
+                    max(3.0, min(_env_float("DOWNLOAD_COMPONENT_DIRECT_HTTP_TIMEOUT_SEC", 30.0), 30.0)),
                 )
                 if is_suwon_component_direct:
                     # The Suwon endpoint is a direct binary route, but it intermittently stalls
@@ -4248,7 +4248,7 @@ async def download_worker(
                 )
                 per_item_http_timeout = max(
                     5.0,
-                    min(_env_float("DOWNLOAD_STATIC_DIRECT_HTTP_TIMEOUT_SEC", 15.0), 30.0),
+                    min(_env_float("DOWNLOAD_STATIC_DIRECT_HTTP_TIMEOUT_SEC", 30.0), 30.0),
                 )
                 logger.info(
                     "[Download][Worker %s] direct attachment HTTP-only policy | http_timeout=%.1fs retries=%s url=%s",
@@ -5399,20 +5399,31 @@ async def download_worker(
                                     continue
                                 if is_timeout:
                                     logger.warning(
-                                        "[Download][Worker %s] Playwright fallback timed out; retrying (attempt %s/%s) | url=%s",
+                                        "[PlaywrightDiag][fallback_timeout_reuse_browser] worker=%s attempt=%s/%s browser_connected=%s url=%s",
                                         worker_id,
                                         p_attempt,
                                         per_item_pw_attempts,
+                                        bool(current_browser and current_browser.is_connected()),
                                         url,
                                     )
-                                    if browser_relauncher:
-                                        try:
-                                            browser = await browser_relauncher()
-                                        except Exception:
-                                            pass
+                                    # A navigation/download timeout commonly means the target
+                                    # server is slow. It is not evidence that Chromium failed;
+                                    # the fallback helper closes its page/context in finally and
+                                    # the next attempt reuses the shared browser.
                                     await asyncio.sleep(0.5)
                                     continue
-                                logger.warning(f"[Download][Worker {worker_id}] Target closed during fallback, retrying (attempt {p_attempt})")
+                                logger.warning(
+                                    "[PlaywrightDiag][fallback_target_closed] job_id=%s worker=%s attempt=%s/%s "
+                                    "browser_connected=%s url=%s post_url=%s error=%s",
+                                    file_meta.get("job_id"),
+                                    worker_id,
+                                    p_attempt,
+                                    per_item_pw_attempts,
+                                    bool(current_browser and current_browser.is_connected()),
+                                    _short(url, 220),
+                                    _short(source_page, 220),
+                                    _short(last_err_msg, 360),
+                                )
                                 if browser_relauncher: # 釉뚮씪?곗? ?ъ떎???쒕룄
                                     try: browser = await browser_relauncher()
                                     except: pass
