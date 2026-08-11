@@ -562,6 +562,8 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
         self._url_to_cate_map: Dict[str, str] = {}
         self._file_job_started_monotonic = time.monotonic()
         self._file_job_summary_logged = False
+        self._file_pg_duplicate_fingerprints: Set[tuple[str, int]] = set()
+        self._file_pg_duplicate_fingerprints_loaded = False
 
     def _file_summary_int(self, stats: Dict[str, Any], *keys: str) -> int:
         for key in keys:
@@ -1949,93 +1951,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             _cu = _valid_contents_url(start_urls)
         return _cu.strip() if isinstance(_cu, str) else None
 
-    async def _prepare_learned_file_source_url_dedup(self, start_urls: Any) -> None:
-        """Load learned file source URLs once for the start-URL prequeue check."""
-        self._learned_file_source_url_keys: Set[str] = set()
-        if not isinstance(start_urls, (list, tuple)) or not start_urls:
-            return
-        if not (getattr(self, "chat_bot_id", None) and getattr(self, "db_name", None)):
-            return
-
-        try:
-            from db.mariadb_save_update import (
-                ensure_learn_list_standard_columns,
-                get_account_identifier_from_chatbot_setup,
-                get_learn_list_table_name,
-            )
-            from db.mysql_db_config import mysql_execute_query
-
-            account_identifier = await get_account_identifier_from_chatbot_setup(
-                self.chat_bot_id,
-                self.db_name,
-            )
-            learn_table = get_learn_list_table_name(account_identifier)
-            columns = await ensure_learn_list_standard_columns(self.db_name, learn_table)
-            if not columns or "source_url" not in columns or "status" not in columns:
-                logger.info(
-                    "[FileStartDedup] skipped | job_id=%s db=%s reason=missing_source_or_status_column",
-                    getattr(self, "job_id", ""),
-                    self.db_name,
-                )
-                return
-
-            if "content_type" in columns:
-                type_sql = "`content_type` = %s"
-                params: tuple[Any, ...] = ("Y", "file")
-            elif "type" in columns:
-                type_sql = "`type` = %s"
-                params = ("Y", "file")
-            else:
-                logger.info(
-                    "[FileStartDedup] skipped | job_id=%s db=%s reason=missing_file_type_column",
-                    getattr(self, "job_id", ""),
-                    self.db_name,
-                )
-                return
-
-            rows = await mysql_execute_query(
-                f"SELECT DISTINCT `source_url` FROM `{learn_table}` "
-                f"WHERE `status` = %s AND {type_sql} "
-                "AND `source_url` IS NOT NULL AND `source_url` <> ''",
-                params,
-                fetch=True,
-                dbname=self.db_name,
-                op_name=f"file_start_learned_source_url_lookup:job={getattr(self, 'job_id', '') or '-'}",
-            )
-            learned_source_keys = {
-                canonicalize_url_for_dedup(str(row.get("source_url") or "")) or ""
-                for row in (rows or [])
-                if isinstance(row, dict) and str(row.get("source_url") or "").strip()
-            }
-            learned_source_keys.discard("")
-            self._learned_file_source_url_keys = learned_source_keys
-
-            logger.info(
-                "[FileStartDedup] ready | job_id=%s db=%s start_urls=%s learned_sources=%s",
-                getattr(self, "job_id", ""),
-                self.db_name,
-                len(start_urls),
-                len(learned_source_keys),
-            )
-        except Exception as exc:
-            logger.warning(
-                "[FileStartDedup] failed open | job_id=%s db=%s err=%s",
-                getattr(self, "job_id", ""),
-                getattr(self, "db_name", ""),
-                exc,
-            )
-
-    def _is_learned_file_source_url(self, item: Any) -> bool:
-        learned_source_keys = getattr(self, "_learned_file_source_url_keys", set()) or set()
-        if not learned_source_keys:
-            return False
-        try:
-            post_url = str(getattr(item, "url", item) or "")
-            post_key = canonicalize_url_for_dedup(post_url) or post_url.strip()
-            return bool(post_key and post_key in learned_source_keys)
-        except Exception:
-            return False
-
     async def start_workflow(
         self,
         start_urls: Any = None,
@@ -2059,7 +1974,9 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
         self.file_mode = True
         self._pre_filtered_memory = filtered_memory_storage or []
         self._reset_run_state()
-        await self._prepare_learned_file_source_url_dedup(start_urls)
+        self._file_pg_duplicate_fingerprints.clear()
+        self._file_pg_duplicate_fingerprints_loaded = False
+        await self._load_file_pg_duplicate_fingerprints()
         if start_urls:
             try:
                 self.init_file_scan_count_base_from_start_urls(start_urls)
@@ -2100,17 +2017,12 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 concurrency=concurrency,
                 timeout_sec=timeout_sec,
                 enqueue=True,
-                prequeue_skip_check=self._is_learned_file_source_url,
             )
             try:
                 fast_result = self.fast_file_front_result if isinstance(self.fast_file_front_result, dict) else {}
                 fast_counters = fast_result.get("counters") if isinstance(fast_result.get("counters"), dict) else fast_result
                 fast_results = fast_result.get("results") if isinstance(fast_result.get("results"), list) else []
                 fast_post_count = int(fast_counters.get("post_count", 0) or 0)
-                fast_unique_post_count = int(fast_counters.get("post_unique_count", fast_post_count) or 0)
-                fast_prequeue_duplicate_skipped = int(
-                    fast_counters.get("post_prequeue_duplicate_skipped_count", 0) or 0
-                )
                 fast_success_count = int(fast_counters.get("post_success_count", 0) or 0)
                 fast_attachment_count = int(fast_counters.get("attachment_count", 0) or 0)
                 fast_enqueued_count = int(fast_counters.get("enqueued_count", 0) or 0)
@@ -2140,14 +2052,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                         int(self.stats.get("file_attachment_found_total_count", 0) or 0),
                         fast_attachment_count,
                     )
-                logger.info(
-                    "[FileStartDedup] completed | job_id=%s input=%s unique=%s skipped=%s collection_targets=%s",
-                    getattr(self, "job_id", ""),
-                    fast_post_count,
-                    fast_unique_post_count,
-                    fast_prequeue_duplicate_skipped,
-                    max(0, fast_unique_post_count - fast_prequeue_duplicate_skipped),
-                )
             except Exception as fast_stats_exc:
                 logger.debug(
                     "[file-fast][stats_merge_failed] job_id=%s err=%s",

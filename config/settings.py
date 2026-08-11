@@ -292,8 +292,13 @@ class Settings:
     # save_batch_queue는 기본적으로 1건씩 학습 워커에 전달되므로,
     # 학습 병목 완화의 직접적인 기본 튜닝 포인트는 STUDY_WORKERS다.
     DOWNLOAD_WORKERS: int = _env_int("DOWNLOAD_WORKERS", _env_int("FILE_CRAWL_DOWNLOAD_WORKERS", 4, max_value=16), max_value=16)
+    FILE_CRAWL_LARGE_DOWNLOAD_WORKERS: int = _env_int(
+        "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 1, max_value=16
+    )
     FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS: int = _env_int(
-        "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", DOWNLOAD_WORKERS, max_value=16
+        "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS",
+        max(1, DOWNLOAD_WORKERS - FILE_CRAWL_LARGE_DOWNLOAD_WORKERS),
+        max_value=16,
     )
     STUDY_WORKERS: int = _derived_workers("LEARNING_WORKERS", "STUDY_WORKERS", LEARNING_WORKERS)
     DOWNLOAD_MAX_CONCURRENT: int = _env_int("DOWNLOAD_MAX_CONCURRENT", _env_int("FILE_CRAWL_DOWNLOAD_MAX_CONCURRENT", 2, max_value=16), max_value=16)

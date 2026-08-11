@@ -1913,10 +1913,25 @@ async def run_workflow_task(
 
             state_payload: Dict[str, Any] = {
                 "status": "running",
+                "scan_count": scan_val,
                 "total_count": total_val,
                 "collection_count": int(stats.get("collection_count", 0) or 0),
                 "save_count": int(stats.get("save_count", 0) or 0),
+                "save_done_count": int(stats.get("save_done_count", 0) or 0),
+                "save_success_count": int(stats.get("save_success_count", 0) or 0),
+                "save_failed_count": int(stats.get("save_failed_count", 0) or 0),
                 "study_count": int(stats.get("study_count", 0) or 0),
+                "study_done_count": int(stats.get("study_done_count", 0) or 0),
+                "study_success_count": int(stats.get("study_success_count", 0) or 0),
+                "study_failed_count": int(stats.get("study_failed_count", 0) or 0),
+                "study_skipped_count": int(stats.get("study_skipped_count", 0) or 0),
+                "file_study_count": int(stats.get("file_study_count", 0) or 0),
+                "file_study_done_count": int(stats.get("file_study_done_count", 0) or 0),
+                "file_study_success_count": int(stats.get("file_study_success_count", 0) or 0),
+                "file_study_failed_count": int(stats.get("file_study_failed_count", 0) or 0),
+                "file_study_skipped_count": int(stats.get("file_study_skipped_count", 0) or 0),
+                "pending_collection_count": int(stats.get("pending_collection_count", 0) or 0),
+                "pending_save_count": int(stats.get("pending_save_count", 0) or 0),
                 "stats_revision": int(stats.get("stats_revision", 0) or 0),
                 "progress_percentage": float(stats.get("progress_percentage", 0) or 0),
                 "timestamp": datetime.now().isoformat(),
@@ -3480,7 +3495,6 @@ async def run_workflow_task(
                     delay_sec=delay_sec,
                     history_detail="auto_cleanup_after_finish_fallback",
                 )
-
 
 
 

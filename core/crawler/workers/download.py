@@ -347,6 +347,19 @@ def _large_file_threshold_bytes() -> int:
     return int(threshold_mb * 1024 * 1024)
 
 
+def _download_stream_stall_timeout_sec() -> float:
+    """Return the no-progress timeout, distinct from the item total timeout."""
+    return max(5.0, min(_env_float("DOWNLOAD_STREAM_STALL_TIMEOUT_SEC", 30.0), 180.0))
+
+
+class _DownloadStreamFailure(Exception):
+    def __init__(self, cause: BaseException, *, bytes_written: int, last_progress_at: float) -> None:
+        super().__init__(str(cause or ""))
+        self.cause = cause
+        self.bytes_written = max(0, int(bytes_written or 0))
+        self.last_progress_at = float(last_progress_at or time.monotonic())
+
+
 def _should_defer_response_to_large_lane(
     file_meta: Dict[str, Any],
     content_length: int,
@@ -361,24 +374,14 @@ def _should_defer_response_to_large_lane(
         and int(content_length or 0) >= _large_file_threshold_bytes()
     )
 
-def _download_http_request_timeout(file_meta: Dict[str, Any], base_timeout_sec: float) -> float | aiohttp.ClientTimeout:
-    """Extend total timeout only for attachments that declare a large file size."""
+def _download_http_request_timeout(file_meta: Dict[str, Any], base_timeout_sec: float) -> aiohttp.ClientTimeout:
+    """Use a no-progress read timeout while the outer item deadline caps total time."""
     base_timeout = max(1.0, min(float(base_timeout_sec), 300.0))
-    declared_size = _declared_file_size_bytes(file_meta)
-    if declared_size < _large_file_threshold_bytes():
-        return base_timeout
-
-    minimum_bps = max(
-        64 * 1024,
-        min(_env_float("DOWNLOAD_LARGE_FILE_MIN_BYTES_PER_SEC", 256 * 1024), 10 * 1024 * 1024),
-    )
-    max_total = max(60.0, min(_env_float("DOWNLOAD_LARGE_FILE_MAX_TIMEOUT_SEC", 900.0), 3600.0))
-    total_timeout = min(max_total, max(base_timeout, 30.0 + (declared_size / minimum_bps)))
     return aiohttp.ClientTimeout(
-        total=total_timeout,
+        total=None,
         connect=base_timeout,
         sock_connect=base_timeout,
-        sock_read=max(30.0, base_timeout),
+        sock_read=_download_stream_stall_timeout_sec(),
     )
 
 
@@ -404,15 +407,26 @@ async def _stream_http_response_to_file(
     head = bytearray()
     stream_chunk_size = chunk_size or _download_http_stream_chunk_size()
 
-    with open(filepath, "wb") as fh:
-        async for chunk in response.content.iter_chunked(stream_chunk_size):
-            if not chunk:
-                continue
-            if len(head) < sniff_bytes:
-                remain = sniff_bytes - len(head)
-                head.extend(chunk[:remain])
-            fh.write(chunk)
-            total += len(chunk)
+    last_progress_at = time.monotonic()
+    try:
+        with open(filepath, "wb") as fh:
+            async for chunk in response.content.iter_chunked(stream_chunk_size):
+                if not chunk:
+                    continue
+                if len(head) < sniff_bytes:
+                    remain = sniff_bytes - len(head)
+                    head.extend(chunk[:remain])
+                fh.write(chunk)
+                total += len(chunk)
+                last_progress_at = time.monotonic()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _DownloadStreamFailure(
+            exc,
+            bytes_written=total,
+            last_progress_at=last_progress_at,
+        ) from exc
 
     return total, bytes(head)
 
@@ -498,20 +512,55 @@ def _is_not_found_download_error(exc: BaseException) -> bool:
 
 
 def _is_timeout_download_error(exc: BaseException) -> bool:
-    if isinstance(exc, TimeoutError):
-        return True
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        try:
+            msg = str(current or "").strip().lower()
+        except Exception:
+            msg = ""
+        if any(token in msg for token in (
+            "timeout",
+            "timed out",
+            "download timeout",
+            "waiting for event",
+        )):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _download_transport_failure_reason(
+    exc: BaseException,
+    *,
+    phase: str,
+    bytes_written: int = 0,
+) -> str:
+    """Classify a transport failure without hiding the phase that failed."""
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ConnectionResetError, aiohttp.ClientPayloadError)):
+            return "connection_reset"
+        current = current.__cause__ or current.__context__
+
+    if _is_timeout_download_error(exc):
+        if phase == "http_response_headers_wait":
+            return "header_timeout"
+        if phase == "http_body_stream":
+            return "stream_stall_timeout" if int(bytes_written or 0) > 0 else "body_timeout"
+        return "connect_timeout"
+
     try:
-        msg = str(exc or "").strip().lower()
+        if isinstance(exc, aiohttp.ClientConnectorError):
+            return "connect_failed"
     except Exception:
-        msg = ""
-    if not msg:
-        return False
-    return (
-        "timeout" in msg
-        or "timed out" in msg
-        or "download timeout" in msg
-        or "waiting for event" in msg
-    )
+        pass
+    return "transport_exception"
 
 
 def _should_skip_portal_direct_download_event_wait(url: str) -> bool:
@@ -1742,6 +1791,29 @@ def _remove_file_quietly(filepath: str) -> None:
             os.remove(filepath)
     except Exception:
         pass
+
+
+async def _cleanup_active_download_temp_file(file_meta: Any, *, reason: str, worker_id: Any) -> None:
+    """Remove only the tracked per-attempt .part file after a terminal failure."""
+    if not isinstance(file_meta, dict):
+        return
+    filepath = str(file_meta.pop("_active_download_temp_filepath", "") or "").strip()
+    if not filepath:
+        return
+    existed = False
+    try:
+        existed = await asyncio.to_thread(os.path.exists, filepath)
+        if existed:
+            await asyncio.to_thread(_remove_file_quietly, filepath)
+        logger.info(
+            "[DownloadTrace][temp_cleanup] job_id=%s worker=%s reason=%s existed=%s path=%s",
+            file_meta.get("job_id"), worker_id, reason, existed, _short(filepath, 260),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[DownloadTrace][temp_cleanup_failed] job_id=%s worker=%s reason=%s path=%s err=%s",
+            file_meta.get("job_id"), worker_id, reason, _short(filepath, 260), exc,
+        )
 
 
 def _replace_file(src: str, dst: str) -> None:
@@ -4534,6 +4606,7 @@ async def download_worker(
                             }
                         )
                         _set_download_activity_phase(file_meta, "http_response_headers_wait")
+                        file_meta["_download_transport_phase"] = "http_response_headers_wait"
                         request_started_at = time.monotonic()
                         async with session.get(
                             safe_url,
@@ -4859,11 +4932,13 @@ async def download_worker(
                                 
                                 filepath = os.path.join(download_dir, storage_filename) # ??λ맆 ?꾩껜 寃쎈줈 ?앹꽦
                                 tmp_filepath = _download_temp_path(filepath)
+                                file_meta["_active_download_temp_filepath"] = tmp_filepath
                                 # 1以?二쇱꽍: HTTP ?ъ떆??猷⑦봽 ?댁뿉??湲곗〈???섎せ ?앹꽦???뚯씪???덉쓣 寃쎌슦留???젣??
                                 if os.path.exists(filepath):
                                     pass
 
                                 _set_download_activity_phase(file_meta, "http_body_stream")
+                                file_meta["_download_transport_phase"] = "http_body_stream"
                                 body_stream_started_at = time.monotonic()
                                 try:
                                     file_size, head = await _stream_http_response_to_file(
@@ -4871,23 +4946,58 @@ async def download_worker(
                                         tmp_filepath,
                                     )
                                 except Exception as stream_exc:
-                                    if _is_timeout_download_error(stream_exc):
-                                        file_meta["_download_empty_reason"] = (
-                                            f"http_body_timeout:{per_item_http_timeout:.1f}s"
-                                        )
+                                    bytes_written = int(getattr(stream_exc, "bytes_written", 0) or 0)
+                                    last_progress_at = float(
+                                        getattr(stream_exc, "last_progress_at", body_stream_started_at) or body_stream_started_at
+                                    )
+                                    no_progress_sec = max(0.0, time.monotonic() - last_progress_at)
+                                    failure_reason = _download_transport_failure_reason(
+                                        stream_exc,
+                                        phase="http_body_stream",
+                                        bytes_written=bytes_written,
+                                    )
+                                    await _cleanup_active_download_temp_file(
+                                        file_meta,
+                                        reason="http_stream_failed",
+                                        worker_id=worker_id,
+                                    )
+                                    file_meta["_download_empty_reason"] = (
+                                        f"{failure_reason}:bytes={bytes_written}:idle={no_progress_sec:.1f}s"
+                                    )
                                     logger.warning(
                                         "[DownloadTrace][transport_body_failed] job_id=%s worker=%s host=%s header_elapsed_sec=%.3f "
-                                        "body_elapsed_sec=%.3f url=%s post_url=%s err_type=%s err=%s err_repr=%r",
+                                        "body_elapsed_sec=%.3f failure_reason=%s bytes_written=%s no_progress_sec=%.3f "
+                                        "stall_timeout_sec=%.1f url=%s post_url=%s err_type=%s err=%s err_repr=%r",
                                         file_meta.get("job_id"),
                                         worker_id,
                                         host or "-",
                                         response_header_elapsed_sec,
                                         max(0.0, time.monotonic() - body_stream_started_at),
+                                        failure_reason,
+                                        bytes_written,
+                                        no_progress_sec,
+                                        _download_stream_stall_timeout_sec(),
                                         _short(url, 220),
                                         _short(source_page, 220),
                                         type(stream_exc).__name__,
                                         stream_exc,
                                         stream_exc,
+                                    )
+                                    await _append_download_url_trace(
+                                        {
+                                            "event": "transport_failed",
+                                            "job_id": file_meta.get("job_id"),
+                                            "worker_id": worker_id,
+                                            "worker_lane": worker_lane,
+                                            "url": url,
+                                            "post_url": source_page,
+                                            "phase": "http_body_stream",
+                                            "failure_reason": failure_reason,
+                                            "bytes_written": bytes_written,
+                                            "no_progress_sec": round(no_progress_sec, 3),
+                                            "stream_stall_timeout_sec": _download_stream_stall_timeout_sec(),
+                                            "error": _format_exception_for_log(stream_exc),
+                                        }
                                     )
                                     raise
                                 body_stream_elapsed_sec = max(0.0, time.monotonic() - body_stream_started_at)
@@ -4971,6 +5081,7 @@ async def download_worker(
                                         head=head,
                                     )
                                     await asyncio.to_thread(_replace_file, tmp_filepath, filepath)
+                                    file_meta.pop("_active_download_temp_filepath", None)
                                     # The unique temporary file was validated before the atomic replace.
                                     # A stale sibling from another attempt must not block this finalized file.
                                     file_size = await wait_for_file_ready(
@@ -5163,6 +5274,42 @@ async def download_worker(
                     except Exception as http_exc:
                         last_err_msg = _format_exception_for_log(http_exc)
                         file_meta["_download_last_error"] = last_err_msg
+                        transport_phase = str(
+                            file_meta.get("_download_transport_phase") or "http_request"
+                        )
+                        failure_reason = _download_transport_failure_reason(
+                            http_exc,
+                            phase=transport_phase,
+                            bytes_written=int(getattr(http_exc, "bytes_written", 0) or 0),
+                        )
+                        logger.warning(
+                            "[DownloadTrace][transport_request_failed] job_id=%s worker=%s lane=%s phase=%s "
+                            "failure_reason=%s attempt=%s/%s url=%s post_url=%s err=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            worker_lane,
+                            transport_phase,
+                            failure_reason,
+                            attempt,
+                            per_item_http_retries,
+                            _short(url, 220),
+                            _short(source_page, 220),
+                            _short(last_err_msg, 300),
+                        )
+                        await _append_download_url_trace(
+                            {
+                                "event": "transport_failed",
+                                "job_id": file_meta.get("job_id"),
+                                "worker_id": worker_id,
+                                "worker_lane": worker_lane,
+                                "url": url,
+                                "post_url": source_page,
+                                "phase": transport_phase,
+                                "failure_reason": failure_reason,
+                                "http_attempt": attempt,
+                                "error": last_err_msg,
+                            }
+                        )
                         if (
                             attempt >= per_item_http_retries
                             and not transient_payload_retry_extended
@@ -5181,7 +5328,7 @@ async def download_worker(
                                 _short(source_page, 220),
                                 _short(last_err_msg, 240),
                             )
-                        if attempt >= per_item_http_retries:
+                        if attempt >= per_item_http_retries and not file_meta.get("_download_empty_reason"):
                             file_meta["_download_empty_reason"] = f"http_exception:{_short(last_err_msg, 160)}"
                         log_http_exception = logger.warning
                         if browser or browser_relauncher:
@@ -5687,6 +5834,11 @@ async def download_worker(
                             if isinstance(item, dict):
                                 item["_download_empty_reason"] = reason
                                 item["_download_last_error"] = reason
+                            await _cleanup_active_download_temp_file(
+                                item_meta,
+                                reason="item_hard_timeout",
+                                worker_id=worker_id,
+                            )
                             timeout_phase = str(item_meta.get("_download_trace_phase") or "unknown")
                             timeout_phase_started_at = float(item_meta.get("_download_trace_phase_started_at") or started_at)
                             logger.warning(

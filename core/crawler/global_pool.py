@@ -839,8 +839,28 @@ class GlobalWorkerPool:
                 max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
             max_concurrent = max(1, max_concurrent)
 
-            normal_download_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
+            total_download_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4))
+            requested_large_workers = max(
+                0,
+                int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 1) or 0),
+            )
+            large_download_workers = min(requested_large_workers, max(0, total_download_workers - 1))
+            requested_normal_workers = max(
+                1,
+                int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", total_download_workers) or total_download_workers),
+            )
+            normal_download_workers = min(
+                requested_normal_workers,
+                total_download_workers - large_download_workers,
+            )
             normal_download_workers = max(1, normal_download_workers)
+            logger.info(
+                "[GlobalPool][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
+                total_download_workers,
+                normal_download_workers,
+                large_download_workers,
+                max_concurrent,
+            )
             shared_download_semaphore = asyncio.Semaphore(normal_download_workers)
             for i in range(normal_download_workers):
                 worker_lane = "normal"
@@ -856,13 +876,36 @@ class GlobalWorkerPool:
                         browser_releaser=self.release_browser,
                         worker_id=i + 1,
                         worker_lane=worker_lane,
-                        large_download_queue=None,
+                        large_download_queue=(
+                            self.large_collection_batch_queue if large_download_workers else None
+                        ),
                         browser_relauncher=self._relaunch_browser,
                         shared_download_semaphore=shared_download_semaphore,
                     ),
                     name=f"global-download-{worker_lane}-worker-{i+1}",
                 )
                 self._track_worker_task(t)
+
+            if large_download_workers:
+                large_download_semaphore = asyncio.Semaphore(large_download_workers)
+                for i in range(large_download_workers):
+                    t = asyncio.create_task(
+                        download_worker(
+                            self.large_collection_batch_queue,
+                            self.save_batch_queue,
+                            progress_queue=self.progress_queue,
+                            max_concurrent=max_concurrent,
+                            browser=self._browser,
+                            browser_getter=self.acquire_browser,
+                            browser_releaser=self.release_browser,
+                            worker_id=normal_download_workers + i + 1,
+                            worker_lane="large",
+                            browser_relauncher=self._relaunch_browser,
+                            shared_download_semaphore=large_download_semaphore,
+                        ),
+                        name=f"global-download-large-worker-{i+1}",
+                    )
+                    self._track_worker_task(t)
 
             # Start study workers (consume save_batch_queue)
             for i in range(max(1, study_workers)):

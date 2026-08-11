@@ -293,9 +293,26 @@ def _merge_monotonic(prev: Dict[str, Any], cur: Dict[str, Any]) -> Dict[str, Any
 # --- ?곗씠??紐⑤뜽 諛??곹깭 ?뺢퇋??(湲곗〈 ?좎?) ---
 class RedisSSEPayload(BaseModel):
     status: str = Field(default="running")
+    scan_count: int = 0
     total_count: int = 0
     collection_count: int = 0
     save_count: int = 0
+    save_done_count: int = 0
+    save_success_count: int = 0
+    save_failed_count: int = 0
+    study_count: int = 0
+    study_done_count: int = 0
+    study_success_count: int = 0
+    study_failed_count: int = 0
+    study_skipped_count: int = 0
+    file_study_count: int = 0
+    file_study_done_count: int = 0
+    file_study_success_count: int = 0
+    file_study_failed_count: int = 0
+    file_study_skipped_count: int = 0
+    pending_collection_count: int = 0
+    pending_save_count: int = 0
+    stats_revision: int = 0
     progress_percentage: float = 0.0
     timestamp: Optional[str] = None
 
@@ -1374,9 +1391,26 @@ def _build_payload(message: Dict[str, Any]) -> RedisSSEPayload:
     total = int(message.get("total_count", message.get("scan_count", 0)) or 0)
     return RedisSSEPayload(
         status=message.get("status", "running"),
+        scan_count=int(message.get("scan_count", total) or 0),
         total_count=total,
         collection_count=int(message.get("collection_count", 0) or 0),
         save_count=int(message.get("save_count", 0) or 0),
+        save_done_count=int(message.get("save_done_count", 0) or 0),
+        save_success_count=int(message.get("save_success_count", 0) or 0),
+        save_failed_count=int(message.get("save_failed_count", 0) or 0),
+        study_count=int(message.get("study_count", 0) or 0),
+        study_done_count=int(message.get("study_done_count", 0) or 0),
+        study_success_count=int(message.get("study_success_count", 0) or 0),
+        study_failed_count=int(message.get("study_failed_count", 0) or 0),
+        study_skipped_count=int(message.get("study_skipped_count", 0) or 0),
+        file_study_count=int(message.get("file_study_count", 0) or 0),
+        file_study_done_count=int(message.get("file_study_done_count", 0) or 0),
+        file_study_success_count=int(message.get("file_study_success_count", 0) or 0),
+        file_study_failed_count=int(message.get("file_study_failed_count", 0) or 0),
+        file_study_skipped_count=int(message.get("file_study_skipped_count", 0) or 0),
+        pending_collection_count=int(message.get("pending_collection_count", 0) or 0),
+        pending_save_count=int(message.get("pending_save_count", 0) or 0),
+        stats_revision=int(message.get("stats_revision", 0) or 0),
         progress_percentage=float(message.get("progress_percentage", 0.0) or 0.0),
         timestamp=message.get("timestamp"),
     )

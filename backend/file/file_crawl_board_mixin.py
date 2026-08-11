@@ -158,10 +158,10 @@ class FileCrawlBoardMixin:
         st = getattr(self, "stats", None)
         if not isinstance(st, dict):
             return
-        # 파일 모드의 선별은 실제 다운로드 큐 등록 시점에 완료된다.
-        # 저장 완료 수를 선별 값으로 덮으면 UI가 다운로드/저장 뒤에야 반응한다.
+        # UI 선별은 PG 중복 검사를 통과한 저장 후보만 반영한다. 큐 등록 수는
+        # file_attachment_enqueue_enqueued_total로 별도 보존한다.
         try:
-            selected = int(st.get("file_attachment_enqueue_enqueued_total", 0) or 0)
+            selected = int(st.get("file_attachment_selection_confirmed_total", 0) or 0)
         except Exception:
             selected = 0
         st["collection_count"] = max(0, selected)
@@ -182,24 +182,20 @@ class FileCrawlBoardMixin:
         # board.get_stats()는 min(save, collection)으로 save를 깎을 수 있어, 파일 크롤은
         # 선별·저장을 동일 눈금으로 맞춘 뒤 super 호출 → 마지막에 self.stats 기준으로 복구한다.
         try:
-            self.stats["collection_count"] = max(
+            confirmed_selection = max(
                 0,
-                int((self.stats or {}).get("file_attachment_enqueue_enqueued_total", 0) or 0),
+                int((self.stats or {}).get("file_attachment_selection_confirmed_total", 0) or 0),
             )
+            self.stats["collection_count"] = confirmed_selection
         except Exception:
-            pass
+            confirmed_selection = 0
         out = super().get_stats()
         raw_save = int((self.stats or {}).get("save_count", 0) or 0)
         try:
-            scan_cap = max(0, int(out.get("scan_count", out.get("total_count", 0)) or 0))
-        except Exception:
-            scan_cap = 0
-        visible_save = min(raw_save, scan_cap) if scan_cap >= 0 else raw_save
-        try:
             raw_save_succ = int((self.stats or {}).get("save_success_count", 0) or 0)
-            out["collection_count"] = visible_save
-            out["save_count"] = visible_save
-            out["save_success_count"] = min(raw_save_succ, visible_save)
+            out["collection_count"] = confirmed_selection
+            out["save_count"] = raw_save
+            out["save_success_count"] = min(raw_save_succ, raw_save)
         except Exception:
             pass
 
@@ -230,8 +226,8 @@ class FileCrawlBoardMixin:
         if "study_skip_samples" in self.stats:
             out["study_skip_samples"] = self.stats.get("study_skip_samples") or []
         try:
-            out["study_count"] = min(int(out.get("study_count", 0) or 0), visible_save)
-            out["study_done_count"] = min(int(out.get("study_done_count", 0) or 0), visible_save)
+            out["study_count"] = min(int(out.get("study_count", 0) or 0), raw_save)
+            out["study_done_count"] = min(int(out.get("study_done_count", 0) or 0), raw_save)
         except Exception:
             pass
         try:

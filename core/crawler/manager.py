@@ -275,8 +275,26 @@ class WorkerManager:
             max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
         max_concurrent = max(1, max_concurrent)
 
-        normal_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
+        total_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4))
+        requested_large_workers = max(
+            0,
+            int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 1) or 0),
+        )
+        large_workers = min(requested_large_workers, max(0, total_workers - 1))
+        requested_normal_workers = max(
+            1,
+            int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", total_workers) or total_workers),
+        )
+        normal_workers = min(requested_normal_workers, total_workers - large_workers)
         normal_workers = max(1, normal_workers)
+
+        logger.info(
+            "[WorkerManager][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
+            total_workers,
+            normal_workers,
+            large_workers,
+            max_concurrent,
+        )
         shared_download_semaphore = asyncio.Semaphore(normal_workers)
         for i in range(normal_workers):
             worker_lane = "normal"
@@ -293,12 +311,35 @@ class WorkerManager:
                     browser_relauncher=self._relaunch_browser,
                     worker_id=i + 1,
                     worker_lane=worker_lane,
-                    large_download_queue=None,
+                    large_download_queue=(
+                        self.job_queues.large_collection_batch_queue if large_workers else None
+                    ),
                     shared_download_semaphore=shared_download_semaphore,
                 )
             )
             self.download_tasks.append(t)
             self.tasks.append(t)
+
+        if large_workers:
+            large_download_semaphore = asyncio.Semaphore(large_workers)
+            for i in range(large_workers):
+                t = asyncio.create_task(
+                    download_worker(
+                        self.job_queues.large_collection_batch_queue,
+                        self.job_queues.save_batch_queue,
+                        progress_queue=self.job_queues.progress_queue,
+                        max_concurrent=max_concurrent,
+                        browser=self.browser,
+                        browser_getter=self.acquire_browser,
+                        browser_releaser=self.release_browser,
+                        browser_relauncher=self._relaunch_browser,
+                        worker_id=normal_workers + i + 1,
+                        worker_lane="large",
+                        shared_download_semaphore=large_download_semaphore,
+                    )
+                )
+                self.download_tasks.append(t)
+                self.tasks.append(t)
 
     async def _start_study_workers(self, cfg):
         """study worker 기동

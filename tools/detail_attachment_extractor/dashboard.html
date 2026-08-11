@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>첨부파일 URL 추출</title>
+  <style>
+    :root { --blue: #0969da; --line: #d0d7de; --soft: #f6f8fa; --text: #1f2328; --muted: #57606a; --danger: #cf222e; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--text); font-family: Arial, "Malgun Gothic", sans-serif; }
+    main { max-width: 1120px; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { margin: 0; font-size: 24px; } .subtitle { margin: 8px 0 24px; color: var(--muted); font-size: 14px; }
+    .form-row { display: grid; grid-template-columns: 1fr 42px; gap: 8px; align-items: end; }
+    label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    input { width: 100%; height: 38px; border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; font-size: 14px; }
+    input:focus { outline: 2px solid #b6d7ff; border-color: var(--blue); }
+    button { height: 38px; border: 0; border-radius: 5px; background: var(--blue); color: #fff; cursor: pointer; font-weight: 700; }
+    button:disabled { cursor: wait; background: #8c959f; }
+    .status { min-height: 22px; margin: 16px 0; color: var(--muted); font-size: 14px; } .status.error { color: var(--danger); }
+    .summary { display: none; grid-template-columns: 180px 1fr; gap: 12px; align-items: center; padding: 14px 0; border-block: 1px solid var(--line); }
+    .summary.visible { display: grid; } .metric strong { display: block; color: var(--blue); font-size: 23px; } .metric span, .detail-url { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+    .result-head { display: flex; justify-content: space-between; align-items: center; margin-top: 22px; } h2 { margin: 0; font-size: 17px; }
+    .copy { width: auto; padding: 0 10px; background: var(--soft); border: 1px solid var(--line); color: var(--text); font-size: 13px; }
+    table { width: 100%; margin-top: 10px; border-collapse: collapse; table-layout: fixed; } th, td { border: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; font-size: 13px; } th { background: var(--soft); color: var(--muted); } th:first-child, td:first-child { width: 50px; text-align: center; } th:nth-child(2), td:nth-child(2) { width: 26%; } th:last-child, td:last-child { width: 84px; text-align: center; } a { color: var(--blue); overflow-wrap: anywhere; } .download-link { display: inline-block; color: #fff; background: var(--blue); border-radius: 4px; padding: 5px 8px; text-decoration: none; white-space: nowrap; } .empty { padding: 28px; color: var(--muted); text-align: center; }
+    .trace { margin-top: 24px; border-top: 1px solid var(--line); } .trace h2 { margin-top: 18px; } pre { min-height: 64px; margin: 9px 0 0; padding: 12px; overflow: auto; border: 1px solid var(--line); background: var(--soft); color: var(--text); font: 12px/1.5 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    @media (max-width: 680px) { main { padding: 20px 14px; } .summary { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>첨부파일 URL 추출</h1>
+    <p class="subtitle">상세페이지에서 문서 첨부파일 링크만 확인합니다.</p>
+    <form id="extract-form"><div class="form-row">
+      <div><label for="url">상세페이지 URL</label><input id="url" type="url" required placeholder="https://example.go.kr/board/view.do?seq=1"></div>
+      <button id="submit" type="submit" title="첨부파일 URL 추출">&#x2192;</button>
+    </div></form>
+    <div id="status" class="status">상세페이지 URL을 입력하세요.</div>
+    <section id="summary" class="summary"><div class="metric"><strong id="count">0</strong><span>추출 첨부파일</span></div><div id="detail-url" class="detail-url"></div></section>
+    <div class="result-head"><h2>첨부파일 목록</h2><button id="copy" class="copy" type="button" title="결과 JSON 복사" disabled>결과 복사</button></div>
+    <table><thead><tr><th>번호</th><th>파일명</th><th>첨부파일 URL</th><th>다운로드</th></tr></thead><tbody id="results"><tr><td class="empty" colspan="4">추출 결과가 없습니다.</td></tr></tbody></table>
+    <section class="trace"><h2>요청 Payload</h2><pre id="payload">-</pre><h2>응답 Response</h2><pre id="response">-</pre></section>
+  </main>
+  <script>
+    const form = document.querySelector('#extract-form'), submit = document.querySelector('#submit'), status = document.querySelector('#status'), summary = document.querySelector('#summary'), results = document.querySelector('#results'), copy = document.querySelector('#copy'), payloadView = document.querySelector('#payload'), responseView = document.querySelector('#response');
+    let lastResult = null;
+    const escapeHtml = value => { const el = document.createElement('span'); el.textContent = String(value ?? ''); return el.innerHTML; };
+    const setStatus = (message, error = false) => { status.textContent = message; status.classList.toggle('error', error); };
+    const renderRows = attachments => { results.innerHTML = attachments.length ? attachments.map((item, index) => { const fileName = item.file_name || item.title || 'attachment'; const downloadUrl = `/api/download?url=${encodeURIComponent(item.url)}&file_name=${encodeURIComponent(fileName)}`; return `<tr><td>${index + 1}</td><td>${escapeHtml(fileName)}</td><td><a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">${escapeHtml(item.url)}</a></td><td><a class="download-link" href="${escapeHtml(downloadUrl)}">다운로드</a></td></tr>`; }).join('') : '<tr><td class="empty" colspan="4">문서 첨부파일을 찾지 못했습니다.</td></tr>'; };
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); submit.disabled = true; setStatus('상세페이지에서 첨부파일을 추출하고 있습니다.');
+      const payload = { url: form.url.value.trim() };
+      payloadView.textContent = JSON.stringify(payload, null, 2); responseView.textContent = '요청 처리 중';
+      try {
+        const response = await fetch('/api/extract', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const body = await response.json(); if (!response.ok) throw new Error(body.detail || '추출 요청에 실패했습니다.');
+        responseView.textContent = JSON.stringify({ http_status: response.status, body }, null, 2); lastResult = body; document.querySelector('#count').textContent = body.attachment_count; document.querySelector('#detail-url').textContent = body.detail_url; summary.classList.add('visible'); copy.disabled = false; renderRows(body.attachments || []); setStatus(`추출 완료: ${body.attachment_count}건`);
+      } catch (error) { responseView.textContent = JSON.stringify({ error: error.message || '추출 요청에 실패했습니다.' }, null, 2); lastResult = null; copy.disabled = true; summary.classList.remove('visible'); renderRows([]); setStatus(error.message || '추출 요청에 실패했습니다.', true); }
+      finally { submit.disabled = false; }
+    });
+    copy.addEventListener('click', async () => { if (!lastResult) return; await navigator.clipboard.writeText(JSON.stringify(lastResult, null, 2)); setStatus('결과 JSON을 복사했습니다.'); });
+  </script>
+</body>
+</html>

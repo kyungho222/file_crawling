@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -115,6 +116,86 @@ def _clip_log_value(value: Any, limit: int = 240) -> str:
     if len(text) > limit:
         return text[: max(0, limit - 3)] + "..."
     return text
+
+
+def _file_pg_duplicate_fingerprint(file_name: Any, file_size: Any) -> Optional[Tuple[str, int]]:
+    """Build a stable file identity from the original name and actual byte size."""
+    try:
+        size = int(file_size or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return None
+    try:
+        name = strip_trailing_file_size(strip_fallback_download_label(str(file_name or "")) or "")
+        name = re.sub(
+            r"\s*\(\s*\d+(?:\.\d+)?\s*(?:b|kb|mb|gb)\s*(?:,\s*[^)]*)?\)\s*$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        )
+        name = unicodedata.normalize("NFC", name).casefold()
+        # Storage names may drop whitespace and punctuation while preserving the
+        # source name elsewhere. Treat those display-only differences equally for
+        # the duplicate identity, while retaining the extension text itself.
+        name = re.sub(r"[\W_]+", "", name, flags=re.UNICODE)
+    except Exception:
+        name = ""
+    if not name:
+        return None
+    return name, size
+
+
+def _attachment_exact_file_size_bytes(attachment: Any) -> int:
+    """Read only an explicit, exact attachment byte count for pre-download skips."""
+    if not isinstance(attachment, dict):
+        return 0
+    for key in ("exact_file_size_bytes", "file_size_bytes", "byte_size"):
+        try:
+            value = str(attachment.get(key) or "").strip()
+        except Exception:
+            value = ""
+        if re.fullmatch(r"[1-9]\d{0,15}", value):
+            try:
+                return int(value)
+            except ValueError:
+                return 0
+    return 0
+
+
+def _response_content_length_bytes(headers: Any) -> int:
+    """Accept an HTTP file byte length only when it is safe to compare exactly."""
+    try:
+        if str(headers.get("content-encoding") or "").strip():
+            return 0
+        value = str(headers.get("content-length") or "").strip()
+    except Exception:
+        return 0
+    if not re.fullmatch(r"[1-9]\d{0,15}", value):
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def _response_attachment_filename(headers: Any) -> str:
+    """Extract the server filename from response headers for pre-download identity."""
+    try:
+        content_disposition = str(
+            headers.get("content-disposition") or headers.get("Content-Disposition") or ""
+        )
+    except Exception:
+        return ""
+    if not content_disposition:
+        return ""
+    match = re.search(r"filename\*\s*=\s*(?:UTF-8'')?\"?([^;\"]+)", content_disposition, re.IGNORECASE)
+    if not match:
+        match = re.search(r"filename\s*=\s*\"?([^;\"]+)", content_disposition, re.IGNORECASE)
+    if not match:
+        return ""
+    name = unquote(match.group(1).strip().strip("'\\\""))
+    return strip_file_type_display_prefix(strip_trailing_file_size(name)) or name
 
 
 def _log_file_url_status(
@@ -565,21 +646,26 @@ def _resolve_learning_title(info: Optional[Dict[str, Any]], file_path: str = "")
 def _resolve_downloaded_file_subject(info: Optional[Dict[str, Any]], file_path: str = "") -> str:
     """Resolve the final downloaded filename for DB/PG identity after file_saved."""
     candidates: List[Any] = []
-    if file_path:
-        candidates.append(os.path.basename(file_path))
     if isinstance(info, dict):
+        original_meta = info.get("original_meta") if isinstance(info.get("original_meta"), dict) else {}
         candidates.extend(
             [
+                info.get("attachment_name"),
+                info.get("display_name"),
+                original_meta.get("attachment_name"),
+                original_meta.get("display_name"),
+                info.get("original_name"),
+                original_meta.get("original_name"),
+                info.get("subject"),
+                info.get("name"),
                 info.get("saved_filename"),
                 info.get("storage_filename"),
                 os.path.basename(str(info.get("file_path") or "")),
                 os.path.basename(str(info.get("local_path") or "")),
-                info.get("subject"),
-                info.get("name"),
-                info.get("display_name"),
-                info.get("attachment_name"),
             ]
         )
+    if file_path:
+        candidates.append(os.path.basename(file_path))
     for candidate in candidates:
         text = str(candidate or "").strip()
         if not text:
@@ -1010,6 +1096,119 @@ class BoardContentFilePipelineMixin:
             workers = 2
         return max(1, min(workers, 4))
 
+    def _file_local_finalize_worker_count(self) -> int:
+        try:
+            workers = int(os.getenv("FILE_CRAWL_LOCAL_FINALIZE_WORKERS", "2") or "2")
+        except Exception:
+            workers = 2
+        return max(1, min(workers, 8))
+
+    def _trace_file_pipeline_transition(
+        self,
+        *,
+        stage: str,
+        url: str = "",
+        post_url: str = "",
+        file_name: str = "",
+        detail: str = "",
+    ) -> None:
+        """Keep a small per-job stage ledger for selected-but-unsaved diagnosis."""
+        key = str(url or "").strip() or f"unknown:{time.monotonic_ns()}"
+        now = time.monotonic()
+        ledger = getattr(self, "_file_pipeline_trace_ledger", None)
+        if not isinstance(ledger, dict):
+            ledger = {}
+            self._file_pipeline_trace_ledger = ledger
+        previous = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+        ledger[key] = {
+            "stage": stage,
+            "updated_at": now,
+            "first_seen_at": float(previous.get("first_seen_at") or now),
+            "url": str(url or previous.get("url") or "")[:220],
+            "post_url": str(post_url or previous.get("post_url") or "")[:220],
+            "file": str(file_name or previous.get("file") or "")[:160],
+            "detail": str(detail or "")[:180],
+        }
+        while len(ledger) > 80:
+            oldest_key = next(iter(ledger), None)
+            if oldest_key is None:
+                break
+            ledger.pop(oldest_key, None)
+        logger.info(
+            "[FilePipelineTrace][transition] job_id=%s from=%s to=%s url=%s post_url=%s file=%s detail=%s",
+            getattr(self, "job_id", None),
+            previous.get("stage") or "-",
+            stage,
+            str(url or "")[:220],
+            str(post_url or "")[:220],
+            str(file_name or "")[:160],
+            str(detail or "-")[:180],
+        )
+
+    def _file_pipeline_trace_summary(self) -> Dict[str, Any]:
+        ledger = getattr(self, "_file_pipeline_trace_ledger", None)
+        if not isinstance(ledger, dict):
+            return {"stages": {}, "samples": []}
+        now = time.monotonic()
+        stages: Dict[str, int] = {}
+        samples: List[Dict[str, Any]] = []
+        for value in list(ledger.values()):
+            if not isinstance(value, dict):
+                continue
+            stage = str(value.get("stage") or "unknown")
+            stages[stage] = stages.get(stage, 0) + 1
+            if len(samples) < 8:
+                samples.append({
+                    "stage": stage,
+                    "elapsed_sec": round(max(0.0, now - float(value.get("updated_at") or now)), 1),
+                    "url": value.get("url") or "",
+                    "file": value.get("file") or "",
+                    "detail": value.get("detail") or "",
+                })
+        return {"stages": stages, "samples": samples}
+
+    def _log_file_pipeline_worker_done(self, task: asyncio.Task, stage: str) -> None:
+        """Keep worker exits visible so the watchdog is not the first clue."""
+        try:
+            task_name = task.get_name()
+            if task.cancelled():
+                logger.info(
+                    "[FileCrawlTrace][worker_stopped] job_id=%s stage=%s worker=%s reason=cancelled",
+                    getattr(self, "job_id", None),
+                    stage,
+                    task_name,
+                )
+                return
+
+            error = task.exception()
+            if error is None:
+                stopped_by_request = bool(getattr(self, "stop_event", None) and self.stop_event.is_set())
+                log = logger.info if stopped_by_request else logger.warning
+                log(
+                    "[FileCrawlTrace][worker_stopped] job_id=%s stage=%s worker=%s reason=%s",
+                    getattr(self, "job_id", None),
+                    stage,
+                    task_name,
+                    "stop_requested" if stopped_by_request else "returned",
+                )
+                return
+
+            logger.error(
+                "[FileCrawlTrace][worker_stopped] job_id=%s stage=%s worker=%s reason=exception err_type=%s err=%s",
+                getattr(self, "job_id", None),
+                stage,
+                task_name,
+                type(error).__name__,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        except Exception:
+            logger.exception(
+                "[FileCrawlTrace][worker_exit_log_failed] job_id=%s stage=%s",
+                getattr(self, "job_id", None),
+                stage,
+            )
+
     async def _ensure_file_progress_workers(self) -> None:
         save_queue = getattr(self, "_file_save_queue", None)
         if save_queue is None:
@@ -1022,21 +1221,30 @@ class BoardContentFilePipelineMixin:
 
         async def _ensure_tasks(attribute: str, desired: int, factory: Any, label: str) -> Set[asyncio.Task]:
             existing = getattr(self, attribute, None)
+            is_initial_start = not isinstance(existing, set)
             if not isinstance(existing, set):
                 existing = set()
             alive = {task for task in existing if isinstance(task, asyncio.Task) and not task.done()}
             missing = max(0, desired - len(alive))
             if missing:
                 start_index = len(alive)
-                alive.update(
+                new_tasks = {
                     asyncio.create_task(
                         factory(),
                         name=f"{label}-{getattr(self, 'job_id', 'unknown')}-{start_index + index + 1}",
                     )
                     for index in range(missing)
-                )
-                logger.warning(
-                    "[FileCrawlTrace][workers_replenished] job_id=%s stage=%s desired=%s alive_before=%s started=%s",
+                }
+                for task in new_tasks:
+                    task.add_done_callback(
+                        lambda completed, worker_stage=label: self._log_file_pipeline_worker_done(completed, worker_stage)
+                    )
+                alive.update(new_tasks)
+                log = logger.info if is_initial_start else logger.warning
+                event = "workers_started" if is_initial_start else "workers_replenished"
+                log(
+                    "[FileCrawlTrace][%s] job_id=%s stage=%s desired=%s alive_before=%s started=%s",
+                    event,
                     getattr(self, "job_id", None),
                     label,
                     desired,
@@ -1079,8 +1287,11 @@ class BoardContentFilePipelineMixin:
         """Run file parsing and external batch submission outside save workers."""
         queue = getattr(self, "_file_learning_request_queue", None)
         if queue is None:
-            workers = self._file_learning_request_worker_count()
-            queue = asyncio.Queue(maxsize=max(2, workers * 2))
+            # Saving is the durable crawl boundary. Do not let slow parsing or an
+            # external embedding submission block the save worker at queue.put().
+            # The workflow finalizer still drains this queue before it reports
+            # completion, but it does not wait for the external callback.
+            queue = asyncio.Queue()
             self._file_learning_request_queue = queue
 
         tasks = getattr(self, "_file_learning_request_tasks", None)
@@ -1111,9 +1322,9 @@ class BoardContentFilePipelineMixin:
         queue = getattr(self, "_file_learning_request_queue", None)
         if queue is None:
             raise RuntimeError("file_learning_request_queue_unavailable")
-        await queue.put(item)
+        queue.put_nowait(item)
         logger.info(
-            "[FileLearnRequest][queued] job_id=%s learn_list_id=%s file_url=%s pending=%s",
+            "[FileLearnRequest][queued] job_id=%s learn_list_id=%s file_url=%s pending=%s queue_max=unbounded",
             getattr(self, "job_id", None),
             item.get("pre_learn_list_id"),
             str(item.get("url") or "")[:220],
@@ -1131,7 +1342,24 @@ class BoardContentFilePipelineMixin:
                     continue
                 started = time.perf_counter()
                 sem = self._get_file_pipeline_learn_semaphore()
+                logger.info(
+                    "[FileLearnTrace][item_taken] job_id=%s worker=%s learn_list_id=%s queue_after_take=%s file_url=%s",
+                    getattr(self, "job_id", None),
+                    worker_id,
+                    item.get("pre_learn_list_id"),
+                    queue.qsize(),
+                    str(item.get("url") or "")[:220],
+                )
+                slot_wait_started = time.perf_counter()
                 async with sem:
+                    logger.info(
+                        "[FileLearnTrace][slot_acquired] job_id=%s worker=%s learn_list_id=%s wait_ms=%s file_url=%s",
+                        getattr(self, "job_id", None),
+                        worker_id,
+                        item.get("pre_learn_list_id"),
+                        int((time.perf_counter() - slot_wait_started) * 1000),
+                        str(item.get("url") or "")[:220],
+                    )
                     await self._file_run_saved_file_learn_after_save(**item)
                 save_key = str(item.get("save_key") or "").strip()
                 outcome = self._file_study_outcome_for_key(save_key) if save_key else ""
@@ -1382,7 +1610,7 @@ class BoardContentFilePipelineMixin:
             gap = max(0, save_count - study_done_count)
             if gap < allowed_gap:
                 if pause_logged:
-                    logger.debug(
+                    logger.info(
                         "[Phase][file][learn_backpressure.resume] job_id=%s save=%s study_done=%s "
                         "study_success=%s gap=%s allowed=%s url=%s",
                         getattr(self, "job_id", None),
@@ -1397,7 +1625,7 @@ class BoardContentFilePipelineMixin:
 
             delay_sec = min(max_delay, max(base_delay, base_delay * float((gap - allowed_gap) + 1)))
             if not pause_logged:
-                logger.debug(
+                logger.info(
                     "[Phase][file][learn_backpressure.pause] job_id=%s save=%s study_done=%s "
                     "study_success=%s gap=%s allowed=%s delay_sec=%.2f url=%s",
                     getattr(self, "job_id", None),
@@ -1841,8 +2069,10 @@ class BoardContentFilePipelineMixin:
             file_url: str,
             file_name: str,
         ) -> None:
-            lane = "normal"
-            target_queue = collection_batch_queue
+            is_large = is_large_download_item(item)
+            lane = "large" if is_large else "normal"
+            target_queue = large_collection_batch_queue if is_large else collection_batch_queue
+            item["download_lane"] = lane
             before = _collection_queue_trace_snapshot(target_queue)
             started_at = time.monotonic()
             if before["full"]:
@@ -1878,6 +2108,16 @@ class BoardContentFilePipelineMixin:
             )
             try:
                 await target_queue.put(item)
+                self._trace_file_pipeline_transition(
+                    stage="download_queue_enqueued",
+                    url=file_url,
+                    post_url=post_url,
+                    file_name=file_name,
+                    detail=(
+                        f"lane={lane} declared_size_bytes="
+                        f"{item.get('declared_file_size_bytes') or 0}"
+                    ),
+                )
             finally:
                 wait_notice_task.cancel()
                 try:
@@ -1985,6 +2225,7 @@ class BoardContentFilePipelineMixin:
                     if reason and dropped_count > 0:
                         key = f"file_attachment_enqueue_drop_{reason}_total"
                         self.stats[key] = int(self.stats.get(key, 0) or 0) + dropped_count
+                    self._bump_stats_revision_locked()
             except Exception:
                 pass
 
@@ -2100,6 +2341,66 @@ class BoardContentFilePipelineMixin:
                     (file_url_key or "")[:220],
                 )
                 _count_candidate_skip("empty_url" if not file_url else "seen_url")
+                continue
+            exact_file_size = _attachment_exact_file_size_bytes(attach)
+            pg_name_exists = self._file_pg_duplicate_name_exists(file_name)
+            duplicate_compare_name = file_name
+            if not exact_file_size and pg_name_exists:
+                response_file_name, exact_file_size = await self._probe_attachment_response_metadata_before_download(
+                    file_url=file_url,
+                    post_url=post_url,
+                    file_name=file_name,
+                )
+                if response_file_name:
+                    duplicate_compare_name = response_file_name
+                if exact_file_size:
+                    attach["response_file_size_bytes"] = exact_file_size
+                    attach["_declared_file_size_bytes"] = exact_file_size
+            if exact_file_size and self._is_file_pg_duplicate(duplicate_compare_name, exact_file_size):
+                logger.info(
+                    "[FilePgDuplicate][skip] job_id=%s phase=pre_download attachment_file=%s response_file=%s size=%s post_url=%s file_url=%s",
+                    effective_job_id,
+                    (file_name or "")[:180],
+                    (duplicate_compare_name or "")[:180],
+                    exact_file_size,
+                    (post_url or "")[:220],
+                    (file_url or "")[:220],
+                )
+                try:
+                    self._record_job_result_stage(
+                        url=file_url_key or file_url,
+                        stage="file_attachment",
+                        status="skipped",
+                        reason="pg_learned_match_pre_download",
+                        source_url=post_url,
+                        file_url=file_url,
+                        file_name=file_name,
+                    )
+                except Exception:
+                    pass
+                _log_file_url_status(
+                    stage="candidate_select",
+                    status="skipped",
+                    process_url=file_url or post_url,
+                    post_url=post_url,
+                    file_url=file_url,
+                    selected="no",
+                    saved="no",
+                    learn="skipped",
+                    reason="pg_learned_match_pre_download",
+                    name=file_name,
+                    job_id=effective_job_id,
+                    db_name=getattr(self, "db_name", ""),
+                )
+                async with self._stats_lock:
+                    self.stats["file_pg_duplicate_pre_download_skip_count"] = int(
+                        self.stats.get("file_pg_duplicate_pre_download_skip_count", 0) or 0
+                    ) + 1
+                    self.stats["file_download_skipped_count"] = int(
+                        self.stats.get("file_download_skipped_count", 0) or 0
+                    ) + 1
+                    self._bump_stats_revision_locked()
+                _count_candidate_skip("pg_learned_match_pre_download")
                 continue
             # A successful LEARN_LIST save makes the attachment reusable for this
             # process-wide TTL window, including attachment-file crawl jobs.
@@ -2684,6 +2985,11 @@ class BoardContentFilePipelineMixin:
             if file_meta:
                 file_meta["declared_file_size_bytes"] = int(attach.get("_declared_file_size_bytes") or 0)
                 file_meta["download_lane"] = "normal"
+                # Queue registration is not UI selection. Count only after the
+                # save worker has the final local file identity and passes PG
+                # duplicate verification.
+                file_meta["_file_selection_counted"] = False
+                file_meta["_file_selection_pending_reason"] = "awaiting_save_verification"
             if not file_meta:
                 _track_enqueue_missing(
                     "file_meta_empty",
@@ -2781,7 +3087,7 @@ class BoardContentFilePipelineMixin:
                         process_url=file_url or post_url,
                         post_url=post_url,
                         file_url=file_url,
-                        selected="yes",
+                        selected="pending",
                         saved="pending",
                         learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                         name=file_name,
@@ -2792,7 +3098,7 @@ class BoardContentFilePipelineMixin:
                         self._record_job_result_stage(
                             url=file_url_key or file_url,
                             stage="selection",
-                            status="success",
+                            status="pending",
                             source_url=post_url,
                             file_url=file_url,
                             file_name=file_name,
@@ -2837,7 +3143,7 @@ class BoardContentFilePipelineMixin:
                     process_url=file_url or post_url,
                     post_url=post_url,
                     file_url=file_url,
-                    selected="yes",
+                    selected="pending",
                     saved="pending",
                     learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                     name=file_name,
@@ -2848,7 +3154,7 @@ class BoardContentFilePipelineMixin:
                     self._record_job_result_stage(
                         url=file_url_key or file_url,
                         stage="selection",
-                        status="success",
+                        status="pending",
                         source_url=post_url,
                         file_url=file_url,
                         file_name=file_name,
@@ -2993,6 +3299,210 @@ class BoardContentFilePipelineMixin:
         except Exception as e:
             # ignore scan entry recording errors
             logger.debug("[_record_scan_entries] scan record failed: %s", e)
+
+    async def _load_file_pg_duplicate_fingerprints(self) -> None:
+        """Load completed PG file identities once for this crawl job."""
+        if getattr(self, "_file_pg_duplicate_fingerprints_loaded", False):
+            return
+        self._file_pg_duplicate_fingerprints_loaded = True
+        self._file_pg_duplicate_fingerprints = set()
+        self._file_pg_duplicate_names = set()
+
+        job_id = str(getattr(self, "job_id", "") or "")
+        db_name = str(getattr(self, "db_name", "") or "")
+        logger.info("[FilePgDuplicate][load_begin] job_id=%s db=%s", job_id, db_name)
+        try:
+            table_name = await self._resolve_file_pg_training_table_for_source_check()
+            if not table_name or not re.fullmatch(r"td_[a-z0-9_]+_training_data", table_name):
+                logger.info(
+                    "[FilePgDuplicate][load_done] job_id=%s db=%s table=%s rows=0 fingerprints=0 reason=training_table_unavailable",
+                    job_id,
+                    db_name,
+                    table_name or "-",
+                )
+                return
+
+            from db.db_operations import execute_query as pg_execute_query
+
+            rows = await pg_execute_query(
+                f"""
+                SELECT DISTINCT
+                    COALESCE(NULLIF(content_metadata ->> 'attachment_name', ''), NULLIF(subject, '')) AS file_name,
+                    COALESCE(
+                        NULLIF(content_metadata ->> 'file_size', ''),
+                        NULLIF(content_metadata ->> 'content_size_bytes', '')
+                    ) AS file_size
+                FROM public.{table_name}
+                WHERE COALESCE(content_metadata ->> 'source_category', 'file') = 'file'
+                  AND COALESCE(
+                        NULLIF(content_metadata ->> 'file_size', ''),
+                        NULLIF(content_metadata ->> 'content_size_bytes', '')
+                  ) ~ '^[0-9]+$'
+                """,
+                fetch=True,
+                dbname=db_name,
+            )
+            fingerprints: Set[Tuple[str, int]] = set()
+            for row in rows or []:
+                data = dict(row or {})
+                fingerprint = _file_pg_duplicate_fingerprint(
+                    data.get("file_name"), data.get("file_size")
+                )
+                if fingerprint:
+                    fingerprints.add(fingerprint)
+            self._file_pg_duplicate_fingerprints = fingerprints
+            self._file_pg_duplicate_names = {name for name, _size in fingerprints}
+            logger.info(
+                "[FilePgDuplicate][load_done] job_id=%s db=%s table=%s rows=%s fingerprints=%s",
+                job_id,
+                db_name,
+                table_name,
+                len(rows or []),
+                len(fingerprints),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[FilePgDuplicate][load_failed] job_id=%s db=%s err=%s",
+                job_id,
+                db_name,
+                exc,
+            )
+
+    def _is_file_pg_duplicate(self, file_name: Any, file_size: Any) -> bool:
+        fingerprint = _file_pg_duplicate_fingerprint(file_name, file_size)
+        if not fingerprint:
+            return False
+        return fingerprint in (getattr(self, "_file_pg_duplicate_fingerprints", set()) or set())
+
+    def _file_pg_duplicate_name_exists(self, file_name: Any) -> bool:
+        """Avoid a preflight request unless PG has at least one same-name file."""
+        fingerprint = _file_pg_duplicate_fingerprint(file_name, 1)
+        if not fingerprint:
+            return False
+        return fingerprint[0] in (getattr(self, "_file_pg_duplicate_names", set()) or set())
+
+    async def _probe_attachment_response_metadata_before_download(
+        self,
+        *,
+        file_url: str,
+        post_url: str,
+        file_name: str,
+    ) -> Tuple[str, int]:
+        """Read final response filename and exact bytes without downloading its body."""
+        if not file_url:
+            return "", 0
+        try:
+            import aiohttp
+            from utils.http_client import get_aiohttp_session
+
+            timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0, sock_read=5.0)
+            headers = {
+                "Accept": "*/*",
+                "Referer": post_url or file_url,
+                "User-Agent": "Mozilla/5.0",
+            }
+            async with get_aiohttp_session(headers=headers, timeout=timeout) as session:
+                async with session.head(file_url, allow_redirects=True) as response:
+                    size = _response_content_length_bytes(response.headers)
+                    response_name = _response_attachment_filename(response.headers)
+                    logger.info(
+                        "[FilePgDuplicate][pre_download_probe] job_id=%s method=head status=%s size=%s attachment_file=%s response_file=%s url=%s",
+                        getattr(self, "job_id", None),
+                        response.status,
+                        size or "-",
+                        (file_name or "")[:180],
+                        (response_name or "-")[:180],
+                        (file_url or "")[:220],
+                    )
+                    if 200 <= response.status < 400 and size:
+                        return response_name, size
+                # Some municipal endpoints reject HEAD but accept GET. Ask only
+                # for byte zero to obtain headers for the pre-download comparison.
+                async with session.get(
+                    file_url,
+                    allow_redirects=True,
+                    headers={"Range": "bytes=0-0"},
+                ) as response:
+                    size = _response_content_length_bytes(response.headers)
+                    response_name = _response_attachment_filename(response.headers)
+                    if not size:
+                        try:
+                            content_range = str(response.headers.get("content-range") or "")
+                            size = int(content_range.rsplit("/", 1)[-1]) if "/" in content_range else 0
+                        except (TypeError, ValueError):
+                            size = 0
+                    logger.info(
+                        "[FilePgDuplicate][pre_download_probe] job_id=%s method=range_get status=%s size=%s attachment_file=%s response_file=%s url=%s",
+                        getattr(self, "job_id", None),
+                        response.status,
+                        size or "-",
+                        (file_name or "")[:180],
+                        (response_name or "-")[:180],
+                        (file_url or "")[:220],
+                    )
+                    return (response_name, size) if 200 <= response.status < 400 else ("", 0)
+        except Exception as exc:
+            logger.info(
+                "[FilePgDuplicate][pre_download_probe_failed] job_id=%s file=%s url=%s err_type=%s",
+                getattr(self, "job_id", None),
+                (file_name or "")[:180],
+                (file_url or "")[:220],
+                type(exc).__name__,
+            )
+            return "", 0
+
+    async def _confirm_file_selection_after_download(
+        self,
+        *,
+        info: Dict[str, Any],
+        url: str,
+        file_name: str,
+        file_size: int,
+    ) -> bool:
+        """Count an ambiguous candidate only after its exact identity is known."""
+        original_meta = info.get("original_meta") if isinstance(info.get("original_meta"), dict) else {}
+        if original_meta.get("_file_selection_counted"):
+            return False
+        original_meta["_file_selection_counted"] = True
+        original_meta.pop("_file_selection_pending_reason", None)
+        async with self._stats_lock:
+            self.stats["file_attachment_selection_confirmed_total"] = int(
+                self.stats.get("file_attachment_selection_confirmed_total", 0) or 0
+            ) + 1
+            self._bump_stats_revision_locked()
+        try:
+            self._record_job_result_stage(
+                url=url,
+                stage="selection",
+                status="success",
+                source_url=info.get("source_page") or info.get("source_url"),
+                file_url=url,
+                file_name=file_name,
+            )
+        except Exception:
+            pass
+        logger.info(
+            "[FilePgDuplicate][selection_confirmed] job_id=%s file=%s size=%s file_url=%s",
+            getattr(self, "job_id", None),
+            (file_name or "")[:180],
+            file_size,
+            (url or "")[:220],
+        )
+        return True
+
+    def _remember_file_pg_duplicate_fingerprint(self, file_name: Any, file_size: Any) -> None:
+        fingerprint = _file_pg_duplicate_fingerprint(file_name, file_size)
+        if fingerprint:
+            fingerprints = getattr(self, "_file_pg_duplicate_fingerprints", None)
+            if not isinstance(fingerprints, set):
+                fingerprints = set()
+                self._file_pg_duplicate_fingerprints = fingerprints
+            fingerprints.add(fingerprint)
+            names = getattr(self, "_file_pg_duplicate_names", None)
+            if not isinstance(names, set):
+                names = set()
+                self._file_pg_duplicate_names = names
+            names.add(fingerprint[0])
 
     async def _resolve_file_pg_training_table_for_source_check(self) -> str:
         if getattr(self, "_file_pg_source_check_table_resolved", False):
@@ -3161,8 +3671,10 @@ class BoardContentFilePipelineMixin:
             or ""
         ).strip()
         try:
+            attach["_exact_file_size_bytes"] = _attachment_exact_file_size_bytes(attach)
             attach["_declared_file_size_bytes"] = int(attach.get("declared_file_size_bytes") or parse_display_file_size_bytes(file_name) or 0)
         except Exception:
+            attach["_exact_file_size_bytes"] = 0
             attach["_declared_file_size_bytes"] = 0
         if file_name:
             cleaned_name = strip_file_type_display_prefix(strip_trailing_file_size(file_name))
@@ -5883,6 +6395,14 @@ class BoardContentFilePipelineMixin:
                         )
                 else:
                     t_ex0 = time.perf_counter()
+                    logger.info(
+                        "[FileLearnTrace][text_extract_begin] job_id=%s learn_list_id=%s ext=%s file_url=%s file=%s",
+                        getattr(self, "job_id", None),
+                        pre_learn_list_id,
+                        ext_hint,
+                        (url or "")[:220],
+                        file_subject[:160],
+                    )
                     logger.debug(
                         "[LearningTrace][board_file.before_extract] job_id=%s db=%s url=%s upload_path=%s",
                         getattr(self, "job_id", None),
@@ -5896,6 +6416,16 @@ class BoardContentFilePipelineMixin:
                         file_name=file_subject,
                     )
                     extract_elapsed_sec = time.perf_counter() - t_ex0
+                    logger.info(
+                        "[FileLearnTrace][text_extract_done] job_id=%s learn_list_id=%s ext=%s elapsed_ms=%s chars=%s file_url=%s file=%s",
+                        getattr(self, "job_id", None),
+                        pre_learn_list_id,
+                        ext_hint,
+                        int(extract_elapsed_sec * 1000),
+                        len((extracted_text or "").strip()),
+                        (url or "")[:220],
+                        file_subject[:160],
+                    )
                     if extract_elapsed_sec >= 3.0:
                         logger.warning(
                             "[FileLearnTrace][text_extract_slow] job_id=%s elapsed_sec=%.3f learn_list_id=%s ext=%s chars=%s file_url=%s file=%s",
@@ -6122,6 +6652,14 @@ class BoardContentFilePipelineMixin:
                         int((time.perf_counter() - t_as0) * 1000),
                     )
                 learn_pipeline_started = time.perf_counter()
+                logger.info(
+                    "[FileLearnTrace][embedding_request_begin] job_id=%s learn_list_id=%s chars=%s file_url=%s file=%s",
+                    getattr(self, "job_id", None),
+                    pre_learn_list_id,
+                    len((extracted_text or "").strip()),
+                    (url or "")[:220],
+                    file_subject[:160],
+                )
                 logger.debug(
                     "[LearningTrace][board_file.before_pipeline] job_id=%s db=%s url=%s learn_list_id=%s file=%s",
                     getattr(self, "job_id", None),
@@ -6157,6 +6695,15 @@ class BoardContentFilePipelineMixin:
                     memo_for_learning=getattr(self, "memo", ""),
                     learn_list_id=pre_learn_list_id,
                     start_time=time.monotonic(),
+                )
+                logger.info(
+                    "[FileLearnTrace][embedding_request_done] job_id=%s learn_list_id=%s elapsed_ms=%s accepted=%s pending_callback=%s file_url=%s",
+                    getattr(self, "job_id", None),
+                    pre_learn_list_id,
+                    int((time.perf_counter() - learn_pipeline_started) * 1000),
+                    learning_completed_ok,
+                    bool(file_result.get("embedding_batch_background_queued")),
+                    (url or "")[:220],
                 )
                 _log_file_study_debug(
                     self,
@@ -6483,6 +7030,18 @@ class BoardContentFilePipelineMixin:
                 for value in list(active_progress.values())[:8]
                 if isinstance(value, dict)
             ]
+        for name, queue in (
+            ("file_save", getattr(self, "_file_save_queue", None)),
+            ("local_finalize", getattr(self, "_file_local_finalize_queue", None)),
+            ("learning_request", getattr(self, "_file_learning_request_queue", None)),
+        ):
+            if queue is None:
+                continue
+            try:
+                result[f"{name}_queue"] = queue.qsize()
+                result[f"{name}_queue_unfinished"] = int(getattr(queue, "_unfinished_tasks", 0) or 0)
+            except Exception as exc:
+                result[f"{name}_queue_error"] = f"{type(exc).__name__}:{exc}"
         return result
 
     async def _run_file_queue_watchdog(self) -> None:
@@ -6508,6 +7067,7 @@ class BoardContentFilePipelineMixin:
             if queues is None:
                 return
             await self._ensure_file_progress_workers()
+            await self._ensure_file_local_finalize_workers()
             try:
                 snapshot = queues.debug_snapshot() if hasattr(queues, "debug_snapshot") else queues.snapshot()
             except Exception:
@@ -6536,6 +7096,33 @@ class BoardContentFilePipelineMixin:
                     + int(snapshot.get("large_collection_batch_queue_buffer", 0) or 0),
             )
             pending = max(0, normal_pending + large_pending)
+            selected_count = int(stats.get("file_attachment_selection_confirmed_total", 0) or 0)
+            saved_count = int(stats.get("save_count", 0) or 0)
+            if selected_count > saved_count:
+                trace_summary = self._file_pipeline_trace_summary()
+                logger.info(
+                    "[FilePipelineTrace][selection_save_gap]\n"
+                    "job_id=%s\n"
+                    "selected=%s\n"
+                    "saved=%s\n"
+                    "gap=%s\n"
+                    "download_queue_pending=%s\n"
+                    "progress_queue=%s\n"
+                    "save_queue=%s\n"
+                    "local_finalize_queue=%s\n"
+                    "stages=%s\n"
+                    "samples=%s",
+                    getattr(self, "job_id", None),
+                    selected_count,
+                    saved_count,
+                    selected_count - saved_count,
+                    pending,
+                    snapshot.get("progress_queue_unfinished", 0),
+                    snapshot.get("file_save_queue_unfinished", 0),
+                    snapshot.get("local_finalize_queue_unfinished", 0),
+                    trace_summary.get("stages"),
+                    trace_summary.get("samples"),
+                )
             if pending <= 0:
                 last_activity = None
                 last_change_at = time.monotonic()
@@ -6743,25 +7330,35 @@ class BoardContentFilePipelineMixin:
         if not isinstance(tasks, set):
             tasks = set()
         alive = {task for task in tasks if isinstance(task, asyncio.Task) and not task.done()}
-        if alive:
+        desired = self._file_local_finalize_worker_count()
+        missing = max(0, desired - len(alive))
+        if not missing:
             self._file_local_finalize_tasks = alive
             return
-        try:
-            workers = int(os.getenv("FILE_CRAWL_LOCAL_FINALIZE_WORKERS", "2") or "2")
-        except Exception:
-            workers = 2
-        workers = max(1, min(workers, 8))
-        self._file_local_finalize_tasks = {
+        is_initial_start = not tasks
+        start_index = len(alive)
+        new_tasks = {
             asyncio.create_task(
-                self._run_file_local_finalize_worker(index + 1),
-                name=f"file-local-finalize-{getattr(self, 'job_id', 'unknown')}-{index + 1}",
+                self._run_file_local_finalize_worker(start_index + index + 1),
+                name=f"file-local-finalize-{getattr(self, 'job_id', 'unknown')}-{start_index + index + 1}",
             )
-            for index in range(workers)
+            for index in range(missing)
         }
-        logger.info(
-            "[FileCrawlTrace][local_finalize_workers_started] job_id=%s workers=%s queue_max=%s",
+        for task in new_tasks:
+            task.add_done_callback(
+                lambda completed: self._log_file_pipeline_worker_done(completed, "local_finalize")
+            )
+        alive.update(new_tasks)
+        self._file_local_finalize_tasks = alive
+        log = logger.info if is_initial_start else logger.warning
+        event = "local_finalize_workers_started" if is_initial_start else "local_finalize_workers_replenished"
+        log(
+            "[FileCrawlTrace][%s] job_id=%s desired=%s alive_before=%s started=%s queue_max=%s",
+            event,
             getattr(self, "job_id", None),
-            workers,
+            desired,
+            desired - missing,
+            missing,
             queue.maxsize,
         )
 
@@ -6771,6 +7368,13 @@ class BoardContentFilePipelineMixin:
         if queue is None:
             raise RuntimeError("local finalize queue unavailable")
         await queue.put(item)
+        info = item.get("file_info") if isinstance(item, dict) and isinstance(item.get("file_info"), dict) else {}
+        self._trace_file_pipeline_transition(
+            stage="local_finalize_queue_enqueued",
+            url=str(info.get("url") or item.get("url") or ""),
+            post_url=str(info.get("source_page") or item.get("source_page") or ""),
+            file_name=str(info.get("name") or info.get("subject") or item.get("name") or ""),
+        )
 
     async def _run_file_local_finalize_worker(self, worker_id: int) -> None:
         queue = getattr(self, "_file_local_finalize_queue", None)
@@ -6817,6 +7421,13 @@ class BoardContentFilePipelineMixin:
                     event["type"] = "file_saved"
                     event["file_info"] = info
                 await self._file_job_queues.progress_queue.put(event)
+                self._trace_file_pipeline_transition(
+                    stage="local_finalize_emitted",
+                    url=file_url,
+                    post_url=post_url,
+                    file_name=str(info.get("name") or info.get("subject") or ""),
+                    detail=str(event.get("type") or ""),
+                )
                 logger.info(
                     "[FileCrawlTrace][local_finalize_done] job_id=%s worker=%s elapsed_ms=%s url=%s post_url=%s",
                     item.get("job_id"),
@@ -6900,6 +7511,14 @@ class BoardContentFilePipelineMixin:
                 return
             try:
                 await save_queue.put(item)
+                info = item.get("file_info") if isinstance(item, dict) and isinstance(item.get("file_info"), dict) else {}
+                self._trace_file_pipeline_transition(
+                    stage="save_queue_enqueued",
+                    url=str(info.get("url") or item.get("url") or ""),
+                    post_url=str(info.get("source_page") or item.get("source_page") or ""),
+                    file_name=str(info.get("name") or info.get("subject") or item.get("name") or ""),
+                    detail=str(item.get("type") or ""),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -6939,8 +7558,17 @@ class BoardContentFilePipelineMixin:
                     if self.stop_event.is_set():
                         break
                 continue
-            except Exception:
-                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "[FileCrawlTrace][save_worker_get_failed] job_id=%s worker=%s err_type=%s err=%s",
+                    getattr(self, "job_id", None),
+                    save_worker_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
 
             current_task = asyncio.current_task()
             trace_key = current_task.get_name() if current_task is not None else f"progress-{id(item)}"
@@ -6957,6 +7585,25 @@ class BoardContentFilePipelineMixin:
                 "[FileSaveTrace][item_taken] job_id=%s worker=%s event=%s url=%s queue_after_take=%s unfinished_after_take=%s",
                 getattr(self, "job_id", None), trace_key, active_progress[trace_key]["type"], active_progress[trace_key]["url"],
                 save_queue.qsize(), int(getattr(save_queue, "_unfinished_tasks", 0) or 0),
+            )
+            logger.info(
+                "[FileSaveTrace][item_payload] job_id=%s worker=%s event=%s post_url=%s file_url=%s file=%s path=%s size=%s reason=%s",
+                getattr(self, "job_id", None),
+                trace_key,
+                active_progress[trace_key]["type"],
+                (trace_info.get("source_page") or trace_info.get("source_url") or (item.get("source_page") if isinstance(item, dict) else "") or "")[:220],
+                active_progress[trace_key]["url"],
+                _content_author_debug_value(trace_info.get("name") or trace_info.get("subject") or (item.get("name") if isinstance(item, dict) else "")),
+                (str(trace_info.get("file_path") or trace_info.get("local_path") or (item.get("file_path") if isinstance(item, dict) else "") or "")[:260]),
+                trace_info.get("size") if trace_info else (item.get("size") if isinstance(item, dict) else None),
+                (trace_info.get("reason") or (item.get("reason") if isinstance(item, dict) else "") or "")[:160],
+            )
+            self._trace_file_pipeline_transition(
+                stage="save_worker_taken",
+                url=active_progress[trace_key]["url"],
+                post_url=active_progress[trace_key]["post_url"],
+                file_name=str(trace_info.get("name") or trace_info.get("subject") or ""),
+                detail=active_progress[trace_key]["type"],
             )
             skip_pq_task_done = False
             evt_type = None
@@ -7086,6 +7733,13 @@ class BoardContentFilePipelineMixin:
                                 int((time.perf_counter() - file_ready_started) * 1000),
                                 file_size,
                             )
+                            self._trace_file_pipeline_transition(
+                                stage="file_ready",
+                                url=url,
+                                post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                file_name=file_name,
+                                detail=f"size={file_size}",
+                            )
                         except Exception as exc:
                             path_ok = False
                             file_size = 0
@@ -7122,12 +7776,93 @@ class BoardContentFilePipelineMixin:
                             path_ok,
                         )
 
+                    logger.info(
+                        "[FilePersist][persist_begin] job_id=%s worker=%s db=%s post_url=%s file_url=%s file=%s size=%s path_ok=%s path=%s",
+                        getattr(self, "job_id", None),
+                        trace_key,
+                        getattr(self, "db_name", None),
+                        (info.get("source_page") or info.get("source_url") or "")[:220],
+                        (url or "")[:220],
+                        file_name,
+                        file_size,
+                        path_ok,
+                        (file_path or "")[:260],
+                    )
+
+                    if save_key and file_path and path_ok and self._is_file_pg_duplicate(file_name, file_size):
+                        logger.info(
+                            "[FilePgDuplicate][skip] job_id=%s phase=post_download file=%s size=%s post_url=%s file_url=%s",
+                            getattr(self, "job_id", None),
+                            (file_name or "")[:180],
+                            file_size,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220],
+                        )
+                        try:
+                            self._record_job_result_stage(
+                                url=save_key,
+                                stage="save",
+                                status="skipped",
+                                reason="pg_learned_match_post_download",
+                                source_url=info.get("source_page") or info.get("source_url"),
+                                file_url=url,
+                                file_name=file_name,
+                                file_path=file_path,
+                            )
+                        except Exception:
+                            pass
+                        async with self._stats_lock:
+                            self.stats["file_pg_duplicate_post_download_skip_count"] = int(
+                                self.stats.get("file_pg_duplicate_post_download_skip_count", 0) or 0
+                            ) + 1
+                            self.stats["file_download_skipped_count"] = int(
+                                self.stats.get("file_download_skipped_count", 0) or 0
+                            ) + 1
+                            self._bump_stats_revision_locked()
+                        try:
+                            self._record_job_result_stage(
+                                url=save_key,
+                                stage="selection",
+                                status="skipped",
+                                reason="pg_learned_match_post_download",
+                                source_url=info.get("source_page") or info.get("source_url"),
+                                file_url=url,
+                                file_name=file_name,
+                                file_path=file_path,
+                            )
+                        except Exception:
+                            pass
+                        await self._mark_save_skipped(url=save_key)
+                        await self._mark_study_done(url=save_key, outcome="skipped")
+                        logger.info(
+                            "[FilePersist][persist_result] job_id=%s worker=%s result=skipped reason=pg_learned_match_post_download post_url=%s file_url=%s file=%s size=%s",
+                            getattr(self, "job_id", None), trace_key,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220], file_name, file_size,
+                        )
+                        if self.progress_callback:
+                            self.progress_callback(self.get_stats())
+                        continue
+
                     if save_key and file_path and path_ok:
+                        await self._confirm_file_selection_after_download(
+                            info=info,
+                            url=save_key,
+                            file_name=file_name,
+                            file_size=file_size,
+                        )
                         throttle_sec = _file_crawl_save_throttle_seconds()
                         if throttle_sec > 0:
                             await asyncio.sleep(throttle_sec)
                         pre_extracted_text = None
                         active_progress[trace_key]["stage"] = "learn_list_ensure"
+                        self._trace_file_pipeline_transition(
+                            stage="learn_list_ensure_begin",
+                            url=url,
+                            post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                            file_name=file_name,
+                            detail=f"size={file_size}",
+                        )
                         logger.info(
                             "[FilePersist][learn_list_ensure_begin] job_id=%s db=%s enable_db_save=%s post_url=%s file_url=%s file=%s size=%s",
                             getattr(self, "job_id", None),
@@ -7175,10 +7910,26 @@ class BoardContentFilePipelineMixin:
                                 pass
                             await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
+                            logger.info(
+                                "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_ensure_timeout post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None), trace_key,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220], file_name,
+                            )
                             if self.progress_callback:
                                 self.progress_callback(self.get_stats())
                             continue
                         active_progress[trace_key]["stage"] = "learn_list_ensure_done"
+                        logger.info(
+                            "[FilePersist][learn_list_ensure_done] job_id=%s worker=%s elapsed_ms=%s row_id=%s post_url=%s file_url=%s file=%s",
+                            getattr(self, "job_id", None),
+                            trace_key,
+                            int((time.perf_counter() - t_ll0) * 1000),
+                            row_out,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220],
+                            file_name,
+                        )
                         if _file_pipeline_bottleneck_log_enabled():
                             logger.debug(
                                 "[Bottleneck][progress_loop] insert_into_learn_list(ensure) %sms row_out=%s url=%s",
@@ -7231,6 +7982,12 @@ class BoardContentFilePipelineMixin:
                                 pass
                             await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
+                            logger.info(
+                                "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_no_row post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None), trace_key,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220], file_name,
+                            )
                             if self.progress_callback:
                                 self.progress_callback(self.get_stats())
                             continue
@@ -7266,6 +8023,12 @@ class BoardContentFilePipelineMixin:
                                 pass
                             await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
+                            logger.info(
+                                "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_invalid_row_id row_id=%s post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None), trace_key, row_out,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220], file_name,
+                            )
                             if self.progress_callback:
                                 self.progress_callback(self.get_stats())
                             continue
@@ -7341,6 +8104,13 @@ class BoardContentFilePipelineMixin:
                                 pass
                             await self._mark_save_skipped(url=save_key)
                             await self._mark_study_done(url=save_key, outcome="skipped")
+                            logger.info(
+                                "[FilePersist][persist_result] job_id=%s worker=%s result=skipped reason=%s row_id=%s post_url=%s file_url=%s file=%s",
+                                getattr(self, "job_id", None), trace_key,
+                                "duplicate_reuse_learned" if duplicate_learned else "duplicate_existing", row_out,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220], file_name,
+                            )
                             if self.progress_callback:
                                 self.progress_callback(self.get_stats())
                             continue
@@ -7358,6 +8128,22 @@ class BoardContentFilePipelineMixin:
                         except Exception:
                             pass
                         await self._mark_save_done(url=save_key, ok=True)
+                        logger.info(
+                            "[FilePersist][persist_result] job_id=%s worker=%s result=saved row_id=%s post_url=%s file_url=%s file=%s size=%s",
+                            getattr(self, "job_id", None), trace_key, row_out,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220], file_name, file_size,
+                        )
+                        self._trace_file_pipeline_transition(
+                            stage="save_completed",
+                            url=url,
+                            post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                            file_name=file_name,
+                            detail=f"learn_list_id={row_out}",
+                        )
+                        # Prevent the same attachment from being learned twice within this job
+                        # while its external learning callback is still pending.
+                        self._remember_file_pg_duplicate_fingerprint(file_name, file_size)
                         _log_file_processing_trace(
                             stage="저장완료",
                             post_url=info.get("source_page") or info.get("source_url") or "",
@@ -7506,6 +8292,38 @@ class BoardContentFilePipelineMixin:
                                 "pre_extracted_text": pre_extracted_text,
                             }
                         )
+                    else:
+                        persist_reason = "file_path_unavailable" if not path_ok else "save_input_missing"
+                        terminal_save_key = save_key or url_key or url
+                        logger.error(
+                            "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=%s post_url=%s file_url=%s file=%s path=%s path_ok=%s",
+                            getattr(self, "job_id", None),
+                            trace_key,
+                            persist_reason,
+                            (info.get("source_page") or info.get("source_url") or "")[:220],
+                            (url or "")[:220],
+                            file_name,
+                            (file_path or "")[:260],
+                            path_ok,
+                        )
+                        if terminal_save_key:
+                            try:
+                                self._record_job_result_stage(
+                                    url=terminal_save_key,
+                                    stage="save",
+                                    status="failed",
+                                    reason=persist_reason,
+                                    source_url=info.get("source_page") or info.get("source_url"),
+                                    file_url=url,
+                                    file_name=file_name,
+                                    file_path=file_path,
+                                )
+                            except Exception:
+                                pass
+                            await self._mark_save_done(url=terminal_save_key, ok=False)
+                            await self._mark_study_done(url=terminal_save_key, outcome="skipped")
+                        if self.progress_callback:
+                            self.progress_callback(self.get_stats())
                 elif evt_type == "download_deferred":
                     logger.info(
                         "[FileCrawlTrace][download_deferred_to_large_lane] job_id=%s item_job=%s url=%s post_url=%s size=%s worker=%s",
