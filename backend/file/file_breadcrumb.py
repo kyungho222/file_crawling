@@ -26,6 +26,8 @@ _BREADCRUMB_SELECTORS = [
     ".page-path",
     ".pagePath",
     ".path",
+    # Gwangjin detail pages: <div class="hgroup"><p>HOME > ...</p></div>
+    ".hgroup > p",
 ]
 
 

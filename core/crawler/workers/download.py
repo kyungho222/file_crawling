@@ -741,6 +741,15 @@ def _download_domain_concurrency_limit(host: str, strict_hosts: set[str], strict
     return _download_domain_default_concurrency()
 
 
+def _download_domain_admission_wait_sec() -> float:
+    """Bound worker-held time while a per-domain slot is unavailable."""
+    try:
+        value = float(os.getenv("DOWNLOAD_DOMAIN_ADMISSION_WAIT_SEC", "0.15") or "0.15")
+    except Exception:
+        value = 0.15
+    return max(0.01, min(value, 2.0))
+
+
 def _get_download_domain_semaphore(
     host: str,
     limit: int,
@@ -4357,6 +4366,7 @@ async def download_worker(
                 host = (urlparse(str(url)).hostname or "").lower()
             except Exception:
                 host = ""
+            file_meta["_download_domain_host"] = host
             is_fail_fast_host = bool(host and any(host == h or host.endswith("." + h) for h in fail_fast_hosts))
             if is_fail_fast_host:
                 per_item_pw_attempts = min(per_item_pw_attempts, fail_fast_pw_attempts)
@@ -4397,61 +4407,40 @@ async def download_worker(
                         _short(url, 220),
                         _short(source_page, 220),
                     )
-                    if is_http_only_direct:
-                        direct_lock_timeout_sec = max(
-                            1.0,
-                            min(_env_float("DOWNLOAD_COMPONENT_DIRECT_DOMAIN_WAIT_SEC", 5.0), 30.0),
+                    admission_wait_sec = _download_domain_admission_wait_sec()
+                    try:
+                        await asyncio.wait_for(
+                            domain_sem.acquire(),
+                            timeout=admission_wait_sec,
                         )
-                        try:
-                            await asyncio.wait_for(
-                                domain_sem.acquire(),
-                                timeout=direct_lock_timeout_sec,
-                            )
-                        except asyncio.TimeoutError:
-                            reason = f"domain_slot_timeout:{direct_lock_timeout_sec:.0f}s"
-                            file_meta["_download_empty_reason"] = reason
-                            file_meta["_download_last_error"] = reason
-                            logger.warning(
-                                "[DownloadTrace][domain_lock_timeout] job_id=%s worker=%s host=%s limit=%s wait_sec=%.1f url=%s post_url=%s name=%s",
-                                file_meta.get("job_id"),
-                                worker_id,
-                                host,
-                                domain_limit,
-                                direct_lock_timeout_sec,
-                                _short(url, 220),
-                                _short(source_page, 220),
-                                _short(file_meta.get("name") or file_meta.get("subject"), 160),
-                            )
-                            try:
-                                _schedule_failed_retry(
-                                    file_meta,
-                                    reason="domain_slot_timeout",
-                                    detail=reason,
-                                )
-                            except Exception as retry_exc:
-                                logger.exception(
-                                    "[DownloadRetry] schedule_failed | job_id=%s worker=%s url=%s err=%s",
-                                    file_meta.get("job_id"),
-                                    worker_id,
-                                    _short(url, 220),
-                                    retry_exc,
-                                )
-                            await progress_queue.put(
-                                {
-                                    "type": "download_skipped",
-                                    "url": url,
-                                    "reason": "domain_slot_timeout",
-                                    "detail": reason,
-                                    "source_page": source_page,
-                                    "name": file_meta.get("name") or file_meta.get("subject"),
-                                    "worker_id": worker_id,
-                                    "job_id": file_meta.get("job_id"),
-                                }
-                            )
-                            return None
-                    else:
-                        await domain_sem.acquire()
+                    except asyncio.TimeoutError:
+                        defer_attempt = int(file_meta.get("_domain_defer_attempt", 0) or 0) + 1
+                        file_meta["_domain_defer_attempt"] = defer_attempt
+                        _set_download_activity_phase(file_meta, "domain_queue_deferred")
+                        logger.info(
+                            "[DownloadTrace][domain_deferred] job_id=%s worker=%s host=%s limit=%s wait_budget_sec=%.3f attempt=%s url=%s post_url=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            host,
+                            domain_limit,
+                            admission_wait_sec,
+                            defer_attempt,
+                            _short(url, 220),
+                            _short(source_page, 220),
+                        )
+                        # Do not wait on a domain semaphore while holding a
+                        # download worker slot.  The outer worker puts this
+                        # item back into the collection queue after a short
+                        # delay, allowing another domain to run now.
+                        return {
+                            "deferred_to_domain_queue": True,
+                            "url": url,
+                            "domain_host": host,
+                            "domain_limit": domain_limit,
+                            "domain_defer_attempt": defer_attempt,
+                        }
                     domain_lock_acquired = True
+                    file_meta.pop("_domain_defer_attempt", None)
                     _set_download_activity_phase(file_meta, "download_path_prepare")
                     logger.info(
                         "[DownloadTrace][domain_acquired] job_id=%s worker=%s host=%s limit=%s wait_sec=%.3f url=%s",
@@ -5711,6 +5700,46 @@ async def download_worker(
 
     cancelled = False
     retry_tasks: list[asyncio.Task] = []
+    domain_requeue_tasks: set[asyncio.Task] = set()
+
+    def _schedule_domain_queue_requeue(item: Dict[str, Any]) -> None:
+        """Return a domain-blocked item without consuming a download worker."""
+        attempt = max(1, int(item.get("_domain_defer_attempt", 1) or 1))
+        # Short bounded backoff prevents a same-host queue from hot-spinning,
+        # while keeping unrelated domains eligible for the next worker slot.
+        delay_sec = min(2.0, 0.15 * attempt)
+
+        async def _requeue() -> None:
+            try:
+                await asyncio.sleep(delay_sec)
+                await in_queue.put(item)
+                logger.info(
+                    "[DownloadTrace][domain_requeued] job_id=%s worker=%s host=%s attempt=%s delay_sec=%.2f url=%s",
+                    item.get("job_id"),
+                    worker_id,
+                    item.get("_download_domain_host") or (urlparse(str(item.get("url") or "")).hostname or "").lower(),
+                    attempt,
+                    delay_sec,
+                    _short(item.get("url") or item.get("_raw_url"), 220),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[DownloadTrace][domain_requeue_failed] job_id=%s worker=%s attempt=%s url=%s err=%s",
+                    item.get("job_id"),
+                    worker_id,
+                    attempt,
+                    _short(item.get("url") or item.get("_raw_url"), 220),
+                    exc,
+                )
+
+        task = asyncio.create_task(
+            _requeue(),
+            name=f"download-domain-requeue-{worker_id}-{attempt}",
+        )
+        domain_requeue_tasks.add(task)
+        task.add_done_callback(domain_requeue_tasks.discard)
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             session_for_retry = session
@@ -5795,6 +5824,8 @@ async def download_worker(
                             )
                             if result and result.get("deferred_to_large_lane"):
                                 item_meta["_url_trace_outcome"] = "deferred"
+                            elif result and result.get("deferred_to_domain_queue"):
+                                item_meta["_url_trace_outcome"] = "domain_deferred"
                             elif result:
                                 item_meta["_url_trace_outcome"] = "saved"
                                 item_meta["_url_trace_path"] = result.get("file_path") or result.get("local_path")
@@ -5974,6 +6005,10 @@ async def download_worker(
                                     terminal_outcome = "deferred"
                                     terminal_reason = "response_content_length_large"
                                     terminal_level = logging.INFO
+                                elif result and result.get("deferred_to_domain_queue"):
+                                    terminal_outcome = "domain_deferred"
+                                    terminal_reason = f"host={result.get('domain_host') or '-'} attempt={result.get('domain_defer_attempt') or 0}"
+                                    terminal_level = logging.INFO
                                 elif result:
                                     terminal_outcome = "downloaded"
                                     terminal_reason = _short(result.get("file_path") or result.get("local_path") or "", 260)
@@ -6005,7 +6040,7 @@ async def download_worker(
                                     )
                                     continue
                                 results.append(result)
-                                if result and out_queue and not result.get("defer_save_batch_until_learn_list") and not result.get("deferred_to_large_lane"):
+                                if result and out_queue and not result.get("defer_save_batch_until_learn_list") and not result.get("deferred_to_large_lane") and not result.get("deferred_to_domain_queue"):
                                     await out_queue.put(result)
                     except BaseException:
                         for task in pending_tasks:
@@ -6014,15 +6049,27 @@ async def download_worker(
                             await asyncio.gather(*pending_tasks, return_exceptions=True)
                         raise
                     try:
+                        for item, result in zip(batch_items or [], raw_results or []):
+                            if isinstance(item, dict) and isinstance(result, dict) and result.get("deferred_to_domain_queue"):
+                                _schedule_domain_queue_requeue(item)
                         deferred_count = sum(
                             1
                             for result in results
-                            if isinstance(result, dict) and result.get("deferred_to_large_lane")
+                            if isinstance(result, dict) and (
+                                result.get("deferred_to_large_lane")
+                                or result.get("deferred_to_domain_queue")
+                            )
                         )
                         ok_count = sum(
                             1
                             for result in results
-                            if result and not (isinstance(result, dict) and result.get("deferred_to_large_lane"))
+                            if result and not (
+                                isinstance(result, dict)
+                                and (
+                                    result.get("deferred_to_large_lane")
+                                    or result.get("deferred_to_domain_queue")
+                                )
+                            )
                         )
                         empty_count = max(0, len(batch_items or []) - failed_count - ok_count - deferred_count)
                         _batch_len = len(batch_items or [])
@@ -6088,14 +6135,38 @@ async def download_worker(
                         unfinished_after_done = int(getattr(raw_queue, "_unfinished_tasks", -1) or 0)
                     except Exception:
                         unfinished_after_done = -1
+                    domain_deferred_count = sum(
+                        1
+                        for result in raw_results
+                        if isinstance(result, dict) and result.get("deferred_to_domain_queue")
+                    )
+                    large_deferred_count = sum(
+                        1
+                        for result in raw_results
+                        if isinstance(result, dict) and result.get("deferred_to_large_lane")
+                    )
                     logger.info(
-                        "[FileCrawlTrace][queue_batch_done] worker=%s lane=%s job_ids=%s batch_size=%s downloaded=%s skipped=%s exceptions=%s "
+                        "[FileCrawlTrace][queue_batch_done] worker=%s lane=%s job_ids=%s batch_size=%s downloaded=%s domain_deferred=%s large_deferred=%s skipped=%s exceptions=%s "
                         "queued_after_done=%s unfinished_after_done=%s",
                         worker_id,
                         worker_lane,
                         sorted({str((item or {}).get("job_id") or "") for item in batch_items if isinstance(item, dict)}),
                         len(batch_items or []),
-                        sum(1 for result in raw_results if result and not isinstance(result, Exception)),
+                        sum(
+                            1
+                            for result in raw_results
+                            if result
+                            and not isinstance(result, Exception)
+                            and not (
+                                isinstance(result, dict)
+                                and (
+                                    result.get("deferred_to_domain_queue")
+                                    or result.get("deferred_to_large_lane")
+                                )
+                            )
+                        ),
+                        domain_deferred_count,
+                        large_deferred_count,
                         sum(1 for result in raw_results if result is None),
                         sum(1 for result in raw_results if isinstance(result, Exception)),
                         queued_after_done,
@@ -6108,6 +6179,16 @@ async def download_worker(
                     logger.error(f"[Download] Error: {e}")
                     in_queue.task_done()
     finally:
+        for task in tuple(domain_requeue_tasks):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        if domain_requeue_tasks:
+            try:
+                await asyncio.gather(*domain_requeue_tasks, return_exceptions=True)
+            except Exception:
+                pass
         for task in retry_tasks:
             try:
                 task.cancel()

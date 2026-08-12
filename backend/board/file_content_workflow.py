@@ -4114,6 +4114,8 @@ class BoardContentFilePipelineMixin:
         new_cate1: Optional[str],
         new_cate2: Optional[str],
         author_meta: Optional[Dict[str, Any]] = None,
+        emit_progress: bool = True,
+        notify_scan: bool = True,
     ) -> bool:
         """Resolve an existing LEARN_LIST duplicate row for file crawling.
 
@@ -4240,18 +4242,27 @@ class BoardContentFilePipelineMixin:
                 db_id,
                 (post_url or "")[:120],
             )
-            async with self._stats_lock:
-                self.stats["save_update_count"] = (
-                    int(self.stats.get("save_update_count", 0) or 0) + 1
-                )
-            if self.progress_callback:
-                self.progress_callback(self.get_stats())
-            await self._notify_file_dup_scan(
-                post_url,
+            if emit_progress:
+                async with self._stats_lock:
+                    self.stats["save_update_count"] = (
+                        int(self.stats.get("save_update_count", 0) or 0) + 1
+                    )
+                if self.progress_callback:
+                    self.progress_callback(self.get_stats())
+            logger.info(
+                "[FileCateBackfill][duplicate_row_updated] job_id=%s row_id=%s post_url=%s emit_progress=%s",
                 effective_job_id,
-                reason="duplicated_in_db_cate_updated",
+                db_id,
+                (post_url or "")[:220],
+                emit_progress,
             )
-        else:
+            if notify_scan:
+                await self._notify_file_dup_scan(
+                    post_url,
+                    effective_job_id,
+                    reason="duplicated_in_db_cate_updated",
+                )
+        elif notify_scan:
             await self._notify_file_dup_scan(post_url, effective_job_id)
         return True
 
@@ -5656,6 +5667,11 @@ class BoardContentFilePipelineMixin:
                     except (TypeError, ValueError):
                         parsed_cached_id = 0
                     if parsed_cached_id > 0:
+                        if str(cached[1] or "").strip().upper() == "Y":
+                            # The first matching learned duplicate performed
+                            # its category-only backfill.  Subsequent matches
+                            # in the same job must remain a no-progress skip.
+                            return parsed_cached_id, True, str(cached[1] or "")
                         updated_row_id = await _insert_file_row(
                             existing_row_id=parsed_cached_id,
                         )
@@ -5671,10 +5687,18 @@ class BoardContentFilePipelineMixin:
                     )
                     learn_table = get_learn_list_table_name(account_identifier)
                     info["_learn_list_table_name"] = learn_table
+                    duplicate_select_columns = ["`id`", "`status`"]
+                    duplicate_columns = await ensure_learn_list_standard_columns(
+                        str(dbn), learn_table
+                    )
+                    if "cate1" in duplicate_columns:
+                        duplicate_select_columns.append("`cate1`")
+                    if "cate2" in duplicate_columns:
+                        duplicate_select_columns.append("`cate2`")
                     duplicate_rows = await asyncio.wait_for(
                         mysql_execute_query(
                             f"""
-                            SELECT `id`, `status`
+                            SELECT {', '.join(duplicate_select_columns)}
                             FROM `{learn_table}`
                             WHERE `subject` = %s
                               AND `size` = %s
@@ -5722,6 +5746,31 @@ class BoardContentFilePipelineMixin:
                         except (TypeError, ValueError):
                             parsed_duplicate_id = 0
                         if parsed_duplicate_id > 0:
+                            if str(duplicate_status or "").strip().upper() == "Y":
+                                # A learned duplicate must not be treated as a
+                                # newly saved/learned item.  Only fill missing
+                                # category metadata on the matched row and do
+                                # not emit Redis/SSE progress for this path.
+                                await self._resolve_file_learn_list_duplicate_row(
+                                    row=duplicate_row if isinstance(duplicate_row, dict) else {},
+                                    learn_table=learn_table,
+                                    post_url=str(file_info.get("source_url") or info.get("source_page") or info.get("source_url") or ""),
+                                    effective_job_id=str(getattr(self, "job_id", "") or ""),
+                                    new_cate1=str(file_info.get("cate1") or ""),
+                                    new_cate2=str(file_info.get("cate2") or ""),
+                                    author_meta=file_info,
+                                    emit_progress=False,
+                                    notify_scan=False,
+                                )
+                                logger.info(
+                                    "[FileCateBackfill][learned_duplicate_skip] job_id=%s row_id=%s file=%s size=%s file_url=%s",
+                                    getattr(self, "job_id", None),
+                                    parsed_duplicate_id,
+                                    str(file_name or "")[:160],
+                                    size_for_duplicate,
+                                    str(url or "")[:220],
+                                )
+                                return parsed_duplicate_id, True, str(duplicate_status or "")
                             updated_row_id = await _insert_file_row(
                                 existing_row_id=parsed_duplicate_id,
                             )
@@ -8076,7 +8125,7 @@ class BoardContentFilePipelineMixin:
                             duplicate_existing
                             and str(info.get("learn_list_existing_status") or "").strip().upper() == "Y"
                         )
-                        if duplicate_existing:
+                        if duplicate_existing and not duplicate_learned:
                             # A same-name/same-size LEARN_LIST row is an
                             # identity match, not a terminal skip.  Continue
                             # through the learning request so PG's
@@ -8095,65 +8144,19 @@ class BoardContentFilePipelineMixin:
                             info["learn_list_reused_learned"] = False
                             duplicate_existing = False
                             duplicate_learned = False
-                        if duplicate_existing:
-                            _log_file_url_status(
-                                stage="learn_list_persist",
-                                status="duplicate_reuse",
-                                process_url=url,
-                                post_url=info.get("source_page") or info.get("source_url") or "",
-                                file_url=url,
-                                selected="yes",
-                                saved="skipped",
-                                learn="skipped",
-                                reason="duplicate_reuse_learned" if duplicate_learned else "duplicate_existing",
-                                name=file_name,
-                                learn_list_id=row_out,
-                                job_id=getattr(self, "job_id", ""),
-                                db_name=getattr(self, "db_name", ""),
-                            )
-                            logger.debug(
-                                "[Duplicate][file] existing LEARN_LIST row detected after save; skip save/study counters and do not relearn existing row | job_id=%s url=%s learn_list_id=%s status=%s reused_learned=%s",
+                        if duplicate_existing and duplicate_learned:
+                            # Category-only backfill of a learned duplicate is
+                            # not a new save or learning result.  Do not touch
+                            # counters, stats revision, or progress_callback;
+                            # otherwise Redis would report work that was only
+                            # metadata repair on an existing row.
+                            logger.info(
+                                "[FileCateBackfill][learned_duplicate_no_progress] job_id=%s url=%s learn_list_id=%s status=%s",
                                 getattr(self, "job_id", None),
                                 (url or "")[:180],
                                 row_out,
                                 info.get("learn_list_existing_status"),
-                                duplicate_learned,
                             )
-                            try:
-                                await self._record_study_skip(
-                                    reason="duplicate_reuse_learned",
-                                    url=url,
-                                    learn_list_id=row_out,
-                                    status=info.get("learn_list_existing_status"),
-                                    detail="existing LEARN_LIST row matched; normal crawl does not modify or relearn existing duplicate rows",
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                self._record_job_result_stage(
-                                    url=save_key,
-                                    stage="save",
-                                    status="skipped",
-                                    reason="duplicate_reuse_learned",
-                                    source_url=info.get("source_page") or info.get("source_url"),
-                                    file_url=url,
-                                    file_name=file_name,
-                                    file_path=file_path,
-                                    db_id=row_out,
-                                )
-                            except Exception:
-                                pass
-                            await self._mark_save_skipped(url=save_key)
-                            await self._mark_study_done(url=save_key, outcome="skipped")
-                            logger.info(
-                                "[FilePersist][persist_result] job_id=%s worker=%s result=skipped reason=%s row_id=%s post_url=%s file_url=%s file=%s",
-                                getattr(self, "job_id", None), trace_key,
-                                "duplicate_reuse_learned" if duplicate_learned else "duplicate_existing", row_out,
-                                (info.get("source_page") or info.get("source_url") or "")[:220],
-                                (url or "")[:220], file_name,
-                            )
-                            if self.progress_callback:
-                                self.progress_callback(self.get_stats())
                             continue
                         try:
                             self._record_job_result_stage(
