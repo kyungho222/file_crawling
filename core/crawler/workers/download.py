@@ -36,7 +36,6 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(o
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from uuid import uuid4
 from config.settings import settings, get_uploaded_files_local_dir, normalize_access_url, get_storage_domain_for_db_name, get_file_upload_content_url, get_fileupload_root
 from config.constants import DOC_EXTENSIONS
 from utils.file import parse_display_file_size_bytes, sanitize_filename, make_safe_storage_filename
@@ -52,6 +51,12 @@ from utils.url import canonicalize_url_for_dedup, extract_download_url_from_js
 from utils.attachment_url_normalize import extract_attachment_key_candidates
 from backend.shared.completed_url_ttl_cache import completed_url_cached
 from utils.download_integrity import is_partial_download_path, wait_for_file_ready
+from core.crawler.workers.download_storage import (
+    download_final_ready_timeout_sec as _download_final_ready_timeout_sec,
+    download_temp_ready_timeout_sec as _download_temp_ready_timeout_sec,
+    make_download_temp_path as _download_temp_path,
+    write_download_bytes as _write_bytes,
+)
 from backend.board.anseong_file import (
     extract_anseong_attachment_key_candidates,
     resolve_anseong_yhlib_download_url,
@@ -1739,34 +1744,6 @@ def _progress_queue_websync_failed_payload(
         "public_status": public_status,
         "worker_id": worker_id,
     }
-def _write_bytes(filepath: str, data: bytes) -> None:
-    """Synchronous file write helper used through asyncio.to_thread."""
-    # Ensure parent directory exists
-    dirpath = os.path.dirname(filepath)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
-    with open(filepath, "wb") as fh:
-        fh.write(data)
-
-
-def _download_temp_path(filepath: str) -> str:
-    return f"{filepath}.part-{uuid4().hex}"
-
-
-def _download_temp_ready_timeout_sec() -> float:
-    try:
-        value = float(os.getenv("DOWNLOAD_TEMP_READY_TIMEOUT_SEC", "60") or "60")
-    except Exception:
-        value = 60.0
-    return max(10.0, min(value, 300.0))
-
-
-def _download_final_ready_timeout_sec() -> float:
-    try:
-        value = float(os.getenv("DOWNLOAD_FINAL_READY_TIMEOUT_SEC", "60") or "60")
-    except Exception:
-        value = 60.0
-    return max(10.0, min(value, 300.0))
 
 
 def _strip_partial_download_suffix(filename: str) -> str:
@@ -3917,6 +3894,14 @@ async def download_worker(
     - Emits successful file paths to out_queue (SaveBatchQueue).
     - Reports progress through progress_queue.
     """
+    logger.info(
+        "[DownloadWorker][started] worker=%s lane=%s queue_max=%s max_concurrent=%s has_large_queue=%s",
+        worker_id,
+        worker_lane,
+        getattr(getattr(in_queue, "queue", None), "maxsize", None),
+        max_concurrent,
+        large_download_queue is not None,
+    )
     # 湲곕낯 ?ㅼ슫濡쒕뱶 ?붾젆?좊━ (fallback??
     default_download_dir = str(settings.DOWNLOAD_PATH)
     

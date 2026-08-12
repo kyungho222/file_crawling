@@ -3741,7 +3741,13 @@ async def _ensure_learn_list_content_unique_index(db_name: str, table_name: str)
 # =================================================================
 # [???占쏙옙] ???占쏙옙 ?類ｋ궖 ????(URL ?類ㅻ뻼 癰궰占??怨몄뒠)
 # =================================================================
-async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict) -> Optional[int]:
+async def insert_into_learn_list(
+    chat_bot_id: str,
+    db_name: str,
+    file_info: dict,
+    *,
+    existing_row_id: Optional[int] = None,
+) -> Optional[int]:
     """???占쏙옙 ?類ｋ궖??DB????占쎌뿯??占쏙옙???占쎄쉐??ID??獄쏆꼹??(URL ?類ㅻ뻼 ??占쎌젟占?."""
     if not chat_bot_id or not db_name or not file_info.get('url'): return None
     _strip_hash_keys_from_learn_list_input(file_info)
@@ -4143,6 +4149,70 @@ async def insert_into_learn_list(chat_bot_id: str, db_name: str, file_info: dict
         reused_pending_id = await _preselect_pending_duplicate_row()
         if reused_pending_id is not None:
             return reused_pending_id
+
+        if existing_row_id is not None:
+            try:
+                parsed_existing_row_id = int(existing_row_id)
+            except (TypeError, ValueError):
+                parsed_existing_row_id = 0
+            if parsed_existing_row_id > 0:
+                # A subject+size match is an existing file identity. Refresh
+                # its current file metadata, but keep the last confirmed
+                # learning status until the asynchronous callback confirms a
+                # new result.  Resetting status to N here makes an existing
+                # Y row disappear from learned-data views while the callback
+                # is still pending.
+                update_data = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in {"created_at", "status"}
+                }
+                if update_data:
+                    update_columns = list(update_data)
+                    update_sql = ", ".join(
+                        f"`{column}` = %s" for column in update_columns
+                    )
+                    update_started = time.perf_counter()
+                    update_rowcount = await mysql_execute_query(
+                        f"UPDATE `{table_name}` SET {update_sql} WHERE `id` = %s",
+                        tuple(update_data[column] for column in update_columns)
+                        + (parsed_existing_row_id,),
+                        dbname=db_name,
+                    )
+                    # MySQL reports rowcount=0 both when the row is missing
+                    # and when every value was already identical.  Confirm the
+                    # row still exists before returning its id to the caller;
+                    # otherwise the crawler could increment its save counter
+                    # for a stale cached id that was never persisted.
+                    if int(update_rowcount or 0) <= 0:
+                        existing_rows = await mysql_execute_query(
+                            f"SELECT `id` FROM `{table_name}` WHERE `id` = %s LIMIT 1",
+                            (parsed_existing_row_id,),
+                            fetch=True,
+                            dbname=db_name,
+                        )
+                        if not existing_rows:
+                            logger.warning(
+                                "[FilePersist][existing_row_missing_after_update] job_id=%s db=%s table=%s row_id=%s file_url=%s",
+                                file_info.get("job_id"),
+                                db_name,
+                                table_name,
+                                parsed_existing_row_id,
+                                str(file_info.get("url") or "")[:220],
+                            )
+                            return None
+                    logger.info(
+                        "[FilePersist][existing_row_updated] job_id=%s db=%s table=%s row_id=%s rowcount=%s elapsed_ms=%s file_url=%s fields=%s",
+                        file_info.get("job_id"),
+                        db_name,
+                        table_name,
+                        parsed_existing_row_id,
+                        update_rowcount,
+                        int((time.perf_counter() - update_started) * 1000),
+                        str(file_info.get("url") or "")[:220],
+                        ",".join(update_columns),
+                    )
+                return parsed_existing_row_id
 
         # 7a. content ?醫딅빍??+ UPSERT.
         content_dup_key_ok = False

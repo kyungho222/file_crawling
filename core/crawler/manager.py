@@ -43,6 +43,7 @@ class WorkerManager:
         max_depth: Optional[int] = None,
         job_queues: Optional[JobQueues] = None,
         worker_config_override: Optional[Dict[str, Any]] = None,
+        defer_browser_launch: bool = False,
     ):
         self.tasks: List[asyncio.Task] = []
         # 역할별 task (부분 중단/그레이스풀 중단 제어용)
@@ -69,6 +70,7 @@ class WorkerManager:
         self.end_date = end_date
         self.max_depth = max_depth
         self.worker_config_override = dict(worker_config_override or {})
+        self.defer_browser_launch = bool(defer_browser_launch)
         self.on_collection_batch = on_collection_batch
         self._semaphore_acquired = False  # 동시 브라우저 수 제한용
         self._browser_use_count: Dict[int, int] = {}
@@ -101,12 +103,14 @@ class WorkerManager:
                 logger.warning("[WorkerManager] Playwright may fail on Windows. Update loop policy before startup.")
         
         # Start Playwright
-        self.playwright = await async_playwright().start()
+        self.playwright = await async_playwright().start() if not self.defer_browser_launch else None
         # 동시 브라우저 수 제한: 세마포어 획득 후 launch (꽉 차면 대기)
-        await BROWSER_LAUNCH_SEMAPHORE.acquire()
-        self._semaphore_acquired = True
+        if not self.defer_browser_launch:
+            await BROWSER_LAUNCH_SEMAPHORE.acquire()
+        self._semaphore_acquired = not self.defer_browser_launch
         try:
-            self.browser = await self._launch_browser()
+            if not self.defer_browser_launch:
+                self.browser = await self._launch_browser()
         except Exception:
             if self._semaphore_acquired:
                 BROWSER_LAUNCH_SEMAPHORE.release()
@@ -119,6 +123,11 @@ class WorkerManager:
                     self._semaphore_acquired = False
                 except Exception:
                     pass
+        if self.defer_browser_launch:
+            logger.info(
+                "[WorkerManager] browser launch deferred; direct HTTP workers start first | db=%s",
+                self.db_name,
+            )
         context_options = dict(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
@@ -319,6 +328,7 @@ class WorkerManager:
             )
             self.download_tasks.append(t)
             self.tasks.append(t)
+            self._log_download_task_lifecycle(t, worker_id=i + 1, lane=worker_lane)
 
         if large_workers:
             large_download_semaphore = asyncio.Semaphore(large_workers)
@@ -340,6 +350,58 @@ class WorkerManager:
                 )
                 self.download_tasks.append(t)
                 self.tasks.append(t)
+                self._log_download_task_lifecycle(
+                    t,
+                    worker_id=normal_workers + i + 1,
+                    lane="large",
+                )
+
+    def _log_download_task_lifecycle(self, task: asyncio.Task, *, worker_id: int, lane: str) -> None:
+        logger.info(
+            "[WorkerManager][download_worker_created] db=%s worker=%s lane=%s task=%s",
+            self.db_name,
+            worker_id,
+            lane,
+            task.get_name(),
+        )
+
+        def _done(completed: asyncio.Task) -> None:
+            if completed.cancelled():
+                logger.warning(
+                    "[WorkerManager][download_worker_stopped] db=%s worker=%s lane=%s reason=cancelled",
+                    self.db_name,
+                    worker_id,
+                    lane,
+                )
+                return
+            try:
+                exc = completed.exception()
+            except Exception as exc:
+                logger.error(
+                    "[WorkerManager][download_worker_stopped] db=%s worker=%s lane=%s reason=exception_read err=%r",
+                    self.db_name,
+                    worker_id,
+                    lane,
+                    exc,
+                )
+                return
+            if exc is None:
+                logger.warning(
+                    "[WorkerManager][download_worker_stopped] db=%s worker=%s lane=%s reason=returned",
+                    self.db_name,
+                    worker_id,
+                    lane,
+                )
+            else:
+                logger.error(
+                    "[WorkerManager][download_worker_stopped] db=%s worker=%s lane=%s reason=exception err=%r",
+                    self.db_name,
+                    worker_id,
+                    lane,
+                    exc,
+                )
+
+        task.add_done_callback(_done)
 
     async def _start_study_workers(self, cfg):
         """study worker 기동
@@ -356,6 +418,9 @@ class WorkerManager:
         """브라우저 실행 시 크래시 방지 옵션을 강제로 추가하여 실행합니다."""
         if self.playwright is None:
             self.playwright = await async_playwright().start()
+        if not self._semaphore_acquired:
+            await BROWSER_LAUNCH_SEMAPHORE.acquire()
+            self._semaphore_acquired = True
         # 1. 기존 설정된 실행 인자를 가져옵니다.
         launch_args = filter_launch_args(get_default_launch_args())
         

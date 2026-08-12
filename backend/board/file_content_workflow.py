@@ -50,6 +50,8 @@ from backend.board.anseong_file import (
 )
 from backend.shared.completed_url_ttl_cache import completed_url_cached, remember_completed_url
 from backend.shared.file_name_debug import emit_file_name_debug
+from backend.file.file_pg_duplicate import build_file_pg_duplicate_fingerprint
+from backend.file.file_learn_list_persistence import run_learn_list_ensure
 
 from urllib.parse import unquote, urlencode, urlparse
 
@@ -119,31 +121,8 @@ def _clip_log_value(value: Any, limit: int = 240) -> str:
 
 
 def _file_pg_duplicate_fingerprint(file_name: Any, file_size: Any) -> Optional[Tuple[str, int]]:
-    """Build a stable file identity from the original name and actual byte size."""
-    try:
-        size = int(file_size or 0)
-    except (TypeError, ValueError):
-        size = 0
-    if size <= 0:
-        return None
-    try:
-        name = strip_trailing_file_size(strip_fallback_download_label(str(file_name or "")) or "")
-        name = re.sub(
-            r"\s*\(\s*\d+(?:\.\d+)?\s*(?:b|kb|mb|gb)\s*(?:,\s*[^)]*)?\)\s*$",
-            "",
-            name,
-            flags=re.IGNORECASE,
-        )
-        name = unicodedata.normalize("NFC", name).casefold()
-        # Storage names may drop whitespace and punctuation while preserving the
-        # source name elsewhere. Treat those display-only differences equally for
-        # the duplicate identity, while retaining the extension text itself.
-        name = re.sub(r"[\W_]+", "", name, flags=re.UNICODE)
-    except Exception:
-        name = ""
-    if not name:
-        return None
-    return name, size
+    """Compatibility wrapper for the file duplicate identity helper."""
+    return build_file_pg_duplicate_fingerprint(file_name, file_size)
 
 
 def _attachment_exact_file_size_bytes(attachment: Any) -> int:
@@ -1283,58 +1262,98 @@ class BoardContentFilePipelineMixin:
     def _file_learning_request_worker_count(self) -> int:
         return _file_crawl_learn_concurrency_default()
 
+    def _file_learning_request_lane(self, item: Dict[str, Any]) -> str:
+        candidate = str(
+            item.get("file_path")
+            or item.get("local_path")
+            or item.get("file_name")
+            or ""
+        )
+        return "pdf" if os.path.splitext(candidate)[1].lower() == ".pdf" else "normal"
+
     async def _ensure_file_learning_request_workers(self) -> None:
         """Run file parsing and external batch submission outside save workers."""
-        queue = getattr(self, "_file_learning_request_queue", None)
-        if queue is None:
+        normal_queue = getattr(self, "_file_learning_request_queue", None)
+        if normal_queue is None:
             # Saving is the durable crawl boundary. Do not let slow parsing or an
             # external embedding submission block the save worker at queue.put().
             # The workflow finalizer still drains this queue before it reports
             # completion, but it does not wait for the external callback.
-            queue = asyncio.Queue()
-            self._file_learning_request_queue = queue
+            normal_queue = asyncio.Queue()
+            self._file_learning_request_queue = normal_queue
+        pdf_queue = getattr(self, "_file_learning_pdf_request_queue", None)
+        if pdf_queue is None:
+            pdf_queue = asyncio.Queue()
+            self._file_learning_pdf_request_queue = pdf_queue
 
         tasks = getattr(self, "_file_learning_request_tasks", None)
         if not isinstance(tasks, set):
             tasks = set()
         alive = {task for task in tasks if isinstance(task, asyncio.Task) and not task.done()}
         workers = self._file_learning_request_worker_count()
-        missing = max(0, workers - len(alive))
-        if missing:
-            start_index = len(alive)
-            alive.update(
-                asyncio.create_task(
-                    self._run_file_learning_request_worker(index + start_index + 1),
-                    name=f"file-learning-request-{getattr(self, 'job_id', 'unknown')}-{index + start_index + 1}",
+        pdf_workers = 1 if workers > 1 else 0
+        normal_workers = max(1, workers - pdf_workers)
+        alive_by_lane = {
+            "normal": {
+                task for task in alive
+                if str(task.get_name()).startswith("file-learning-request-")
+            },
+            "pdf": {
+                task for task in alive
+                if str(task.get_name()).startswith("file-learning-pdf-request-")
+            },
+        }
+        started_workers = False
+        for lane, queue, desired in (
+            ("normal", normal_queue, normal_workers),
+            ("pdf", pdf_queue, pdf_workers),
+        ):
+            missing = max(0, desired - len(alive_by_lane[lane]))
+            for index in range(missing):
+                worker_id = len(alive_by_lane[lane]) + index + 1
+                prefix = "file-learning-pdf-request" if lane == "pdf" else "file-learning-request"
+                task = asyncio.create_task(
+                    self._run_file_learning_request_worker(worker_id, queue=queue, lane=lane),
+                    name=f"{prefix}-{getattr(self, 'job_id', 'unknown')}-{worker_id}",
                 )
-                for index in range(missing)
-            )
+                alive.add(task)
+                alive_by_lane[lane].add(task)
+                started_workers = True
+        if started_workers:
             logger.info(
-                "[FileLearnRequest][workers_ready] job_id=%s workers=%s queue_max=%s",
+                "[FileLearnRequest][workers_ready] job_id=%s normal_workers=%s pdf_workers=%s normal_queue_max=%s pdf_queue_max=%s",
                 getattr(self, "job_id", None),
-                len(alive),
-                queue.maxsize,
+                len(alive_by_lane["normal"]),
+                len(alive_by_lane["pdf"]),
+                normal_queue.maxsize,
+                pdf_queue.maxsize,
             )
         self._file_learning_request_tasks = alive
 
     async def _enqueue_file_learning_request(self, item: Dict[str, Any]) -> None:
         await self._ensure_file_learning_request_workers()
-        queue = getattr(self, "_file_learning_request_queue", None)
+        lane = self._file_learning_request_lane(item)
+        queue_name = "_file_learning_pdf_request_queue" if lane == "pdf" else "_file_learning_request_queue"
+        queue = getattr(self, queue_name, None)
         if queue is None:
             raise RuntimeError("file_learning_request_queue_unavailable")
         queue.put_nowait(item)
         logger.info(
-            "[FileLearnRequest][queued] job_id=%s learn_list_id=%s file_url=%s pending=%s queue_max=unbounded",
+            "[FileLearnRequest][queued] job_id=%s lane=%s learn_list_id=%s file_url=%s pending=%s queue_max=unbounded",
             getattr(self, "job_id", None),
+            lane,
             item.get("pre_learn_list_id"),
             str(item.get("url") or "")[:220],
             int(getattr(queue, "_unfinished_tasks", 0) or 0),
         )
 
-    async def _run_file_learning_request_worker(self, worker_id: int) -> None:
-        queue = getattr(self, "_file_learning_request_queue", None)
-        if queue is None:
-            return
+    async def _run_file_learning_request_worker(
+        self,
+        worker_id: int,
+        *,
+        queue: asyncio.Queue,
+        lane: str,
+    ) -> None:
         while True:
             item = await queue.get()
             try:
@@ -1343,9 +1362,10 @@ class BoardContentFilePipelineMixin:
                 started = time.perf_counter()
                 sem = self._get_file_pipeline_learn_semaphore()
                 logger.info(
-                    "[FileLearnTrace][item_taken] job_id=%s worker=%s learn_list_id=%s queue_after_take=%s file_url=%s",
+                    "[FileLearnTrace][item_taken] job_id=%s worker=%s lane=%s learn_list_id=%s queue_after_take=%s file_url=%s",
                     getattr(self, "job_id", None),
                     worker_id,
+                    lane,
                     item.get("pre_learn_list_id"),
                     queue.qsize(),
                     str(item.get("url") or "")[:220],
@@ -1353,9 +1373,10 @@ class BoardContentFilePipelineMixin:
                 slot_wait_started = time.perf_counter()
                 async with sem:
                     logger.info(
-                        "[FileLearnTrace][slot_acquired] job_id=%s worker=%s learn_list_id=%s wait_ms=%s file_url=%s",
+                        "[FileLearnTrace][slot_acquired] job_id=%s worker=%s lane=%s learn_list_id=%s wait_ms=%s file_url=%s",
                         getattr(self, "job_id", None),
                         worker_id,
+                        lane,
                         item.get("pre_learn_list_id"),
                         int((time.perf_counter() - slot_wait_started) * 1000),
                         str(item.get("url") or "")[:220],
@@ -1366,9 +1387,10 @@ class BoardContentFilePipelineMixin:
                 if save_key and outcome == "failed":
                     self._schedule_file_learning_retry(dict(item), attempt=0)
                 logger.info(
-                    "[FileLearnRequest][submitted] job_id=%s worker=%s learn_list_id=%s file_url=%s elapsed_ms=%s outcome=%s",
+                    "[FileLearnRequest][submitted] job_id=%s worker=%s lane=%s learn_list_id=%s file_url=%s elapsed_ms=%s outcome=%s",
                     getattr(self, "job_id", None),
                     worker_id,
+                    lane,
                     item.get("pre_learn_list_id"),
                     str(item.get("url") or "")[:220],
                     int((time.perf_counter() - started) * 1000),
@@ -1378,9 +1400,10 @@ class BoardContentFilePipelineMixin:
                 raise
             except Exception as exc:
                 logger.exception(
-                    "[FileLearnRequest][worker_failed] job_id=%s worker=%s learn_list_id=%s file_url=%s err=%s",
+                    "[FileLearnRequest][worker_failed] job_id=%s worker=%s lane=%s learn_list_id=%s file_url=%s err=%s",
                     getattr(self, "job_id", None),
                     worker_id,
+                    lane,
                     item.get("pre_learn_list_id") if isinstance(item, dict) else None,
                     str(item.get("url") or "")[:220] if isinstance(item, dict) else "",
                     exc,
@@ -1389,9 +1412,10 @@ class BoardContentFilePipelineMixin:
                 queue.task_done()
 
     def file_learning_request_dispatch_complete(self) -> bool:
-        queue = getattr(self, "_file_learning_request_queue", None)
-        if queue is not None and int(getattr(queue, "_unfinished_tasks", 0) or 0) > 0:
-            return False
+        for queue_name in ("_file_learning_request_queue", "_file_learning_pdf_request_queue"):
+            queue = getattr(self, queue_name, None)
+            if queue is not None and int(getattr(queue, "_unfinished_tasks", 0) or 0) > 0:
+                return False
         retries = getattr(self, "_file_parallel_learn_tasks", set()) or set()
         return not any(isinstance(task, asyncio.Task) and not task.done() for task in retries)
 
@@ -1400,9 +1424,10 @@ class BoardContentFilePipelineMixin:
         return True
 
     async def _wait_for_file_learning_request_drain(self) -> None:
-        queue = getattr(self, "_file_learning_request_queue", None)
-        if queue is not None:
-            await queue.join()
+        for queue_name in ("_file_learning_request_queue", "_file_learning_pdf_request_queue"):
+            queue = getattr(self, queue_name, None)
+            if queue is not None:
+                await queue.join()
         retries = [
             task
             for task in (getattr(self, "_file_parallel_learn_tasks", set()) or set())
@@ -1412,8 +1437,7 @@ class BoardContentFilePipelineMixin:
             await asyncio.gather(*retries, return_exceptions=True)
 
     async def _stop_file_learning_request_workers(self, *, graceful: bool) -> None:
-        queue = getattr(self, "_file_learning_request_queue", None)
-        if graceful and queue is not None:
+        if graceful:
             await self._wait_for_file_learning_request_drain()
         tasks = list(getattr(self, "_file_learning_request_tasks", set()) or set())
         for task in tasks:
@@ -1423,6 +1447,7 @@ class BoardContentFilePipelineMixin:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._file_learning_request_tasks = set()
         self._file_learning_request_queue = None
+        self._file_learning_pdf_request_queue = None
 
     async def _stop_file_progress_workers(self) -> None:
         tasks = set(getattr(self, "_file_progress_dispatch_tasks", set()) or set())
@@ -1785,6 +1810,7 @@ class BoardContentFilePipelineMixin:
                     max_depth=0,
                     job_queues=self._file_job_queues,
                     worker_config_override=worker_config,
+                    defer_browser_launch=True,
                 )
                 self._file_worker_task = asyncio.create_task(self._file_worker_manager.start())
 
@@ -1809,6 +1835,31 @@ class BoardContentFilePipelineMixin:
                         )
 
                 self._file_worker_task.add_done_callback(_log_file_worker_task_done)
+                try:
+                    # WorkerManager.start() returns once all worker tasks are
+                    # created.  Do not enqueue attachments before that point:
+                    # otherwise a Playwright/startup failure presents as an
+                    # unexplained per-job download_total=0 state.
+                    await asyncio.wait_for(
+                        asyncio.shield(self._file_worker_task),
+                        timeout=45.0,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[FileCrawlTrace][download_workers_start_failed] job_id=%s err_type=%s err=%s",
+                        self.job_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                worker_health = self._file_pipeline_worker_health_snapshot()
+                if int(worker_health.get("download_alive", 0) or 0) < 1:
+                    raise RuntimeError(f"file download workers unavailable after start: {worker_health}")
+                logger.info(
+                    "[FileCrawlTrace][download_workers_ready] job_id=%s workers=%s",
+                    self.job_id,
+                    worker_health,
+                )
                 logger.debug(
                     "[file_crawl][workers] local pipeline worker redistribution | job_id=%s workers=%s",
                     self.job_id,
@@ -2342,71 +2393,14 @@ class BoardContentFilePipelineMixin:
                 )
                 _count_candidate_skip("empty_url" if not file_url else "seen_url")
                 continue
-            exact_file_size = _attachment_exact_file_size_bytes(attach)
-            pg_name_exists = self._file_pg_duplicate_name_exists(file_name)
-            duplicate_compare_name = file_name
-            if not exact_file_size and pg_name_exists:
-                response_file_name, exact_file_size = await self._probe_attachment_response_metadata_before_download(
-                    file_url=file_url,
-                    post_url=post_url,
-                    file_name=file_name,
-                )
-                if response_file_name:
-                    duplicate_compare_name = response_file_name
-                if exact_file_size:
-                    attach["response_file_size_bytes"] = exact_file_size
-                    attach["_declared_file_size_bytes"] = exact_file_size
-            if exact_file_size and self._is_file_pg_duplicate(duplicate_compare_name, exact_file_size):
-                logger.info(
-                    "[FilePgDuplicate][skip] job_id=%s phase=pre_download attachment_file=%s response_file=%s size=%s post_url=%s file_url=%s",
-                    effective_job_id,
-                    (file_name or "")[:180],
-                    (duplicate_compare_name or "")[:180],
-                    exact_file_size,
-                    (post_url or "")[:220],
-                    (file_url or "")[:220],
-                )
-                try:
-                    self._record_job_result_stage(
-                        url=file_url_key or file_url,
-                        stage="file_attachment",
-                        status="skipped",
-                        reason="pg_learned_match_pre_download",
-                        source_url=post_url,
-                        file_url=file_url,
-                        file_name=file_name,
-                    )
-                except Exception:
-                    pass
-                _log_file_url_status(
-                    stage="candidate_select",
-                    status="skipped",
-                    process_url=file_url or post_url,
-                    post_url=post_url,
-                    file_url=file_url,
-                    selected="no",
-                    saved="no",
-                    learn="skipped",
-                    reason="pg_learned_match_pre_download",
-                    name=file_name,
-                    job_id=effective_job_id,
-                    db_name=getattr(self, "db_name", ""),
-                )
-                async with self._stats_lock:
-                    self.stats["file_pg_duplicate_pre_download_skip_count"] = int(
-                        self.stats.get("file_pg_duplicate_pre_download_skip_count", 0) or 0
-                    ) + 1
-                    self.stats["file_download_skipped_count"] = int(
-                        self.stats.get("file_download_skipped_count", 0) or 0
-                    ) + 1
-                    self._bump_stats_revision_locked()
-                _count_candidate_skip("pg_learned_match_pre_download")
-                continue
             # A successful LEARN_LIST save makes the attachment reusable for this
             # process-wide TTL window, including attachment-file crawl jobs.
-            skip_by_completed_cache = completed_url_cached(
-                file_url_key or file_url,
-                stage="save",
+            # File crawls intentionally refresh persisted learning data on each
+            # run.  Per-job URL de-duplication above remains the guard; the
+            # process-wide completed cache must not suppress a later refresh.
+            skip_by_completed_cache = (
+                not bool(getattr(self, "is_attachment_file_crawl_workflow", False))
+                and completed_url_cached(file_url_key or file_url, stage="save")
             )
             if skip_by_completed_cache:
                 try:
@@ -2739,25 +2733,11 @@ class BoardContentFilePipelineMixin:
                 (post_url or "")[:220],
             )
 
-        try:
-            conc = int(os.getenv("FILE_CRAWL_DUP_CHECK_CONCURRENCY", "4") or "4")
-        except Exception:
-            conc = 4
-        conc = max(1, min(conc, 8))
-        dup_bundle = await self._ensure_file_dup_sql_bundle()
-        dup_check_semaphore = asyncio.Semaphore(conc)
-
         async def _check_candidate_duplicate(candidate: Tuple[Dict[str, Any], str, str, str, List[str]]) -> bool:
-            _, candidate_url, _, _, _ = candidate
-            async with dup_check_semaphore:
-                return await self._apply_file_dup_query(
-                    candidate_url,
-                    post_url,
-                    effective_job_id,
-                    dup_bundle,
-                    new_cate1=nc1,
-                    new_cate2=nc2,
-                )
+            # Existing LEARN_LIST/PG rows are refreshed by the learning UPSERT.
+            # Do not spend one MariaDB round-trip per attachment merely to
+            # decide whether an otherwise valid file should be skipped.
+            return False
 
         dup_results = await asyncio.gather(
             *(_check_candidate_duplicate(candidate) for candidate in candidates),
@@ -4624,12 +4604,17 @@ class BoardContentFilePipelineMixin:
                 params = (key, dup_bundle.get("dedup_type") or "file")
             else:
                 params = (key,)
+            duplicate_started = time.perf_counter()
             rows = await mysql_execute_query(
                 dup_bundle["sql"],
                 params,
                 fetch=True,
                 dbname=self.db_name,
                 op_name=f"file_prequeue_url_duplicate_lookup:job={effective_job_id or '-'}",
+            )
+            self._record_file_db_operation(
+                operation="file_prequeue_url_duplicate_lookup",
+                elapsed_sec=time.perf_counter() - duplicate_started,
             )
             if rows and isinstance(rows[0], dict):
                 learn_table = dup_bundle.get("learn_table") or ""
@@ -5613,7 +5598,7 @@ class BoardContentFilePipelineMixin:
             duplicate_locks = {}
             self._file_duplicate_subject_size_locks = duplicate_locks
 
-        async def _insert_file_row() -> Any:
+        async def _insert_file_row(*, existing_row_id: Optional[int] = None) -> Any:
             sem = _get_file_learn_list_insert_semaphore()
             gate_started = time.perf_counter()
             async with sem:
@@ -5634,8 +5619,17 @@ class BoardContentFilePipelineMixin:
                             chat_bot_id=str(cid),
                             db_name=str(dbn),
                             file_info=file_info,
+                            existing_row_id=existing_row_id,
                         ),
                         timeout=operation_timeout_sec,
+                    )
+                    self._record_file_db_operation(
+                        operation=(
+                            "file_learn_list_update"
+                            if existing_row_id is not None
+                            else "file_learn_list_insert"
+                        ),
+                        elapsed_sec=time.perf_counter() - insert_started,
                     )
                 except asyncio.TimeoutError:
                     info["_learn_list_ensure_failure_reason"] = "insert_timeout"
@@ -5656,7 +5650,17 @@ class BoardContentFilePipelineMixin:
             if duplicate_cache_key in duplicate_cache:
                 cached = duplicate_cache.get(duplicate_cache_key)
                 if isinstance(cached, tuple) and len(cached) >= 2:
-                    return cached[0], True, str(cached[1] or "")
+                    cached_id = cached[0]
+                    try:
+                        parsed_cached_id = int(cached_id or 0)
+                    except (TypeError, ValueError):
+                        parsed_cached_id = 0
+                    if parsed_cached_id > 0:
+                        updated_row_id = await _insert_file_row(
+                            existing_row_id=parsed_cached_id,
+                        )
+                        return updated_row_id, True, str(cached[1] or "")
+                    return cached_id, True, str(cached[1] or "")
             elif duplicate_cache_key is not None:
                 operation_timeout_sec = _file_learn_list_db_operation_timeout_sec()
                 lookup_started = time.perf_counter()
@@ -5666,6 +5670,7 @@ class BoardContentFilePipelineMixin:
                         timeout=operation_timeout_sec,
                     )
                     learn_table = get_learn_list_table_name(account_identifier)
+                    info["_learn_list_table_name"] = learn_table
                     duplicate_rows = await asyncio.wait_for(
                         mysql_execute_query(
                             f"""
@@ -5685,6 +5690,10 @@ class BoardContentFilePipelineMixin:
                             ),
                         ),
                         timeout=operation_timeout_sec,
+                    )
+                    self._record_file_db_operation(
+                        operation="file_duplicate_subject_size_lookup",
+                        elapsed_sec=time.perf_counter() - lookup_started,
                     )
                     lookup_elapsed_sec = time.perf_counter() - lookup_started
                     if lookup_elapsed_sec >= 1.0:
@@ -5708,6 +5717,15 @@ class BoardContentFilePipelineMixin:
                             duplicate_id,
                             str(duplicate_status or "").strip().upper(),
                         )
+                        try:
+                            parsed_duplicate_id = int(duplicate_id or 0)
+                        except (TypeError, ValueError):
+                            parsed_duplicate_id = 0
+                        if parsed_duplicate_id > 0:
+                            updated_row_id = await _insert_file_row(
+                                existing_row_id=parsed_duplicate_id,
+                            )
+                            return updated_row_id, True, str(duplicate_status or "")
                         return duplicate_id, True, str(duplicate_status or "")
                     duplicate_cache[duplicate_cache_key] = None
                 except asyncio.TimeoutError:
@@ -5852,6 +5870,19 @@ class BoardContentFilePipelineMixin:
             reuse_same_category = str(
                 os.getenv("FILE_CRAWL_REUSE_SAME_CATEGORY_DUP_CHECK", "0") or "0"
             ).strip().lower() in ("1", "true", "yes", "on")
+            if reuse_same_category:
+                # This legacy branch used to delete the newly persisted row
+                # and reuse a same-subject/category learned row.  Subject and
+                # category alone are not a file identity, so that behavior
+                # can remove a valid file record.  File crawl now uses the
+                # subject+actual-size update path above instead.
+                logger.warning(
+                    "[FilePersist][legacy_same_category_duplicate_disabled] job_id=%s row_id=%s file=%s",
+                    getattr(self, "job_id", None),
+                    parsed_row_id,
+                    file_name,
+                )
+                reuse_same_category = False
             if reuse_same_category and parsed_row_id > 0 and not bool(info.get("learn_list_reused_learned")):
                 account_identifier = await get_account_identifier_from_chatbot_setup(str(cid), str(dbn))
                 learn_table = get_learn_list_table_name(account_identifier)
@@ -7034,6 +7065,7 @@ class BoardContentFilePipelineMixin:
             ("file_save", getattr(self, "_file_save_queue", None)),
             ("local_finalize", getattr(self, "_file_local_finalize_queue", None)),
             ("learning_request", getattr(self, "_file_learning_request_queue", None)),
+            ("learning_pdf_request", getattr(self, "_file_learning_pdf_request_queue", None)),
         ):
             if queue is None:
                 continue
@@ -7043,6 +7075,43 @@ class BoardContentFilePipelineMixin:
             except Exception as exc:
                 result[f"{name}_queue_error"] = f"{type(exc).__name__}:{exc}"
         return result
+
+    def _record_file_db_operation(self, *, operation: str, elapsed_sec: float) -> None:
+        """Keep bounded per-job DB timing metrics without per-item success logs."""
+        op = str(operation or "unknown")
+        elapsed_ms = max(0.0, float(elapsed_sec or 0.0) * 1000.0)
+        metrics = getattr(self, "_file_db_operation_metrics", None)
+        if not isinstance(metrics, dict):
+            metrics = {}
+            self._file_db_operation_metrics = metrics
+        bucket = metrics.setdefault(op, {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "samples_ms": []})
+        bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+        bucket["total_ms"] = float(bucket.get("total_ms", 0.0) or 0.0) + elapsed_ms
+        bucket["max_ms"] = max(float(bucket.get("max_ms", 0.0) or 0.0), elapsed_ms)
+        samples = bucket.setdefault("samples_ms", [])
+        if len(samples) < 512:
+            samples.append(elapsed_ms)
+
+    def _file_db_operation_metrics_snapshot(self) -> Dict[str, Dict[str, float]]:
+        metrics = getattr(self, "_file_db_operation_metrics", None)
+        if not isinstance(metrics, dict):
+            return {}
+        summary: Dict[str, Dict[str, float]] = {}
+        for op, bucket in metrics.items():
+            count = int(bucket.get("count", 0) or 0)
+            if count <= 0:
+                continue
+            samples = sorted(float(value) for value in (bucket.get("samples_ms") or []))
+            p95 = samples[min(len(samples) - 1, max(0, int((len(samples) - 1) * 0.95)))] if samples else 0.0
+            total_ms = float(bucket.get("total_ms", 0.0) or 0.0)
+            summary[str(op)] = {
+                "count": count,
+                "avg_ms": round(total_ms / count, 1),
+                "p95_ms": round(p95, 1),
+                "max_ms": round(float(bucket.get("max_ms", 0.0) or 0.0), 1),
+                "total_ms": round(total_ms, 1),
+            }
+        return summary
 
     async def _run_file_queue_watchdog(self) -> None:
         """Emit a rate-limited queue heartbeat and warn when its state stops changing."""
@@ -7193,6 +7262,13 @@ class BoardContentFilePipelineMixin:
                 snapshot.get("large_collection_batch_queue", 0),
                 snapshot.get("large_collection_batch_queue_unfinished", 0),
             )
+            db_metrics = self._file_db_operation_metrics_snapshot()
+            if db_metrics:
+                logger.info(
+                    "[FileDbTrace][summary] job_id=%s operations=%s",
+                    getattr(self, "job_id", None),
+                    db_metrics,
+                )
             activity = (
                 int(stats.get("save_count", 0) or 0),
                 int(stats.get("file_study_done_count", stats.get("study_done_count", 0)) or 0),
@@ -7789,61 +7865,6 @@ class BoardContentFilePipelineMixin:
                         (file_path or "")[:260],
                     )
 
-                    if save_key and file_path and path_ok and self._is_file_pg_duplicate(file_name, file_size):
-                        logger.info(
-                            "[FilePgDuplicate][skip] job_id=%s phase=post_download file=%s size=%s post_url=%s file_url=%s",
-                            getattr(self, "job_id", None),
-                            (file_name or "")[:180],
-                            file_size,
-                            (info.get("source_page") or info.get("source_url") or "")[:220],
-                            (url or "")[:220],
-                        )
-                        try:
-                            self._record_job_result_stage(
-                                url=save_key,
-                                stage="save",
-                                status="skipped",
-                                reason="pg_learned_match_post_download",
-                                source_url=info.get("source_page") or info.get("source_url"),
-                                file_url=url,
-                                file_name=file_name,
-                                file_path=file_path,
-                            )
-                        except Exception:
-                            pass
-                        async with self._stats_lock:
-                            self.stats["file_pg_duplicate_post_download_skip_count"] = int(
-                                self.stats.get("file_pg_duplicate_post_download_skip_count", 0) or 0
-                            ) + 1
-                            self.stats["file_download_skipped_count"] = int(
-                                self.stats.get("file_download_skipped_count", 0) or 0
-                            ) + 1
-                            self._bump_stats_revision_locked()
-                        try:
-                            self._record_job_result_stage(
-                                url=save_key,
-                                stage="selection",
-                                status="skipped",
-                                reason="pg_learned_match_post_download",
-                                source_url=info.get("source_page") or info.get("source_url"),
-                                file_url=url,
-                                file_name=file_name,
-                                file_path=file_path,
-                            )
-                        except Exception:
-                            pass
-                        await self._mark_save_skipped(url=save_key)
-                        await self._mark_study_done(url=save_key, outcome="skipped")
-                        logger.info(
-                            "[FilePersist][persist_result] job_id=%s worker=%s result=skipped reason=pg_learned_match_post_download post_url=%s file_url=%s file=%s size=%s",
-                            getattr(self, "job_id", None), trace_key,
-                            (info.get("source_page") or info.get("source_url") or "")[:220],
-                            (url or "")[:220], file_name, file_size,
-                        )
-                        if self.progress_callback:
-                            self.progress_callback(self.get_stats())
-                        continue
-
                     if save_key and file_path and path_ok:
                         await self._confirm_file_selection_after_download(
                             info=info,
@@ -7876,14 +7897,14 @@ class BoardContentFilePipelineMixin:
                         t_ll0 = time.perf_counter()
                         ensure_timeout_sec = _file_learn_list_ensure_timeout_sec()
                         try:
-                            row_out = await asyncio.wait_for(
-                                self._ensure_learn_list_row_for_file_save(
+                            row_out = await run_learn_list_ensure(
+                                lambda: self._ensure_learn_list_row_for_file_save(
                                     info=info,
                                     file_path=file_path,
                                     file_name=file_name,
                                     file_size=file_size,
                                 ),
-                                timeout=ensure_timeout_sec,
+                                ensure_timeout_sec,
                             )
                         except asyncio.TimeoutError:
                             logger.error(
@@ -8050,10 +8071,30 @@ class BoardContentFilePipelineMixin:
                             saved_ids.add(row_id_int)
 
                         duplicate_existing = bool(info.get("learn_list_duplicate"))
+                        persistence_action = "update" if duplicate_existing else "insert"
                         duplicate_learned = bool(info.get("learn_list_reused_learned")) or (
                             duplicate_existing
                             and str(info.get("learn_list_existing_status") or "").strip().upper() == "Y"
                         )
+                        if duplicate_existing:
+                            # A same-name/same-size LEARN_LIST row is an
+                            # identity match, not a terminal skip.  Continue
+                            # through the learning request so PG's
+                            # content+chunk_num UPSERT overwrites stale chunks.
+                            logger.info(
+                                "[FilePersist][duplicate_reprocess] job_id=%s worker=%s row_id=%s prior_status=%s file=%s size=%s file_url=%s",
+                                getattr(self, "job_id", None),
+                                trace_key,
+                                row_out,
+                                info.get("learn_list_existing_status") or "-",
+                                file_name,
+                                file_size,
+                                (url or "")[:220],
+                            )
+                            info["learn_list_duplicate"] = False
+                            info["learn_list_reused_learned"] = False
+                            duplicate_existing = False
+                            duplicate_learned = False
                         if duplicate_existing:
                             _log_file_url_status(
                                 stage="learn_list_persist",
@@ -8127,10 +8168,19 @@ class BoardContentFilePipelineMixin:
                             )
                         except Exception:
                             pass
+                        async with self._stats_lock:
+                            counter_key = (
+                                "file_save_update_count"
+                                if persistence_action == "update"
+                                else "file_save_insert_count"
+                            )
+                            self.stats[counter_key] = int(self.stats.get(counter_key, 0) or 0) + 1
+                            self._bump_stats_revision_locked()
                         await self._mark_save_done(url=save_key, ok=True)
                         logger.info(
-                            "[FilePersist][persist_result] job_id=%s worker=%s result=saved row_id=%s post_url=%s file_url=%s file=%s size=%s",
-                            getattr(self, "job_id", None), trace_key, row_out,
+                            "[FilePersist][persist_result] job_id=%s worker=%s result=saved persistence=%s db=%s table=%s row_id=%s post_url=%s file_url=%s file=%s size=%s",
+                            getattr(self, "job_id", None), trace_key, persistence_action,
+                            getattr(self, "db_name", None), info.get("_learn_list_table_name") or "unresolved", row_out,
                             (info.get("source_page") or info.get("source_url") or "")[:220],
                             (url or "")[:220], file_name, file_size,
                         )

@@ -1974,9 +1974,15 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
         self.file_mode = True
         self._pre_filtered_memory = filtered_memory_storage or []
         self._reset_run_state()
+        self._file_db_operation_metrics = {}
         self._file_pg_duplicate_fingerprints.clear()
         self._file_pg_duplicate_fingerprints_loaded = False
-        await self._load_file_pg_duplicate_fingerprints()
+        # Existing PG rows are no longer a crawl-time exclusion condition.
+        # The embedding persistence path updates the same logical chunk key.
+        logger.info(
+            "[FilePgUpsert][mode] job_id=%s existing_pg_rows=update_or_insert logical_key=content+chunk_num",
+            getattr(self, "job_id", ""),
+        )
         if start_urls:
             try:
                 self.init_file_scan_count_base_from_start_urls(start_urls)

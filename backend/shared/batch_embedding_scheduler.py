@@ -1991,6 +1991,30 @@ async def process_embedding_callback(payload: Dict[str, Any]) -> Dict[str, Any]:
         table_name=table_name,
         inserted_count=len(inserted_records),
     )
+    pg_upsert_succeeded = bool(inserted_records)
+    if not pg_upsert_succeeded:
+        # A callback result alone is not a learning success.  Do not mark the
+        # LEARN_LIST row Y or advance workflow/SSE learning counters unless at
+        # least one PG chunk was actually inserted or updated.
+        logger.error(
+            "[BatchEmbedding][pg_upsert_empty] batch_id=%s db=%s table=%s learn_list_id=%s merged_rows=%s source_url=%s",
+            batch_id,
+            db_name,
+            table_name,
+            context.get("learn_list_id"),
+            len(merged_rows),
+            source_url[:220],
+        )
+        _file_study_debug(
+            "batch_callback_pg_upsert_empty",
+            batch_id=batch_id,
+            job_id=job_id,
+            db=db_name,
+            table=table_name,
+            merged_rows=len(merged_rows),
+            learn_list_id=context.get("learn_list_id"),
+            source_url=source_url,
+        )
 
     learn_list_id = context.get("learn_list_id")
     if learn_list_id is None and not _board_mariadb_minimal_enabled():
@@ -2002,7 +2026,7 @@ async def process_embedding_callback(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     status_y_on_submit = _as_bool(context.get("status_y_on_submit"))
     learning_ok = False
-    if learn_list_id is not None and chat_bot_id and db_name:
+    if pg_upsert_succeeded and learn_list_id is not None and chat_bot_id and db_name:
         if status_y_on_submit:
             # Older contexts may say status=Y was applied at submission time.
             # Re-apply and verify it after the callback PG write so Redis cannot
@@ -2121,6 +2145,7 @@ async def process_embedding_callback(payload: Dict[str, Any]) -> Dict[str, Any]:
             db_name=db_name,
             learn_list_id=learn_list_id,
             has_chat_bot_id=bool(chat_bot_id),
+            pg_upsert_succeeded=pg_upsert_succeeded,
         )
 
     _file_study_debug(
