@@ -2376,44 +2376,18 @@ async def _fallback_original_board_category_mapping(
     source_cate2: str,
     source_c2_row: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Return board category names as a compatibility fail-safe for legacy DBs.
+    """Return only category codes when a file-learning mapping is unavailable.
 
-    Some existing deployments do not yet contain the fixed File-category child.
-    In that known compatibility state, preserving the resolved board category
-    *name* is safer than writing an opaque category code or silently blanking the
-    category. A later category-repair job can deterministically map that name.
-    This path does not bypass file learning, persistence, or error reporting.
+    ``cate1`` and ``cate2`` are code columns. Display names remain in source
+    metadata for a later repair, but must never be persisted into these fields.
     """
+    del category_table, db_name, source_c2_row
     fallback_c1 = str(source_cate1 or "").strip()
     fallback_c2 = str(source_cate2 or "").strip()
-
-    async def _name_from_value(value: str, row: Optional[Dict[str, Any]] = None) -> str:
-        text = str(value or "").strip()
-        resolved = row
-        if resolved is None and text and _looks_like_category_code(text):
-            resolved = await _fetch_category_by_code(
-                category_table=category_table,
-                cate_code=text,
-                db_name=db_name,
-            )
-        name = str((resolved or {}).get("cate_name") or "").strip()
-        if name:
-            return name
-        return "" if _looks_like_category_code(text) else text
-
-    source_c2_row = source_c2_row or None
-    fallback_c2 = await _name_from_value(fallback_c2, source_c2_row)
-    fallback_c1 = await _name_from_value(fallback_c1)
-
-    if not fallback_c1 and source_c2_row:
-        parent_row = await _fetch_category_parent_by_treecode(
-            category_table=category_table,
-            cate_treecode=str((source_c2_row or {}).get("cate_treecode") or "").strip(),
-            db_name=db_name,
-        )
-        fallback_c1 = str((parent_row or {}).get("cate_name") or "").strip()
-
-    return (fallback_c1, fallback_c2)
+    return (
+        fallback_c1 if _looks_like_category_code(fallback_c1) else "",
+        fallback_c2 if _looks_like_category_code(fallback_c2) else "",
+    )
 
 async def _ensure_file_learning_category_mapping(
     *,
@@ -2463,7 +2437,7 @@ async def _ensure_file_learning_category_mapping(
         )
         log_fn = logger.debug if not (str(source_cate1 or "").strip() or source_c2) else logger.warning
         log_fn(
-            "[CategorySync][file-map-debug] fallback: fixed file cate1 not found; keep original board category name | db=%s chat_bot_id=%s table=%s source=(%s,%s) mapped=(%s,%s)",
+            "[CategorySync][file-map-debug] fallback: fixed file cate1 not found; retain code-only values | db=%s chat_bot_id=%s table=%s source=(%s,%s) mapped=(%s,%s)",
             db_name,
             chat_bot_id,
             category_table,
@@ -2543,7 +2517,7 @@ async def _ensure_file_learning_category_mapping(
             source_c2_row=source_c2_row,
         )
         logger.warning(
-            "[CategorySync][file-map-debug] fallback: source cate2 name not found; keep original board category name | db=%s chat_bot_id=%s table=%s source=(%s,%s) source_row=%s mapped=(%s,%s)",
+            "[CategorySync][file-map-debug] fallback: source cate2 name not found; retain code-only values | db=%s chat_bot_id=%s table=%s source=(%s,%s) source_row=%s mapped=(%s,%s)",
             db_name,
             chat_bot_id,
             category_table,
@@ -2573,7 +2547,7 @@ async def _ensure_file_learning_category_mapping(
             source_c2_row=source_c2_row,
         )
         logger.warning(
-            "[CategorySync][file-map-debug] fallback: file child category not found; keep original board category name | db=%s chat_bot_id=%s table=%s fixed_cate1=%s source=(%s,%s) source_name=%s create_missing=%s mapped=(%s,%s)",
+            "[CategorySync][file-map-debug] fallback: file child category not found; retain code-only values | db=%s chat_bot_id=%s table=%s fixed_cate1=%s source=(%s,%s) source_name=%s create_missing=%s mapped=(%s,%s)",
             db_name,
             chat_bot_id,
             category_table,

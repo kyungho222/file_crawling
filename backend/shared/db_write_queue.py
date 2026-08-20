@@ -96,7 +96,9 @@ def _is_log_db_write(label: str) -> bool:
     if not db_write_log_queue_enabled():
         return False
     normalized = str(label or "").strip().lower()
-    return normalized.startswith("crawling_log.")
+    # Existing crawling-log operations use both dotted labels and MariaDB op names
+    # such as ``crawling_log_fast_status_update``. Keep both off the main write queue.
+    return normalized.startswith(("crawling_log.", "crawling_log_"))
 
 
 async def run_db_write(

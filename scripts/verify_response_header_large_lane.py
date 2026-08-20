@@ -41,7 +41,8 @@ def main() -> None:
     declared = {"declared_file_size_bytes": header_size}
     assert _download_item_hard_timeout_sec(declared) > 90.0
     timeout = _download_http_request_timeout(declared, 30.0)
-    assert getattr(timeout, "total", 0) > 30.0
+    assert getattr(timeout, "total", None) is None
+    assert getattr(timeout, "sock_read", 0) > 0
     print("OK: response-header deferral and declared-size timeouts")
 
 

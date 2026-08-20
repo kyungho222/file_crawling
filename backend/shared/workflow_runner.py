@@ -583,7 +583,6 @@ def _apply_stage_terminal_count_adjustments(
             except Exception:
                 actual_saved = 0
             adjusted["save_count"] = actual_saved
-            adjusted["collection_count"] = actual_saved
             try:
                 adjusted["save_success_count"] = min(
                     int(adjusted.get("save_success_count", 0) or 0),
@@ -1490,8 +1489,7 @@ async def run_workflow_task(
     # endregion
 
     dashboard_job = str(job_id or "").startswith("board-dashboard-")
-    local_file_crawl_job = str(job_id or "").startswith("local-file-crawl-")
-    if _distributed_duplicate_workflow_lock_enabled() and not dashboard_job and not local_file_crawl_job:
+    if _distributed_duplicate_workflow_lock_enabled() and not dashboard_job:
         duplicate_t0 = time.perf_counter()
         try:
             from db.db_redis import get_redis
@@ -1871,6 +1869,8 @@ async def run_workflow_task(
     heartbeat_task: asyncio.Task | None = None
     monitor_stop = asyncio.Event()
     monitor_task: asyncio.Task | None = None
+    # Kept for the legacy helper below; file progress no longer invokes that
+    # direct writer and instead uses the serialized SSE/crawling-log queue.
     live_db_update_tasks: set[asyncio.Task] = set()
     live_db_last_counts: tuple[int, int, int, int] | None = None
     live_db_last_update_at = 0.0
@@ -2018,6 +2018,7 @@ async def run_workflow_task(
                     "collection_count": 0,
                     "save_count": 0,
                     "study_count": 0,
+                    "craw_id": getattr(workflow, "craw_id", None),
                     "timestamp": datetime.now().isoformat(),
                 }
                 extra = {
@@ -2224,6 +2225,10 @@ async def run_workflow_task(
                     "stats_revision": int(stats.get("stats_revision", 0) or 0),
                     "timestamp": datetime.now().isoformat(),
                     "job_id": job_id,
+                    # The queued crawling_log writer must target the same row
+                    # as terminal updates.  Passing only job_id can resolve a
+                    # newer or unrelated row after retries/restarts.
+                    "craw_id": getattr(workflow, "craw_id", None),
                     "account_name": db_name,
                     "pending_collection_count": stats.get("pending_collection_count", 0),
                     "pending_save_count": stats.get("pending_save_count", 0),
@@ -2459,7 +2464,6 @@ async def run_workflow_task(
                     or str(message.get("status_hint") or "").strip().lower() == "stopped"
                     or str(message.get("event") or "").strip().lower() in {"stopping_save", "stop_requested", "hard_stop"}
                 ) else 0
-                _schedule_live_db_progress_update(message)
                 progress_enqueue_t0 = time.perf_counter()
                 enqueue_sse_message(job_id, message, db_name, "workflow_progress", priority=sse_priority)
                 progress_enqueue_ms = (time.perf_counter() - progress_enqueue_t0) * 1000.0
@@ -3044,11 +3048,6 @@ async def run_workflow_task(
                 pass
             except Exception:
                 pass
-        if live_db_update_tasks:
-            try:
-                await asyncio.gather(*list(live_db_update_tasks), return_exceptions=True)
-            except Exception:
-                pass
         # print(f"\n" + "=" * 50)
         # print(f"?猶??臾믩씜 ?ル굝利?workflow_runner (Job ID: {job_id})")
         # print(f"=" * 50 + "\n", flush=True)
@@ -3495,6 +3494,3 @@ async def run_workflow_task(
                     delay_sec=delay_sec,
                     history_detail="auto_cleanup_after_finish_fallback",
                 )
-
-
-

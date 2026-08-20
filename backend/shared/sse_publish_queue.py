@@ -90,6 +90,18 @@ def _merge_counter_snapshot(existing: Dict[str, Any], payload: Dict[str, Any]) -
             merged["progress_percentage"] = existing.get("progress_percentage")
         merged["stats_revision"] = existing.get("stats_revision")
 
+    # A queued state can be produced just before a later save/learning event.
+    # Do not let that stale payload lower the counters written to Redis or to
+    # ASADAL_CRAWLING_LOG.  Explicit counter-repair flows retain an opt-out.
+    if not bool(merged.get("allow_counter_decrease", False)):
+        for key in _MONOTONIC_COUNT_KEYS:
+            if key not in existing and key not in merged:
+                continue
+            merged[key] = max(_to_int(existing.get(key)), _to_int(merged.get(key)))
+
+    if not merged.get("craw_id") and existing.get("craw_id"):
+        merged["craw_id"] = existing.get("craw_id")
+
     return merged
 
 
@@ -370,12 +382,18 @@ async def _apply_crawling_log_update(
     from db.crawl_db_manager import update_crawling_log_counters
 
     db_t0 = time.perf_counter()
+    craw_id = (
+        payload.get("craw_id")
+        or payload.get("crawling_log_id")
+        or payload.get("log_id")
+    )
     crawl_trace(
         logger,
         phase="db",
         action="queued_crawling_log_update",
         state="start",
         job_id=job_id,
+        log_id=craw_id,
         status=status_val,
         counts={
             "scan": payload.get("scan_count"),
@@ -384,7 +402,7 @@ async def _apply_crawling_log_update(
             "study": payload.get("study_count"),
         },
     )
-    await update_crawling_log_counters(
+    applied = await update_crawling_log_counters(
         job_id,
         scan=payload.get("scan_count"),
         collection=payload.get("collection_count"),
@@ -394,8 +412,22 @@ async def _apply_crawling_log_update(
         status=status_val,
         colle=payload.get("colle"),
         dbname=db_name,
+        log_id=craw_id,
         force=True,
     )
+    if not applied:
+        logger.warning(
+            "[CrawlingLogSync][not_applied] job_id=%s db=%s craw_id=%s scan=%s collection=%s save=%s study=%s status=%s",
+            job_id,
+            db_name,
+            craw_id,
+            payload.get("scan_count"),
+            payload.get("collection_count"),
+            payload.get("save_count"),
+            payload.get("study_count"),
+            status_val,
+        )
+        return
     _sse_last_db_update_ts_by_job[job_id] = time.time()
     crawl_trace(
         logger,
@@ -403,6 +435,7 @@ async def _apply_crawling_log_update(
         action="queued_crawling_log_update",
         state="end",
         job_id=job_id,
+        log_id=craw_id,
         elapsed_ms=trace_elapsed_ms(db_t0),
         status=status_val,
     )

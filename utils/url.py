@@ -7,6 +7,7 @@ from typing import Any
 
 import os
 import json
+import html as html_lib
 import logging  # 추가: 시스템 로그 기록을 위한 모듈
 import re
 import posixpath
@@ -130,7 +131,63 @@ def normalize_url(url: str, base_url: str | None = None) -> str:
     return "|".join(sorted(tokens))
 
 
-def extract_download_url_from_js(js_text: str, base_url: str | None = None) -> str:
+def _source_page_go_download_url(
+    js_text: str,
+    base_url: str | None,
+    page_script: str | None,
+) -> str:
+    """Resolve goDownload from the endpoint declared by its source page."""
+    if not page_script:
+        return ""
+    try:
+        call = re.search(
+            r"godownload\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)",
+            js_text,
+            re.IGNORECASE,
+        )
+        if not call:
+            return ""
+        handler = re.search(
+            r"function\s+godownload\s*\([^)]*\)\s*\{(?P<body>.*?)\}",
+            str(page_script),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not handler:
+            return ""
+        endpoint_match = re.search(
+            r"['\"](?P<endpoint>(?:https?:)?//[^'\"]*?/emwp/jsp/ofr/FileDown(?:New)?\.jsp|/emwp/jsp/ofr/FileDown(?:New)?\.jsp)[^'\"]*['\"]",
+            handler.group("body"),
+            re.IGNORECASE,
+        )
+        if not endpoint_match:
+            return ""
+        endpoint = html_lib.unescape(endpoint_match.group("endpoint").strip())
+        if endpoint.startswith("//"):
+            endpoint = "https:" + endpoint
+        elif endpoint.startswith("/") and base_url:
+            endpoint = urljoin(base_url, endpoint)
+        parsed = urlparse(endpoint)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        query = dict(parse_qsl(parsed.query or "", keep_blank_values=True))
+        query.update(
+            {
+                "user_file_nm": call.group(1).strip(),
+                "sys_file_nm": call.group(2).strip(),
+                "file_path": call.group(3).strip(),
+            }
+        )
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+    except Exception:
+        return ""
+
+
+def extract_download_url_from_js(
+    js_text: str,
+    base_url: str | None = None,
+    *,
+    page_script: str | None = None,
+) -> str:
     """
     'javascript:...' 형태의 클릭 다운로드 문자열에서 실제 다운로드 URL을 추출합니다.
 
@@ -148,6 +205,12 @@ def extract_download_url_from_js(js_text: str, base_url: str | None = None) -> s
 
     if not s:
         return ""
+
+    source_handler_url = _source_page_go_download_url(s, base_url, page_script)
+    if source_handler_url:
+        # The handler builder already uses urlencode(). Running the generic
+        # encoder again would turn query-space '+' into the literal '%2B'.
+        return source_handler_url
 
     # 이미 URL/경로인 경우
     if s.startswith(("http://", "https://")):

@@ -500,6 +500,10 @@ class GlobalWorkerPool:
         self._retired_browsers: Dict[int, Browser] = {}
         self._retired_browser_cleanup_tasks: set[asyncio.Task] = set()
         self._retired_browser_force_cleanup_tasks: set[asyncio.Task] = set()
+        self._normal_download_semaphore: Optional[asyncio.Semaphore] = None
+        self._download_runtime_config: Dict[str, Any] = {}
+        self._elastic_download_tasks: set[asyncio.Task] = set()
+        self._elastic_download_sequence = 0
 
         self._tasks: list[asyncio.Task] = []
         self._flush_task: Optional[asyncio.Task] = None
@@ -527,6 +531,96 @@ class GlobalWorkerPool:
             "download_done": sum(1 for t in download_tasks if t.done()),
             "download_active": get_download_worker_activity_snapshot(job_id=job_id),
         }
+
+    async def ensure_elastic_normal_download_worker(
+        self,
+        *,
+        reason: str,
+        max_elastic_workers: int = 2,
+        lifetime_sec: float = 600.0,
+    ) -> bool:
+        """Create one globally shared, ten-minute normal download worker."""
+        runtime = dict(getattr(self, "_download_runtime_config", {}) or {})
+        normal_workers = int(runtime.get("normal_workers") or 0)
+        if not self._started or normal_workers < 1:
+            return False
+
+        elastic_tasks = getattr(self, "_elastic_download_tasks", None)
+        if not isinstance(elastic_tasks, set):
+            elastic_tasks = set()
+            self._elastic_download_tasks = elastic_tasks
+        elastic_tasks.intersection_update(
+            task
+            for task in elastic_tasks
+            if isinstance(task, asyncio.Task) and not task.done()
+        )
+        max_elastic_workers = max(0, min(int(max_elastic_workers or 0), 4))
+        if len(elastic_tasks) >= max_elastic_workers:
+            return False
+
+        semaphore = getattr(self, "_normal_download_semaphore", None)
+        if semaphore is None:
+            return False
+
+        self._elastic_download_sequence += 1
+        worker_id = (
+            normal_workers
+            + int(runtime.get("large_workers") or 0)
+            + self._elastic_download_sequence
+        )
+        max_concurrent = max(1, int(runtime.get("max_concurrent") or 1))
+        lifetime_sec = max(60.0, min(float(lifetime_sec or 600.0), 600.0))
+        semaphore.release()
+
+        async def _run_elastic_worker() -> None:
+            try:
+                await asyncio.wait_for(
+                    download_worker(
+                        self.collection_batch_queue,
+                        self.save_batch_queue,
+                        progress_queue=self.progress_queue,
+                        max_concurrent=max_concurrent,
+                        browser=self._browser,
+                        browser_getter=self.acquire_browser,
+                        browser_releaser=self.release_browser,
+                        browser_relauncher=self._relaunch_browser,
+                        worker_id=worker_id,
+                        worker_lane="normal",
+                        large_download_queue=(
+                            self.large_collection_batch_queue
+                            if int(runtime.get("large_workers") or 0) > 0
+                            else None
+                        ),
+                        shared_download_semaphore=semaphore,
+                    ),
+                    timeout=lifetime_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[GlobalPool][elastic_download_worker_expired] worker=%s lifetime_sec=%.0f reason=%s",
+                    worker_id,
+                    lifetime_sec,
+                    reason,
+                )
+            finally:
+                self._elastic_download_tasks.discard(asyncio.current_task())
+
+        task = asyncio.create_task(
+            _run_elastic_worker(),
+            name=f"global-download-elastic-normal-worker-{worker_id}",
+        )
+        self._elastic_download_tasks.add(task)
+        task.add_done_callback(self._elastic_download_tasks.discard)
+        self._track_worker_task(task)
+        logger.info(
+            "[GlobalPool][elastic_download_worker_created] worker=%s active_elastic=%s max_elastic=%s lifetime_sec=%.0f reason=%s",
+            worker_id,
+            len(elastic_tasks),
+            max_elastic_workers,
+            lifetime_sec,
+            reason,
+        )
+        return True
     def _track_worker_task(self, task: asyncio.Task) -> None:
         self._tasks.append(task)
 
@@ -832,17 +926,17 @@ class GlobalWorkerPool:
                 max_concurrent = int(
                     os.getenv(
                         "DOWNLOAD_MAX_CONCURRENT",
-                        str(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4)),
+                        str(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5)),
                     )
                 )
             except Exception:
-                max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
+                max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5) or 5)
             max_concurrent = max(1, max_concurrent)
 
-            total_download_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4))
+            total_download_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5))
             requested_large_workers = max(
                 0,
-                int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 1) or 0),
+                int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 2) or 0),
             )
             large_download_workers = min(requested_large_workers, max(0, total_download_workers - 1))
             requested_normal_workers = max(
@@ -862,6 +956,12 @@ class GlobalWorkerPool:
                 max_concurrent,
             )
             shared_download_semaphore = asyncio.Semaphore(normal_download_workers)
+            self._normal_download_semaphore = shared_download_semaphore
+            self._download_runtime_config = {
+                "max_concurrent": max_concurrent,
+                "normal_workers": normal_download_workers,
+                "large_workers": large_download_workers,
+            }
             for i in range(normal_download_workers):
                 worker_lane = "normal"
                 worker_queue = self.collection_batch_queue
@@ -900,6 +1000,7 @@ class GlobalWorkerPool:
                             browser_releaser=self.release_browser,
                             worker_id=normal_download_workers + i + 1,
                             worker_lane="large",
+                            fallback_in_queue=self.collection_batch_queue,
                             browser_relauncher=self._relaunch_browser,
                             shared_download_semaphore=large_download_semaphore,
                         ),

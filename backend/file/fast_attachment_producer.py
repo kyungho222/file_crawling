@@ -860,8 +860,14 @@ async def run_fast_file_attachment_front(
                                 extract_file_category_breadcrumb_from_html,
                             )
 
-                            breadcrumb_tokens = extract_file_breadcrumb_tokens_from_html(html or "")
-                            breadcrumb_cate = extract_file_category_breadcrumb_from_html(html or "")
+                            breadcrumb_tokens = extract_file_breadcrumb_tokens_from_html(
+                                html or "",
+                                detail_url=item.url,
+                            )
+                            breadcrumb_cate = extract_file_category_breadcrumb_from_html(
+                                html or "",
+                                detail_url=item.url,
+                            )
                         except Exception:
                             breadcrumb_cate = ""
                             breadcrumb_tokens = []

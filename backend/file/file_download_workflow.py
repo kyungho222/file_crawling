@@ -180,9 +180,9 @@ def _compact_text(value: Any) -> str:
 def _file_crawl_fast_front_concurrency(kwargs: Dict[str, Any]) -> int:
     # File crawling uses one shared concurrency baseline for discovery and download.
     try:
-        value = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
+        value = int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5)
     except Exception:
-        value = 4
+        value = 5
     return max(1, min(value, 16))
 
 def _file_crawl_detail_fetch_timeout_sec(kwargs: Dict[str, Any]) -> float:

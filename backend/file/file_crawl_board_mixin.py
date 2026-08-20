@@ -7,8 +7,9 @@
 - 학습 실패/성공 집계는 file_study_* (게시판 study_*와 분리)
 - scan_count(잠금 전): 고유 상세(시작 시점 start_urls 기준 1회 카운트) + 고유 첨부 URL 수
   (= Post base + File 증분, 상세·첨부 이중 합산 없음)
-- save_count: 실제 디스크 저장·LEARN_LIST 반영 성공 시에만 증가(기존 file_saved 루프 정책 유지)
-- collection_count는 LEARN_LIST 저장 성공(save_count)과 동일하게 유지
+- collection_count: 이미지 등 비문서류/사전 중복을 제외하고 다운로드 큐에 등록된 문서 수
+- save_count: 실제 스토리지 파일 검증 완료 시에만 증가(LEARN_LIST 저장과 분리)
+- study_count: 외부 임베딩 콜백에서 LEARN_LIST status=Y 반영이 성공한 수
 - get_stats()는 SSE/UI 호환을 위해 study_*에 file_study_* 별칭을 실어 준다.
 
 FileDownloadWorkflow: (BoardContentFilePipelineMixin, FileCrawlBoardMixin, BoardContentWorkflow)
@@ -158,8 +159,8 @@ class FileCrawlBoardMixin:
         st = getattr(self, "stats", None)
         if not isinstance(st, dict):
             return
-        # UI 선별은 PG 중복 검사를 통과한 저장 후보만 반영한다. 큐 등록 수는
-        # file_attachment_enqueue_enqueued_total로 별도 보존한다.
+        # UI 선별은 비문서와 사전 중복을 통과해 다운로드 큐에 등록된 문서다.
+        # 저장/학습 완료 여부와는 별도의 진행 단계로 유지한다.
         try:
             selected = int(st.get("file_attachment_selection_confirmed_total", 0) or 0)
         except Exception:
@@ -179,8 +180,8 @@ class FileCrawlBoardMixin:
                 st[dst] = 0
 
     def get_stats(self) -> Dict[str, Any]:
-        # board.get_stats()는 min(save, collection)으로 save를 깎을 수 있어, 파일 크롤은
-        # 선별·저장을 동일 눈금으로 맞춘 뒤 super 호출 → 마지막에 self.stats 기준으로 복구한다.
+        # board.get_stats()는 board 모드의 상관관계를 적용할 수 있으므로, 파일 모드는
+        # 선별(큐 등록)과 저장(스토리지 검증)을 독립된 눈금으로 복구한다.
         try:
             confirmed_selection = max(
                 0,

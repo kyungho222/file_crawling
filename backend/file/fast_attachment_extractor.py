@@ -390,7 +390,13 @@ def _resolve_egov_file_down_onclick(onclick: str, base_url: str) -> str:
         query["bbsId"] = bbs_id
     return urljoin(base_url, "/common/cmm/fms/FileDown.do?" + urlencode(query))
 
-def _resolve_url(raw: str, onclick: str, base_url: str) -> tuple[str, bool, str]:
+def _resolve_url(
+    raw: str,
+    onclick: str,
+    base_url: str,
+    *,
+    page_script: str = "",
+) -> tuple[str, bool, str]:
     raw = normalize_attachment_href(raw or "")
     onclick = str(onclick or "").strip()
     egov_file_down = _resolve_egov_file_down_onclick(onclick, base_url)
@@ -401,7 +407,7 @@ def _resolve_url(raw: str, onclick: str, base_url: str) -> tuple[str, bool, str]
             continue
         resolved = (
             resolve_yongin_file_download_url(value, base_url)
-            or extract_download_url_from_js(value, base_url)
+            or extract_download_url_from_js(value, base_url, page_script=page_script)
             or resolve_anseong_yhlib_download_url(value, base_url)
         )
         if resolved and _is_download_url(resolved):
@@ -673,7 +679,12 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
             onclick = node.get("onclick") or ""
         except Exception:
             continue
-        href, needs_validation, reason = _resolve_url(str(raw or ""), str(onclick or ""), base_url)
+        href, needs_validation, reason = _resolve_url(
+            str(raw or ""),
+            str(onclick or ""),
+            base_url,
+            page_script=script_blob,
+        )
         if not href:
             scripted_href = _resolve_scripted_file_download(node, base_url, soup, script_blob)
             if scripted_href:
@@ -709,7 +720,12 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
         )
         for match in anchor_re.finditer(scan_html):
             raw = html_lib.unescape(match.group("href") or "")
-            href, needs_validation, reason = _resolve_url(raw, "", base_url)
+            href, needs_validation, reason = _resolve_url(
+                raw,
+                "",
+                base_url,
+                page_script=script_blob,
+            )
             if not href:
                 continue
             body = html_lib.unescape(re.sub(r"<[^>]+>", " ", match.group("body") or ""))

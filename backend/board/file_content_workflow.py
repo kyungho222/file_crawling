@@ -819,9 +819,9 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         study_workers = 1
     study_workers = max(1, min(study_workers, 4))
     try:
-        download_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4)
+        download_workers = int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5)
     except Exception:
-        download_workers = 2
+        download_workers = 5
     download_workers = max(1, min(download_workers, 16))
     return {
         "scan_workers": 1,
@@ -2720,6 +2720,11 @@ class BoardContentFilePipelineMixin:
 
         await self._record_scan_entries([c[0] for c in candidates], post_url, effective_job_id)
 
+        # Load learned file identities once per job.  Candidates with an
+        # explicit byte size can be excluded before they occupy a download
+        # worker; unknown-size candidates are checked again after download.
+        await self._load_file_pg_duplicate_fingerprints()
+
         dup_bundle = None
         conc = 0
 
@@ -2875,6 +2880,47 @@ class BoardContentFilePipelineMixin:
                     )
                 continue
 
+            try:
+                exact_file_size = int((attach or {}).get("_exact_file_size_bytes") or 0)
+            except (TypeError, ValueError):
+                exact_file_size = 0
+            if exact_file_size > 0 and self._is_file_pg_duplicate(file_name, exact_file_size):
+                await self._backfill_file_pg_duplicate_source_url_if_missing(
+                    file_name=file_name,
+                    file_size=exact_file_size,
+                    source_url=post_url,
+                )
+                _record_runtime_duplicate_skip(
+                    "pg_learned_match_pre_download",
+                    file_url,
+                    file_name,
+                )
+                _count_candidate_skip("pg_learned_match_pre_download")
+                self._record_job_result_stage(
+                    url=file_url_key or file_url,
+                    stage="file_attachment",
+                    status="skipped",
+                    reason="pg_learned_match_pre_download",
+                    source_url=post_url,
+                    file_url=file_url,
+                    file_name=file_name,
+                )
+                _log_file_url_status(
+                    stage="candidate_select",
+                    status="skipped",
+                    process_url=file_url or post_url,
+                    post_url=post_url,
+                    file_url=file_url,
+                    selected="no",
+                    saved="no",
+                    learn="skipped",
+                    reason="pg_learned_match_pre_download",
+                    name=file_name,
+                    job_id=effective_job_id,
+                    db_name=getattr(self, "db_name", ""),
+                )
+                continue
+
             claim_url = file_url_key or file_url
             claim_acquired = await try_acquire_cross_job_claim(
                 "file_download",
@@ -2965,11 +3011,10 @@ class BoardContentFilePipelineMixin:
             if file_meta:
                 file_meta["declared_file_size_bytes"] = int(attach.get("_declared_file_size_bytes") or 0)
                 file_meta["download_lane"] = "normal"
-                # Queue registration is not UI selection. Count only after the
-                # save worker has the final local file identity and passes PG
-                # duplicate verification.
+                # A valid document is selected when its download work enters
+                # the queue. Storage and learning have separate counters.
                 file_meta["_file_selection_counted"] = False
-                file_meta["_file_selection_pending_reason"] = "awaiting_save_verification"
+                file_meta["_file_selection_pending_reason"] = "awaiting_download_queue"
             if not file_meta:
                 _track_enqueue_missing(
                     "file_meta_empty",
@@ -3061,30 +3106,25 @@ class BoardContentFilePipelineMixin:
                         _collection_queue_stored_count(),
                     )
                     await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
+                    await self._confirm_file_selection_for_queue(
+                        info=file_meta,
+                        url=file_url_key or file_url,
+                        file_name=file_name,
+                        file_size=int(file_meta.get("declared_file_size_bytes") or 0),
+                    )
                     _log_file_url_status(
                         stage="download_enqueue",
                         status="queued",
                         process_url=file_url or post_url,
                         post_url=post_url,
                         file_url=file_url,
-                        selected="pending",
+                        selected="yes",
                         saved="pending",
                         learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                         name=file_name,
                         job_id=effective_job_id,
                         db_name=getattr(self, "db_name", ""),
                     )
-                    try:
-                        self._record_job_result_stage(
-                            url=file_url_key or file_url,
-                            stage="selection",
-                            status="pending",
-                            source_url=post_url,
-                            file_url=file_url,
-                            file_name=file_name,
-                        )
-                    except Exception:
-                        pass
                     enqueued += 1
             else:
                 await self._wait_for_file_learn_backpressure(file_url=file_url)
@@ -3117,30 +3157,25 @@ class BoardContentFilePipelineMixin:
                     _collection_queue_stored_count(),
                 )
                 await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
+                await self._confirm_file_selection_for_queue(
+                    info=file_meta,
+                    url=file_url_key or file_url,
+                    file_name=file_name,
+                    file_size=int(file_meta.get("declared_file_size_bytes") or 0),
+                )
                 _log_file_url_status(
                     stage="download_enqueue",
                     status="queued",
                     process_url=file_url or post_url,
                     post_url=post_url,
                     file_url=file_url,
-                    selected="pending",
+                    selected="yes",
                     saved="pending",
                     learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                     name=file_name,
                     job_id=effective_job_id,
                     db_name=getattr(self, "db_name", ""),
                 )
-                try:
-                    self._record_job_result_stage(
-                        url=file_url_key or file_url,
-                        stage="selection",
-                        status="pending",
-                        source_url=post_url,
-                        file_url=file_url,
-                        file_name=file_name,
-                    )
-                except Exception:
-                    pass
                 enqueued += 1
 
         known_missing_count = sum(enqueue_missing_reason_counts.values())
@@ -3354,6 +3389,122 @@ class BoardContentFilePipelineMixin:
             return False
         return fingerprint in (getattr(self, "_file_pg_duplicate_fingerprints", set()) or set())
 
+    async def _backfill_file_pg_duplicate_source_url_if_missing(
+        self,
+        *,
+        file_name: Any,
+        file_size: Any,
+        source_url: Any,
+    ) -> int:
+        """Fill only missing PG source_url values for an existing file identity.
+
+        A file can be learned before its board detail URL is retained in PG.
+        Keep the duplicate as a no-progress skip, but repair that missing
+        metadata from the detail page currently being crawled.
+        """
+        fingerprint = _file_pg_duplicate_fingerprint(file_name, file_size)
+        normalized_source_url = str(source_url or "").strip()
+        if not fingerprint or not normalized_source_url:
+            return 0
+
+        checked = getattr(self, "_file_pg_source_url_backfill_checked", None)
+        if not isinstance(checked, set):
+            checked = set()
+            self._file_pg_source_url_backfill_checked = checked
+        if fingerprint in checked:
+            return 0
+
+        table_name = await self._resolve_file_pg_training_table_for_source_check()
+        if not table_name or not re.fullmatch(r"td_[a-z0-9_]+_training_data", table_name):
+            return 0
+
+        try:
+            from db.db_operations import execute_query as pg_execute_query
+
+            size_value = str(fingerprint[1])
+            candidates = await pg_execute_query(
+                f"""
+                SELECT
+                    id::text AS id,
+                    COALESCE(NULLIF(content_metadata ->> 'attachment_name', ''), NULLIF(subject, '')) AS file_name,
+                    COALESCE(
+                        NULLIF(content_metadata ->> 'file_size', ''),
+                        NULLIF(content_metadata ->> 'content_size_bytes', '')
+                    ) AS file_size
+                FROM public.{table_name}
+                WHERE COALESCE(content_metadata ->> 'source_category', 'file') = 'file'
+                  AND COALESCE(
+                        NULLIF(content_metadata ->> 'file_size', ''),
+                        NULLIF(content_metadata ->> 'content_size_bytes', '')
+                  ) = $1
+                  AND COALESCE(NULLIF(BTRIM(content_metadata ->> 'source_url'), ''), '') = ''
+                """,
+                (size_value,),
+                fetch=True,
+                dbname=str(getattr(self, "db_name", "") or ""),
+            )
+            matched_ids = [
+                str(dict(row or {}).get("id") or "").strip()
+                for row in candidates or []
+                if _file_pg_duplicate_fingerprint(
+                    dict(row or {}).get("file_name"),
+                    dict(row or {}).get("file_size"),
+                ) == fingerprint
+                and str(dict(row or {}).get("id") or "").strip()
+            ]
+            if not matched_ids:
+                checked.add(fingerprint)
+                logger.info(
+                    "[FilePgDuplicate][source_url_backfill] job_id=%s table=%s file=%s size=%s result=no_missing_source_url",
+                    getattr(self, "job_id", None),
+                    table_name,
+                    str(file_name or "")[:160],
+                    fingerprint[1],
+                )
+                return 0
+
+            updated_rows = await pg_execute_query(
+                f"""
+                UPDATE public.{table_name}
+                SET content_metadata = jsonb_set(
+                    COALESCE(content_metadata::jsonb, '{{}}'::jsonb),
+                    '{{source_url}}',
+                    to_jsonb($1::text),
+                    true
+                )
+                WHERE id::text = ANY($2::text[])
+                  AND COALESCE(NULLIF(BTRIM(content_metadata ->> 'source_url'), ''), '') = ''
+                RETURNING id
+                """,
+                (normalized_source_url, matched_ids),
+                fetch=True,
+                dbname=str(getattr(self, "db_name", "") or ""),
+            )
+            updated_count = len(updated_rows or [])
+            checked.add(fingerprint)
+            logger.info(
+                "[FilePgDuplicate][source_url_backfill] job_id=%s table=%s file=%s size=%s updated_rows=%s source_url=%s",
+                getattr(self, "job_id", None),
+                table_name,
+                str(file_name or "")[:160],
+                fingerprint[1],
+                updated_count,
+                normalized_source_url[:220],
+            )
+            return updated_count
+        except Exception as exc:
+            logger.warning(
+                "[FilePgDuplicate][source_url_backfill_failed] job_id=%s table=%s file=%s size=%s source_url=%s err_type=%s err=%s",
+                getattr(self, "job_id", None),
+                table_name,
+                str(file_name or "")[:160],
+                fingerprint[1],
+                normalized_source_url[:220],
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+
     def _file_pg_duplicate_name_exists(self, file_name: Any) -> bool:
         """Avoid a preflight request unless PG has at least one same-name file."""
         fingerprint = _file_pg_duplicate_fingerprint(file_name, 1)
@@ -3431,7 +3582,7 @@ class BoardContentFilePipelineMixin:
             )
             return "", 0
 
-    async def _confirm_file_selection_after_download(
+    async def _confirm_file_selection_for_queue(
         self,
         *,
         info: Dict[str, Any],
@@ -3439,10 +3590,11 @@ class BoardContentFilePipelineMixin:
         file_name: str,
         file_size: int,
     ) -> bool:
-        """Count an ambiguous candidate only after its exact identity is known."""
+        """Count a document only after its download work was accepted by the queue."""
         original_meta = info.get("original_meta") if isinstance(info.get("original_meta"), dict) else {}
-        if original_meta.get("_file_selection_counted"):
+        if info.get("_file_selection_counted") or original_meta.get("_file_selection_counted"):
             return False
+        info["_file_selection_counted"] = True
         original_meta["_file_selection_counted"] = True
         original_meta.pop("_file_selection_pending_reason", None)
         async with self._stats_lock:
@@ -3462,13 +3614,41 @@ class BoardContentFilePipelineMixin:
         except Exception:
             pass
         logger.info(
-            "[FilePgDuplicate][selection_confirmed] job_id=%s file=%s size=%s file_url=%s",
+            "[FileCounterTrace][selection_queued] job_id=%s file=%s declared_size=%s file_url=%s",
             getattr(self, "job_id", None),
             (file_name or "")[:180],
             file_size,
             (url or "")[:220],
         )
         return True
+
+    async def _record_file_persist_outcome(
+        self,
+        *,
+        outcome: str,
+        reason: str,
+        file_url: str,
+        file_name: str,
+        row_id: Any = None,
+        persistence_action: str = "",
+    ) -> None:
+        """Record the MariaDB outcome separately from physical file storage."""
+        outcome_key = re.sub(r"[^a-z0-9_]+", "_", str(outcome or "unknown").lower()).strip("_") or "unknown"
+        async with self._stats_lock:
+            key = f"file_persist_{outcome_key}_count"
+            self.stats[key] = int(self.stats.get(key, 0) or 0) + 1
+            self._bump_stats_revision_locked()
+        logger.info(
+            "[FilePersist][db_outcome] job_id=%s db=%s outcome=%s reason=%s persistence_action=%s row_id=%s file_url=%s file=%s",
+            getattr(self, "job_id", None),
+            getattr(self, "db_name", None),
+            outcome_key,
+            reason or "-",
+            persistence_action or "-",
+            row_id if row_id is not None else "-",
+            (file_url or "")[:220],
+            (file_name or "")[:180],
+        )
 
     def _remember_file_pg_duplicate_fingerprint(self, file_name: Any, file_size: Any) -> None:
         fingerprint = _file_pg_duplicate_fingerprint(file_name, file_size)
@@ -5136,17 +5316,15 @@ class BoardContentFilePipelineMixin:
 
     @log_calls
     async def _rollback_saved_selection_for_rrn_pattern(self, *, save_key: str) -> None:
-        if not save_key:
-            return
-        async with self._stats_lock:
-            if save_key not in getattr(self, "_counted_save_keys", set()):
-                return
-            self.stats["save_count"] = max(0, int(self.stats.get("save_count", 0) or 0) - 1)
-            self.stats["save_success_count"] = max(
-                0,
-                int(self.stats.get("save_success_count", 0) or 0) - 1,
+        # A later learning-policy rejection does not undo a file that was
+        # already verified in storage. Keep the physical-storage counter
+        # immutable; only the study result becomes skipped.
+        if save_key:
+            logger.info(
+                "[FileCounterTrace][storage_preserved_after_learning_skip] job_id=%s key=%s",
+                getattr(self, "job_id", None),
+                (save_key or "")[:220],
             )
-            self.stats["collection_count"] = int(self.stats.get("save_count", 0) or 0)
 
     async def await_background_completion(self) -> None:
         """Wait until every saved file has completed its external learning request."""
@@ -7393,6 +7571,62 @@ class BoardContentFilePipelineMixin:
                 continue
 
             if download_inflight:
+                # Large workers may be occupied for minutes while normal items
+                # are still waiting. Add at most one short-lived normal worker
+                # per watchdog pass; WorkerManager caps the elastic pool and
+                # force-expires every elastic task after ten minutes.
+                normal_waiting = max(
+                    0,
+                    int(snapshot.get("collection_batch_queue", 0) or 0)
+                    + int(snapshot.get("collection_batch_queue_buffer", 0) or 0),
+                )
+                large_active = sum(
+                    1
+                    for item in download_inflight
+                    if isinstance(item, dict) and str(item.get("lane") or "").lower() == "large"
+                )
+                normal_active = sum(
+                    1
+                    for item in download_inflight
+                    if isinstance(item, dict) and str(item.get("lane") or "").lower() == "normal"
+                )
+                manager = getattr(self, "_file_worker_manager", None)
+                if manager is None and bool(getattr(self, "use_global_pool", False)):
+                    try:
+                        from core.crawler.global_pool import get_global_worker_pool
+
+                        manager = get_global_worker_pool()
+                    except Exception:
+                        manager = None
+                runtime = dict(getattr(manager, "_download_runtime_config", {}) or {}) if manager else {}
+                base_large = int(runtime.get("large_workers") or 0)
+                base_normal = int(runtime.get("normal_workers") or 0)
+                if (
+                    normal_waiting > 0
+                    and base_large > 0
+                    and large_active >= base_large
+                    and normal_active >= base_normal
+                    and manager is not None
+                    and hasattr(manager, "ensure_elastic_normal_download_worker")
+                ):
+                    try:
+                        await manager.ensure_elastic_normal_download_worker(
+                            reason=(
+                                f"job={getattr(self, 'job_id', None)} "
+                                f"normal_waiting={normal_waiting} "
+                                f"large_active={large_active}/{base_large} "
+                                f"normal_active={normal_active}/{base_normal}"
+                            ),
+                            max_elastic_workers=2,
+                            lifetime_sec=600.0,
+                        )
+                    except Exception as scale_exc:
+                        logger.warning(
+                            "[FileCrawlTrace][elastic_download_scale_failed] job_id=%s err_type=%s err=%s",
+                            getattr(self, "job_id", None),
+                            type(scale_exc).__name__,
+                            scale_exc,
+                        )
                 active_lines = []
                 for item in download_inflight:
                     if not isinstance(item, dict):
@@ -7865,6 +8099,40 @@ class BoardContentFilePipelineMixin:
                                 file_name=file_name,
                                 detail=f"size={file_size}",
                             )
+                            # The storage counter is intentionally advanced at
+                            # the durable-file boundary, before MariaDB/learning
+                            # work can add their own latency or fail.
+                            await self._mark_save_done(url=save_key, ok=True)
+                            try:
+                                append_stage_urls(
+                                    stage="save",
+                                    urls=[{"url": save_key, "file_path": file_path}],
+                                    job_id=getattr(self, "job_id", None),
+                                    db_name=getattr(self, "db_name", None),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[FilePersist][storage_saved_stage_append_failed] job_id=%s file_url=%s err=%s",
+                                    getattr(self, "job_id", None),
+                                    (url or "")[:220],
+                                    exc,
+                                )
+                            logger.info(
+                                "[FilePersist][storage_saved_counted] job_id=%s file_url=%s size=%s",
+                                getattr(self, "job_id", None),
+                                (url or "")[:220],
+                                file_size,
+                            )
+                            if self.progress_callback:
+                                try:
+                                    self.progress_callback(self.get_stats())
+                                except Exception:
+                                    logger.debug(
+                                        "[FilePersist][storage_saved_progress_publish_failed] job_id=%s file_url=%s",
+                                        getattr(self, "job_id", None),
+                                        (url or "")[:220],
+                                        exc_info=True,
+                                    )
                         except Exception as exc:
                             path_ok = False
                             file_size = 0
@@ -7915,12 +8183,90 @@ class BoardContentFilePipelineMixin:
                     )
 
                     if save_key and file_path and path_ok:
-                        await self._confirm_file_selection_after_download(
-                            info=info,
-                            url=save_key,
-                            file_name=file_name,
-                            file_size=file_size,
-                        )
+                        if self._is_file_pg_duplicate(file_name, file_size):
+                            # Metadata-only repair must never occupy every save
+                            # worker.  PG can be unavailable even though the
+                            # duplicate decision was already made in memory.
+                            active_progress[trace_key]["stage"] = "pg_duplicate_source_url_backfill"
+                            self._trace_file_pipeline_transition(
+                                stage="pg_duplicate_source_url_backfill_begin",
+                                url=url,
+                                post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                file_name=file_name,
+                                detail=f"size={file_size}",
+                            )
+                            try:
+                                backfill_count = await asyncio.wait_for(
+                                    self._backfill_file_pg_duplicate_source_url_if_missing(
+                                        file_name=file_name,
+                                        file_size=file_size,
+                                        source_url=info.get("source_page") or info.get("source_url"),
+                                    ),
+                                    timeout=10.0,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "[FilePgDuplicate][source_url_backfill_timeout] job_id=%s timeout_sec=10.0 file=%s size=%s post_url=%s file_url=%s",
+                                    getattr(self, "job_id", None),
+                                    file_name,
+                                    file_size,
+                                    (info.get("source_page") or info.get("source_url") or "")[:220],
+                                    (url or "")[:220],
+                                )
+                                self._trace_file_pipeline_transition(
+                                    stage="pg_duplicate_source_url_backfill_timeout",
+                                    url=url,
+                                    post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                    file_name=file_name,
+                                    detail="timeout_sec=10.0",
+                                )
+                            else:
+                                self._trace_file_pipeline_transition(
+                                    stage="pg_duplicate_source_url_backfill_done",
+                                    url=url,
+                                    post_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                    file_name=file_name,
+                                    detail=f"updated_rows={backfill_count}",
+                                )
+                            logger.info(
+                                "[FilePgDuplicate][skip] job_id=%s phase=post_download file=%s size=%s post_url=%s file_url=%s reason=pg_learned_match",
+                                getattr(self, "job_id", None),
+                                file_name,
+                                file_size,
+                                (info.get("source_page") or info.get("source_url") or "")[:220],
+                                (url or "")[:220],
+                            )
+                            self._record_job_result_stage(
+                                url=save_key,
+                                stage="persist",
+                                status="skipped",
+                                reason="pg_learned_match_post_download",
+                                source_url=info.get("source_page") or info.get("source_url"),
+                                file_url=url,
+                                file_name=file_name,
+                                file_path=file_path,
+                            )
+                            _log_file_url_status(
+                                stage="learn_list_persist",
+                                status="skipped",
+                                process_url=url,
+                                post_url=info.get("source_page") or info.get("source_url") or "",
+                                file_url=url,
+                                selected="yes",
+                                saved="yes",
+                                learn="skipped",
+                                reason="pg_learned_match_post_download",
+                                name=file_name,
+                                job_id=getattr(self, "job_id", ""),
+                                db_name=getattr(self, "db_name", ""),
+                            )
+                            await self._record_file_persist_outcome(
+                                outcome="skipped",
+                                reason="pg_learned_match_post_download",
+                                file_url=url,
+                                file_name=file_name,
+                            )
+                            continue
                         throttle_sec = _file_crawl_save_throttle_seconds()
                         if throttle_sec > 0:
                             await asyncio.sleep(throttle_sec)
@@ -7968,7 +8314,7 @@ class BoardContentFilePipelineMixin:
                             try:
                                 self._record_job_result_stage(
                                     url=save_key,
-                                    stage="save",
+                                    stage="persist",
                                     status="failed",
                                     reason="learn_list_ensure_timeout",
                                     source_url=info.get("source_page") or info.get("source_url"),
@@ -7978,7 +8324,12 @@ class BoardContentFilePipelineMixin:
                                 )
                             except Exception:
                                 pass
-                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._record_file_persist_outcome(
+                                outcome="failed",
+                                reason="learn_list_ensure_timeout",
+                                file_url=url,
+                                file_name=file_name,
+                            )
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_ensure_timeout post_url=%s file_url=%s file=%s",
@@ -8025,7 +8376,7 @@ class BoardContentFilePipelineMixin:
                                 post_url=info.get("source_page") or info.get("source_url") or "",
                                 file_url=url,
                                 selected="yes",
-                                saved="no",
+                                saved="yes",
                                 learn="not_started",
                                 reason="learn_list_no_row",
                                 name=file_name,
@@ -8040,7 +8391,7 @@ class BoardContentFilePipelineMixin:
                             try:
                                 self._record_job_result_stage(
                                     url=save_key,
-                                    stage="save",
+                                    stage="persist",
                                     status="failed",
                                     reason="learn_list_no_row",
                                     source_url=info.get("source_page") or info.get("source_url"),
@@ -8050,7 +8401,12 @@ class BoardContentFilePipelineMixin:
                                 )
                             except Exception:
                                 pass
-                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._record_file_persist_outcome(
+                                outcome="failed",
+                                reason="learn_list_no_row",
+                                file_url=url,
+                                file_name=file_name,
+                            )
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_no_row post_url=%s file_url=%s file=%s",
@@ -8081,7 +8437,7 @@ class BoardContentFilePipelineMixin:
                             try:
                                 self._record_job_result_stage(
                                     url=save_key,
-                                    stage="save",
+                                    stage="persist",
                                     status="failed",
                                     reason="learn_list_invalid_row_id",
                                     source_url=info.get("source_page") or info.get("source_url"),
@@ -8091,7 +8447,13 @@ class BoardContentFilePipelineMixin:
                                 )
                             except Exception:
                                 pass
-                            await self._mark_save_done(url=save_key, ok=False)
+                            await self._record_file_persist_outcome(
+                                outcome="failed",
+                                reason="learn_list_invalid_row_id",
+                                file_url=url,
+                                file_name=file_name,
+                                row_id=row_out,
+                            )
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_invalid_row_id row_id=%s post_url=%s file_url=%s file=%s",
@@ -8157,6 +8519,14 @@ class BoardContentFilePipelineMixin:
                                 row_out,
                                 info.get("learn_list_existing_status"),
                             )
+                            await self._record_file_persist_outcome(
+                                outcome="skipped",
+                                reason="duplicate_reuse_learned",
+                                file_url=url,
+                                file_name=file_name,
+                                row_id=row_out,
+                                persistence_action="existing_row",
+                            )
                             continue
                         try:
                             self._record_job_result_stage(
@@ -8179,7 +8549,14 @@ class BoardContentFilePipelineMixin:
                             )
                             self.stats[counter_key] = int(self.stats.get(counter_key, 0) or 0) + 1
                             self._bump_stats_revision_locked()
-                        await self._mark_save_done(url=save_key, ok=True)
+                        await self._record_file_persist_outcome(
+                            outcome=persistence_action,
+                            reason="learn_list_row_ready",
+                            file_url=url,
+                            file_name=file_name,
+                            row_id=row_out,
+                            persistence_action=persistence_action,
+                        )
                         logger.info(
                             "[FilePersist][persist_result] job_id=%s worker=%s result=saved persistence=%s db=%s table=%s row_id=%s post_url=%s file_url=%s file=%s size=%s",
                             getattr(self, "job_id", None), trace_key, persistence_action,

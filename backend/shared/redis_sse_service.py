@@ -31,12 +31,6 @@ if not logger.handlers:
 STOP_STATUSES = {"stop", "stopped", "cancelled", "cancel", "coll_stop"}
 COMPLETED_STATUSES = {"completed", "complete", "crawled", "ok", "finished"}
 
-
-def _local_file_crawl_no_redis_enabled() -> bool:
-    return str(os.getenv("LOCAL_FILE_CRAWL_NO_REDIS", "1") or "1").strip().lower() in {
-        "1", "true", "yes", "y", "on"
-    }
-
 try:
     RUNNING_STATE_TTL = int(os.getenv("SSE_RUNNING_STATE_TTL_SEC", "86400") or "86400")
 except Exception:
@@ -679,9 +673,6 @@ def _should_skip_state_write(job_id: str, message: Dict[str, Any]) -> bool:
 
 # --- 諛쒗뻾 諛??낅뜲?댄듃 濡쒖쭅 (湲곗〈 ?좎?) ---
 async def update_state_only(*, job_id: str, account_name: str, payload: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> bool:
-    if _local_file_crawl_no_redis_enabled() and str(job_id or "").startswith("local-file-crawl-"):
-        _last_publish_meta[job_id] = {"message": dict(payload or {}), "counts": _count_snapshot(payload or {}), "state_key": "", "updated_at_ts": time.time()}
-        return True
     state_t0 = time.perf_counter()
     try:
         redis_client: Redis = await asyncio.wait_for(get_redis(), timeout=_redis_get_timeout_sec())
@@ -1375,9 +1366,6 @@ def get_last_publish_meta(job_id: str) -> Dict[str, Any]:
     return _last_publish_meta.get(job_id, {})
 
 async def send_message_to_redis_sse(job_id: str, message: Dict[str, Any], dbname: Optional[str] = None):
-    if _local_file_crawl_no_redis_enabled() and str(job_id or "").startswith("local-file-crawl-"):
-        _last_publish_meta[job_id] = {"message": dict(message or {}), "counts": _count_snapshot(message or {}), "state_key": "", "updated_at_ts": time.time()}
-        return RedisSSEPublishResponse(job_id=job_id, account_name=dbname)
     try:
         payload = _build_payload(message)
         extra = {k: v for k, v in message.items() if k not in RedisSSEPayload.model_fields}

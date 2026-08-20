@@ -77,6 +77,10 @@ class WorkerManager:
         self._retired_browsers: Dict[int, Browser] = {}
         self._retired_browser_cleanup_tasks: set[asyncio.Task] = set()
         self._retired_browser_force_cleanup_tasks: set[asyncio.Task] = set()
+        self._normal_download_semaphore: Optional[asyncio.Semaphore] = None
+        self._download_runtime_config: Dict[str, Any] = {}
+        self._elastic_download_tasks: set[asyncio.Task] = set()
+        self._elastic_download_sequence = 0
 
     async def start(self):
         """워커 풀 시작 및 Playwright 초기화"""
@@ -277,17 +281,17 @@ class WorkerManager:
                 max_concurrent = int(
                     os.getenv(
                         "DOWNLOAD_MAX_CONCURRENT",
-                        str(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4)),
+                        str(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5)),
                     )
                 )
         except Exception:
-            max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 4) or 4)
+            max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5) or 5)
         max_concurrent = max(1, max_concurrent)
 
-        total_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 4) or 4))
+        total_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5))
         requested_large_workers = max(
             0,
-            int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 1) or 0),
+            int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 2) or 0),
         )
         large_workers = min(requested_large_workers, max(0, total_workers - 1))
         requested_normal_workers = max(
@@ -305,6 +309,12 @@ class WorkerManager:
             max_concurrent,
         )
         shared_download_semaphore = asyncio.Semaphore(normal_workers)
+        self._normal_download_semaphore = shared_download_semaphore
+        self._download_runtime_config = {
+            "max_concurrent": max_concurrent,
+            "normal_workers": normal_workers,
+            "large_workers": large_workers,
+        }
         for i in range(normal_workers):
             worker_lane = "normal"
             worker_queue = self.job_queues.collection_batch_queue
@@ -345,6 +355,7 @@ class WorkerManager:
                         browser_relauncher=self._relaunch_browser,
                         worker_id=normal_workers + i + 1,
                         worker_lane="large",
+                        fallback_in_queue=self.job_queues.collection_batch_queue,
                         shared_download_semaphore=large_download_semaphore,
                     )
                 )
@@ -355,6 +366,104 @@ class WorkerManager:
                     worker_id=normal_workers + i + 1,
                     lane="large",
                 )
+
+    async def ensure_elastic_normal_download_worker(
+        self,
+        *,
+        reason: str,
+        max_elastic_workers: int = 2,
+        lifetime_sec: float = 600.0,
+    ) -> bool:
+        """Start one bounded normal-lane worker when large downloads block the base pool."""
+        runtime = dict(getattr(self, "_download_runtime_config", {}) or {})
+        normal_workers = int(runtime.get("normal_workers") or 0)
+        if normal_workers < 1:
+            return False
+
+        elastic_tasks = getattr(self, "_elastic_download_tasks", None)
+        if not isinstance(elastic_tasks, set):
+            elastic_tasks = set()
+            self._elastic_download_tasks = elastic_tasks
+        elastic_tasks.intersection_update(
+            task
+            for task in elastic_tasks
+            if isinstance(task, asyncio.Task) and not task.done()
+        )
+        max_elastic_workers = max(0, min(int(max_elastic_workers or 0), 4))
+        if len(elastic_tasks) >= max_elastic_workers:
+            return False
+
+        semaphore = getattr(self, "_normal_download_semaphore", None)
+        if semaphore is None:
+            return False
+
+        self._elastic_download_sequence += 1
+        worker_id = (
+            normal_workers
+            + int(runtime.get("large_workers") or 0)
+            + self._elastic_download_sequence
+        )
+        max_concurrent = max(1, int(runtime.get("max_concurrent") or 1))
+        lifetime_sec = max(60.0, min(float(lifetime_sec or 600.0), 600.0))
+
+        # The base semaphore is sized to the initial normal workers. One permit
+        # makes this elastic worker real concurrency instead of a parked task.
+        semaphore.release()
+
+        async def _run_elastic_worker() -> None:
+            try:
+                await asyncio.wait_for(
+                    download_worker(
+                        self.job_queues.collection_batch_queue,
+                        self.job_queues.save_batch_queue,
+                        progress_queue=self.job_queues.progress_queue,
+                        max_concurrent=max_concurrent,
+                        browser=self.browser,
+                        browser_getter=self.acquire_browser,
+                        browser_releaser=self.release_browser,
+                        browser_relauncher=self._relaunch_browser,
+                        worker_id=worker_id,
+                        worker_lane="normal",
+                        large_download_queue=(
+                            self.job_queues.large_collection_batch_queue
+                            if int(runtime.get("large_workers") or 0) > 0
+                            else None
+                        ),
+                        shared_download_semaphore=semaphore,
+                    ),
+                    timeout=lifetime_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[WorkerManager][elastic_download_worker_expired] db=%s worker=%s lifetime_sec=%.0f reason=%s",
+                    self.db_name,
+                    worker_id,
+                    lifetime_sec,
+                    reason,
+                )
+            finally:
+                # A completed elastic task is removed before the next scale check.
+                self._elastic_download_tasks.discard(asyncio.current_task())
+
+        task = asyncio.create_task(
+            _run_elastic_worker(),
+            name=f"download-elastic-normal-worker-{worker_id}",
+        )
+        self._elastic_download_tasks.add(task)
+        task.add_done_callback(self._elastic_download_tasks.discard)
+        self.download_tasks.append(task)
+        self.tasks.append(task)
+        self._log_download_task_lifecycle(task, worker_id=worker_id, lane="normal-elastic")
+        logger.info(
+            "[WorkerManager][elastic_download_worker_created] db=%s worker=%s active_elastic=%s max_elastic=%s lifetime_sec=%.0f reason=%s",
+            self.db_name,
+            worker_id,
+            len(elastic_tasks),
+            max_elastic_workers,
+            lifetime_sec,
+            reason,
+        )
+        return True
 
     def _log_download_task_lifecycle(self, task: asyncio.Task, *, worker_id: int, lane: str) -> None:
         logger.info(

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>파일 크롤링 대시보드</title>
+  <style>
+    :root { --bg:#f4f7f9; --panel:#ffffff; --line:#d7e0e7; --ink:#18232c; --muted:#5e6d78; --blue:#0868d7; --green:#087a60; --amber:#a35c00; --red:#bb2923; --navy:#14222d; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); background:var(--bg); font:14px Arial,"Malgun Gothic",sans-serif; }
+    main { max-width:1680px; margin:auto; padding:20px; } header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; } h1,h2,h3,p { margin:0; } h1 { font-size:24px; } h2 { font-size:15px; } h3 { font-size:13px; color:var(--muted); } .muted { color:var(--muted); } .error { color:var(--red); white-space:pre-wrap; }
+    .toolbar,.form-row,.segmented { display:flex; gap:8px; align-items:center; flex-wrap:wrap; } button,input,textarea { font:inherit; } button { min-height:36px; padding:7px 11px; color:#fff; background:var(--blue); border:1px solid var(--blue); border-radius:5px; cursor:pointer; font-weight:700; } button:hover { filter:brightness(.94); } button.subtle { color:var(--ink); border-color:var(--line); background:#fff; } button.stop { background:var(--red); border-color:var(--red); } button.mode { color:var(--ink); border-color:var(--line); background:#fff; } button.mode.selected { color:#fff; background:var(--blue); border-color:var(--blue); }
+    input,textarea { width:100%; padding:8px 9px; color:var(--ink); border:1px solid var(--line); border-radius:5px; background:#fff; } textarea { min-height:80px; resize:vertical; } label { display:grid; gap:5px; color:var(--muted); font-size:12px; font-weight:700; }
+    .top-grid { display:grid; grid-template-columns:370px minmax(0,1fr); gap:14px; margin-bottom:14px; } .layout { display:grid; grid-template-columns:330px minmax(0,1fr); gap:14px; } .panel { padding:14px; border:1px solid var(--line); border-radius:7px; background:var(--panel); } .panel > h2 { margin-bottom:12px; } .controls { display:grid; gap:11px; } .form-row > label { flex:1 1 145px; }
+    .run-note { padding:9px; border-left:3px solid var(--blue); color:var(--muted); background:#f4f8ff; line-height:1.45; } .job-list { display:grid; gap:8px; max-height:calc(100vh - 255px); overflow:auto; } .job { padding:10px; border:1px solid var(--line); border-radius:5px; background:#fbfcfd; cursor:pointer; } .job.selected { border-color:var(--blue); box-shadow:inset 3px 0 var(--blue); } .job-id { font:12px Consolas,monospace; word-break:break-all; } .tag { display:inline-block; margin-top:6px; padding:3px 6px; border-radius:4px; background:#eaf1ff; color:#20568e; font-size:12px; font-weight:700; } .job .muted { margin-top:6px; font-size:12px; }
+    .metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:9px; margin:12px 0 14px; } .metric { min-height:76px; padding:10px; border:1px solid var(--line); border-radius:6px; } .metric span { display:block; color:var(--muted); font-size:12px; } .metric strong { display:block; margin-top:6px; font-size:22px; } .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; } .full { grid-column:1/-1; }
+    .kv { width:100%; border-collapse:collapse; } .kv th,.kv td { padding:7px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; word-break:break-word; } .kv th { width:40%; color:var(--muted); font-size:12px; font-weight:600; } .json { max-height:320px; margin:8px 0 0; padding:10px; overflow:auto; border-radius:5px; background:var(--navy); color:#d9e6f3; font:12px Consolas,monospace; white-space:pre-wrap; word-break:break-word; } .inflight { margin:8px 0 0; padding:0; list-style:none; } .inflight li,.event { padding:8px 0; border-bottom:1px solid var(--line); word-break:break-all; } .event time { color:var(--muted); font:12px Consolas,monospace; }
+    .empty { padding:18px 2px; color:var(--muted); } .filter-status { font-size:12px; } .active-title { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    @media (max-width:1080px) { .top-grid,.layout { grid-template-columns:1fr; } .job-list { max-height:300px; } .metrics { grid-template-columns:repeat(3,minmax(0,1fr)); } } @media (max-width:680px) { main { padding:12px; } header { flex-direction:column; } .metrics,.grid { grid-template-columns:1fr; } .full { grid-column:auto; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><h1>파일 크롤링 대시보드</h1><p class="muted">실제 파일 큐, 다운로드, 저장, 학습 요청 및 콜백 상태</p></div>
+      <div class="toolbar"><span id="updated" class="muted"></span><button id="refresh" class="subtle">새로고침</button></div>
+    </header>
+    <div class="top-grid">
+      <section class="panel controls">
+        <h2>실행 제어</h2>
+        <div class="form-row"><label>DB 이름<input id="db-name" placeholder="예: newvit"></label><label>Chatbot ID<input id="chatbot-id" placeholder="UUID 또는 ID"></label></div>
+        <label>시작 URL 또는 상세 URL<textarea id="start-urls" placeholder="한 줄에 URL 하나씩 입력"></textarea></label>
+        <div><h3>실행 범위</h3><div class="segmented" id="run-mode"><button class="mode" data-mode="discover">탐색·선별</button><button class="mode" data-mode="save">저장까지</button><button class="mode selected" data-mode="full">전체 실행</button></div></div>
+        <div class="toolbar"><button id="start">파일 크롤링 시작</button><span id="run-message" class="filter-status muted"></span></div>
+        <div class="run-note">시작과 중단은 기존 파일 크롤링 API를 호출합니다. 대시보드는 별도의 큐나 워커를 생성하지 않습니다.</div>
+      </section>
+      <section class="panel">
+        <div class="active-title"><h2>이력 필터</h2><span id="filter-status" class="filter-status muted"></span></div>
+        <div class="form-row"><label>DB 이름<input id="filter-db" placeholder="전체 DB"></label><label>Chatbot ID<input id="filter-chatbot" placeholder="전체 Chatbot"></label></div>
+        <div class="run-note" style="margin-top:12px">대시보드에서 시작한 작업은 DB와 Chatbot ID 조합으로 이력을 보존합니다. 카운트와 최종 상태는 실제 `ASADAL_CRAWLING_LOG`를 우선 표시합니다.</div>
+      </section>
+    </div>
+    <div class="layout">
+      <aside class="panel"><h2>파일 작업 이력</h2><div id="jobs" class="job-list"><div class="empty">작업을 조회하고 있습니다.</div></div></aside>
+      <section id="detail" class="panel"><div class="empty">왼쪽에서 작업을 선택하세요.</div></section>
+    </div>
+  </main>
+  <script>
+    const ROOT = location.pathname.startsWith('/Ai_Pro_filecrawler/') ? '/Ai_Pro_filecrawler' : '';
+    const API = `${ROOT}/file-crawl-dashboard/api`;
+    let selectedJobId = '', selectedMode = 'full', poller = null;
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    const num = value => Number(value || 0).toLocaleString('ko-KR');
+    const json = value => esc(JSON.stringify(value || {}, null, 2));
+    const field = id => document.querySelector(`#${id}`);
+    const query = () => new URLSearchParams({db_name:field('filter-db').value.trim(), chat_bot_id:field('filter-chatbot').value.trim()});
+    async function get(path) { const response = await fetch(`${API}${path}`, {cache:'no-store'}); if (!response.ok) throw new Error(await response.text()); return response.json(); }
+    async function post(path, body) { const response = await fetch(`${API}${path}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:body ? JSON.stringify(body) : undefined}); if (!response.ok) throw new Error(await response.text()); return response.json(); }
+    function counts(job) { const stats = job.stats || job.crawl_log || {}; return `탐색 ${num(stats.scan_count ?? stats.scan)} · 선별 ${num(stats.collection_count ?? stats.collection)} · 저장 ${num(stats.save_count ?? stats.save)} · 학습 ${num(stats.study_count ?? stats.study)}`; }
+    function label(job) { return job.active ? '실행 중' : (job.crawl_log?.status || job.history?.status || job.last_event || '종료'); }
+    function renderJobs(data) {
+      const active = data.jobs || [], history = data.history || [], unique = new Map(); [...active, ...history].forEach(job => unique.set(job.job_id, {...unique.get(job.job_id), ...job}));
+      const jobs = [...unique.values()]; const target = field('jobs');
+      field('filter-status').textContent = `${jobs.length}건 표시`;
+      if (!jobs.length) { target.innerHTML = '<div class="empty">조건에 맞는 파일 크롤링 이력이 없습니다.</div>'; return; }
+      if (!selectedJobId || !jobs.some(job => job.job_id === selectedJobId)) selectedJobId = jobs[0].job_id;
+      target.innerHTML = jobs.map(job => `<div class="job ${job.job_id === selectedJobId ? 'selected' : ''}" data-job-id="${esc(job.job_id)}"><div class="job-id">${esc(job.job_id)}</div><span class="tag">${esc(label(job))}</span><div class="muted">${esc(job.workflow?.db_name || job.db_name || job.history?.db_name || '')} · ${esc(job.workflow?.chat_bot_id || job.chat_bot_id || '')}</div><div class="muted">${esc(counts(job))}</div></div>`).join('');
+      target.querySelectorAll('.job').forEach(node => node.addEventListener('click', () => { selectedJobId = node.dataset.jobId; refresh(); }));
+    }
+    const rows = object => Object.entries(object || {}).map(([key,value]) => `<tr><th>${esc(key)}</th><td>${esc(typeof value === 'object' ? JSON.stringify(value) : value)}</td></tr>`).join('');
+    function inflight(items, empty) { if (!items?.length) return `<div class="empty">${empty}</div>`; return `<ul class="inflight">${items.map(item => `<li><strong>${esc(item.worker || item.lane || item.stage || 'worker')}</strong> · ${esc(item.elapsed_sec ?? '')}초<br><span class="muted">${esc(item.name || item.filename || item.url || item.file_url || '')}</span></li>`).join('')}</ul>`; }
+    function renderDetail(data) {
+      const stats = data.stats || {}, workers = data.workers || {}, queues = data.queues || {}, events = data.audit_events || [];
+      field('detail').innerHTML = `<header><div><h2>${esc(data.job_id)}</h2><p class="muted">${esc(data.workflow?.db_name || data.history?.db_name || '')} · ${esc(data.workflow?.chat_bot_id || data.history?.chat_bot_id || '')}</p></div>${data.active ? '<button id="stop" class="stop">중단 요청</button>' : ''}</header>
+        <section class="metrics"><div class="metric"><span>탐색</span><strong>${num(stats.scan_count)}</strong></div><div class="metric"><span>선별 확정</span><strong>${num(stats.collection_count)}</strong></div><div class="metric"><span>저장</span><strong>${num(stats.save_count)}</strong></div><div class="metric"><span>학습 완료</span><strong>${num(stats.study_success_count ?? stats.study_count)}</strong></div><div class="metric"><span>콜백 대기</span><strong>${num(data.pending_embedding_callbacks)}</strong></div></section>
+        <div class="grid"><section class="panel"><h2>작업 상태</h2><table class="kv"><tbody>${rows({...data.workflow, task_error:data.task_error || '-'})}</tbody></table></section><section class="panel"><h2>큐 상태</h2><table class="kv"><tbody>${rows(queues)}</tbody></table></section><section class="panel"><h2>다운로드 점유</h2>${inflight(workers.download_inflight, '다운로드 점유 항목이 없습니다.')}</section><section class="panel"><h2>저장 점유</h2>${inflight(workers.save_inflight, '저장 점유 항목이 없습니다.')}</section><section class="panel full"><h2>워커 상태</h2><pre class="json">${json(workers)}</pre></section><section class="panel"><h2>DB 작업 지연</h2><pre class="json">${json(data.db_operations)}</pre></section><section class="panel"><h2>진행 카운터</h2><pre class="json">${json(stats)}</pre></section><section class="panel full"><h2>상태 이력</h2><pre class="json">${json(data.history_events || [data.history])}</pre></section><section class="panel full"><h2>파일 파이프라인 감사 로그</h2>${events.length ? events.map(event => `<div class="event"><time>${esc(event.ts || '')}</time> <strong>${esc(event.event || '')}</strong><br><span class="muted">${esc(event.filename || event.url || event.error_message || '')}</span></div>`).join('') : '<div class="empty">현재 작업의 JSONL 감사 로그가 없습니다.</div>'}</section></div>`;
+      field('stop')?.addEventListener('click', stopSelected);
+    }
+    async function stopSelected() { if (!selectedJobId || !confirm('이 작업의 신규 큐 적재와 진행 중 다운로드를 중단 요청할까요?')) return; try { await post(`/jobs/${encodeURIComponent(selectedJobId)}/stop`); await refresh(); } catch (error) { alert(`중단 요청 실패: ${error.message}`); } }
+    function setMode(mode) { selectedMode = mode; document.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('selected', button.dataset.mode === mode)); }
+    async function start() { const dbName = field('db-name').value.trim(), chatBotId = field('chatbot-id').value.trim(), urls = field('start-urls').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean); if (!dbName || !chatBotId || !urls.length) { field('run-message').textContent = 'DB 이름, Chatbot ID, URL을 입력하세요.'; return; }
+      const mode = selectedMode; const payload = {job_id:crypto.randomUUID(), db_name:dbName, chat_bot_id:chatBotId, colle:'file', content_type:'file', contents:urls, contents_url:urls[0], dashboard_run_mode:mode, enable_db_save:mode !== 'discover', enable_learning:mode === 'full', file_pipeline_skip_learning:mode !== 'full'};
+      field('start').disabled = true; field('run-message').textContent = '시작 요청 중'; try { const result = await post('/start', payload); selectedJobId = result.job_id || payload.job_id; field('filter-db').value = dbName; field('filter-chatbot').value = chatBotId; field('run-message').textContent = `작업 시작됨: ${selectedJobId}`; await refresh(); } catch (error) { field('run-message').textContent = `시작 실패: ${error.message}`; } finally { field('start').disabled = false; } }
+    async function refresh() { try { const jobs = await get(`/jobs?${query().toString()}`); renderJobs(jobs); if (selectedJobId) renderDetail(await get(`/jobs/${encodeURIComponent(selectedJobId)}`)); field('updated').textContent = new Date().toLocaleTimeString('ko-KR'); } catch (error) { field('detail').innerHTML = `<div class="error">상태 조회 실패: ${esc(error.message)}</div>`; } }
+    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode))); field('start').addEventListener('click', start); field('refresh').addEventListener('click', refresh); field('filter-db').addEventListener('change', refresh); field('filter-chatbot').addEventListener('change', refresh); refresh(); poller = setInterval(refresh, 3000); window.addEventListener('beforeunload', () => clearInterval(poller));
+  </script>
+</body>
+</html>

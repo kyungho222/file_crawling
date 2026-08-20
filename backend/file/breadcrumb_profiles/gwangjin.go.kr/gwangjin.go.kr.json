@@ -1,0 +1,8 @@
+{
+  "selectors": [
+    ".hgroup > p",
+    ".location"
+  ],
+  "category_index": -2,
+  "title_fallback": false
+}

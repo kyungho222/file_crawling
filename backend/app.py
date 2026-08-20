@@ -162,21 +162,16 @@ app.add_middleware(
 # Include Backend Router with /Ai_Pro_filecrawler prefix to match frontend requests
 app.include_router(backend_router, prefix="/Ai_Pro_filecrawler")
 
-# Board dashboard routes removed: this project is file-crawling only.
-
+# The operational inspection page reads live file workflow state only. It does
+# not create a second crawl path or a dashboard-specific execution mode.
 try:
-    from tools.file_crawl_dashboard.integration import include_public_routes as include_file_crawl_dashboard_routes
+    from backend.file.file_crawl_inspection_router import router as file_crawl_inspection_router
 
-    include_file_crawl_dashboard_routes(app)
+    app.include_router(file_crawl_inspection_router)
+    app.include_router(file_crawl_inspection_router, prefix="/Ai_Pro_filecrawler")
+    logger.info("[FileCrawlInspection] routes included")
 except Exception as exc:
-    logger.warning("[FileCrawlDashboard] router include skipped: %s", exc)
-
-try:
-    from backend.local_file_crawl_server import router as local_file_crawl_router
-
-    app.include_router(local_file_crawl_router)
-except Exception as exc:
-    logger.warning("[LocalFileCrawl] router include skipped: %s", exc)
+    logger.warning("[FileCrawlInspection] router include skipped: %s", exc)
 
 try:
     from backend.filecrawler_batch_endpoints import router as filecrawler_batch_router

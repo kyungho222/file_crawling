@@ -1,5 +1,8 @@
+import json
 import re
-from typing import List
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 try:
     from bs4 import BeautifulSoup, NavigableString  # type: ignore[import-not-found]
@@ -29,6 +32,55 @@ _BREADCRUMB_SELECTORS = [
     # Gwangjin detail pages: <div class="hgroup"><p>HOME > ...</p></div>
     ".hgroup > p",
 ]
+
+_BREADCRUMB_PROFILE_DIR = Path(__file__).with_name("breadcrumb_profiles")
+_PROFILE_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+
+def _profile_domain_candidates(detail_url: str) -> List[str]:
+    try:
+        host = (urlparse(str(detail_url or "")).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    if not host:
+        return []
+    candidates = [host]
+    if host.startswith("www."):
+        candidates.append(host[4:])
+    else:
+        candidates.append(f"www.{host}")
+    return candidates
+
+
+def _load_breadcrumb_profile(detail_url: str) -> Dict[str, Any]:
+    """Load an optional domain profile without making it a crawl dependency."""
+    for domain in _profile_domain_candidates(detail_url):
+        path = _BREADCRUMB_PROFILE_DIR / domain / f"{domain}.json"
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        cached = _PROFILE_CACHE.get(str(path))
+        if cached and cached[0] == stat.st_mtime_ns:
+            return cached[1]
+        try:
+            with path.open("r", encoding="utf-8") as profile_file:
+                data = json.load(profile_file)
+            profile = data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            profile = {}
+        _PROFILE_CACHE[str(path)] = (stat.st_mtime_ns, profile)
+        return profile
+    return {}
+
+
+def _profile_selectors(profile: Dict[str, Any]) -> List[str]:
+    raw = profile.get("selectors") if isinstance(profile, dict) else None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(selector).strip() for selector in raw if str(selector or "").strip()]
 
 
 def _split_breadcrumb_tokens(text: str) -> List[str]:
@@ -150,13 +202,23 @@ def _tokens_from_title(soup) -> List[str]:
         tokens = tokens[1:]
     return tokens
 
-def extract_file_breadcrumb_tokens_from_html(html: str, *, include_title_fallback: bool = True) -> List[str]:
+def extract_file_breadcrumb_tokens_from_html(
+    html: str,
+    *,
+    detail_url: str = "",
+    include_title_fallback: bool = True,
+) -> List[str]:
     if not html or not BeautifulSoup:
         return []
     try:
         soup = BeautifulSoup(html, "html.parser")  # type: ignore[operator]
         candidates = []
-        for selector in _BREADCRUMB_SELECTORS:
+        profile = _load_breadcrumb_profile(detail_url)
+        profile_selectors = _profile_selectors(profile)
+        selectors = profile_selectors + [
+            selector for selector in _BREADCRUMB_SELECTORS if selector not in profile_selectors
+        ]
+        for selector in selectors:
             try:
                 candidates.extend(soup.select(selector))
             except Exception:
@@ -192,7 +254,9 @@ def extract_file_breadcrumb_tokens_from_html(html: str, *, include_title_fallbac
             cleaned = _clean_breadcrumb_tokens(tokens)
             if len(cleaned) >= 2:
                 return cleaned
-        if include_title_fallback:
+        profile_title_fallback = profile.get("title_fallback") if profile else None
+        use_title_fallback = include_title_fallback if profile_title_fallback is None else bool(profile_title_fallback)
+        if use_title_fallback:
             title_tokens = _tokens_from_title(soup)
             if len(title_tokens) >= 2:
                 return title_tokens
@@ -201,8 +265,8 @@ def extract_file_breadcrumb_tokens_from_html(html: str, *, include_title_fallbac
         return []
 
 
-def extract_file_web_title_from_html(html: str) -> str:
-    tokens = extract_file_breadcrumb_tokens_from_html(html)
+def extract_file_web_title_from_html(html: str, *, detail_url: str = "") -> str:
+    tokens = extract_file_breadcrumb_tokens_from_html(html, detail_url=detail_url)
     if not tokens:
         return ""
     last = tokens[-1]
@@ -211,10 +275,16 @@ def extract_file_web_title_from_html(html: str) -> str:
     return re.sub(r"\s+", " ", last).strip()
 
 
-def extract_file_category_breadcrumb_from_html(html: str) -> str:
-    tokens = extract_file_breadcrumb_tokens_from_html(html)
+def extract_file_category_breadcrumb_from_html(html: str, *, detail_url: str = "") -> str:
+    tokens = extract_file_breadcrumb_tokens_from_html(html, detail_url=detail_url)
     if len(tokens) >= 2:
-        candidate_index = -2
+        profile = _load_breadcrumb_profile(detail_url)
+        try:
+            candidate_index = int(profile.get("category_index", -2))
+        except (TypeError, ValueError):
+            candidate_index = -2
+        if not -len(tokens) <= candidate_index < len(tokens):
+            candidate_index = -2
         candidate = re.sub(r"\s+", " ", tokens[candidate_index]).strip()
         if candidate.endswith(" \uc18c\uac1c") and len(tokens) >= 3:
             candidate = re.sub(r"\s+", " ", tokens[-3]).strip()
