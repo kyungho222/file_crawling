@@ -2312,6 +2312,16 @@ def _looks_like_category_code(value: Any) -> bool:
     return False
 
 
+def sanitize_file_learning_category_codes(cate1: Any, cate2: Any) -> Tuple[str, str]:
+    """Keep LEARN_LIST file category columns code-only at persistence boundaries."""
+    normalized_cate1 = str(cate1 or "").strip()
+    normalized_cate2 = str(cate2 or "").strip()
+    return (
+        normalized_cate1 if _looks_like_category_code(normalized_cate1) else "",
+        normalized_cate2 if _looks_like_category_code(normalized_cate2) else "",
+    )
+
+
 async def _fetch_category_descendant_by_name(
     *,
     category_table: str,
@@ -3554,7 +3564,9 @@ async def learn_list_merge_cate_on_duplicate_row(
         )
         sub_cate_mode = str((meta or {}).get("_sub_cate_mode") or (meta or {}).get("sub_cate_mode") or "emp").strip()
         overwrite_sub_cate = is_sub_cate_overwrite(sub_cate_mode)
-        n1, n2 = coalesce_learn_list_cates(meta)
+        n1, n2 = sanitize_file_learning_category_codes(
+            *coalesce_learn_list_cates(meta)
+        )
         if n1 or n2:
             if "cate1" in cols and should_update_category_field(sub_cate_mode, db_c1, n1):
                 category_update_values["cate1"] = n1
@@ -3750,6 +3762,7 @@ async def insert_into_learn_list(
         )
         # debug checkpoints
         cp_times = {"t0": started}
+        mapped_c1, mapped_c2 = "", ""
         try:
             file_sub_cate_mode = await get_sub_cate_mode_from_config(chat_bot_id, dbname=db_name)
         except Exception:
@@ -3798,9 +3811,10 @@ async def insert_into_learn_list(
                 request_cookies=file_info.get("_category_sync_request_cookies"),
                 create_missing=True,
             )
-            if mapped_c1 or mapped_c2:
-                file_info["cate1"] = mapped_c1
-                file_info["cate2"] = mapped_c2
+            mapped_c1, mapped_c2 = sanitize_file_learning_category_codes(
+                mapped_c1,
+                mapped_c2,
+            )
             logger.info(
                 "[FilePersist][category_mapping_done] job_id=%s db=%s file_url=%s cate1=%s cate2=%s",
                 file_info.get("job_id"),
@@ -3837,6 +3851,10 @@ async def insert_into_learn_list(
                 ref_c2,
                 exc,
             )
+        file_info["cate1"], file_info["cate2"] = sanitize_file_learning_category_codes(
+            mapped_c1,
+            mapped_c2,
+        )
         # 1. ???占쏙옙???類ｋ궖 占???占쏙옙???類ｋ궖
         account_id = await get_account_identifier_from_chatbot_setup(chat_bot_id, db_name)
         cp_times["t1"] = time.perf_counter()

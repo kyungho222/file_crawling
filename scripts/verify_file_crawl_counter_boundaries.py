@@ -27,20 +27,25 @@ def main() -> None:
     callback = BATCH_CALLBACK.read_text(encoding="utf-8")
     workflow_runner = WORKFLOW_RUNNER.read_text(encoding="utf-8")
 
-    # A document becomes selected only once its download work has been queued.
-    _assert_before(
-        workflow,
-        "await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)\n                    await self._confirm_file_selection_for_queue(",
-        "stage=\"download_enqueue\",\n                        status=\"queued\"",
+    # Queue admission is not selection. A document becomes selected only when
+    # the same MariaDB INSERT boundary that increments save_count succeeds.
+    assert "_confirm_file_selection_for_queue" not in workflow
+    assert "[FileCounterTrace][selection_queued]" not in workflow
+    insert_count_marker = (
+        "if persistence_action == \"insert\":\n"
+        "                            await self._confirm_file_selection_for_persist("
     )
+    assert insert_count_marker in workflow
 
-    # Save is the verified storage boundary, not the later LEARN_LIST write.
-    _assert_before(
-        workflow,
-        "[FilePersist][storage_saved_counted]",
-        "[FilePersist][persist_begin]",
+    # Save is counted only after a new MariaDB LEARN_LIST row is inserted.
+    assert "[FilePersist][storage_saved_counted]" not in workflow
+    insert_count_index = workflow.index(insert_count_marker)
+    save_count_index = workflow.index(
+        "await self._mark_save_done(url=save_key, ok=True)",
+        insert_count_index,
     )
-    assert "await self._mark_save_done(url=save_key, ok=True)\n                        logger.info(\n                            \"[FilePersist][persist_result]" not in workflow
+    assert insert_count_index < save_count_index
+    assert save_count_index < workflow.index("[FilePersist][persist_result]", insert_count_index)
     assert "self.stats[\"save_count\"] = max(0, int(self.stats.get(\"save_count\", 0) or 0) - 1)" not in workflow
 
     # Final state reconciliation must not redefine selection as storage count.
@@ -50,6 +55,9 @@ def main() -> None:
     assert "async def _record_file_persist_outcome(" in workflow
     assert "[FilePersist][db_outcome]" in workflow
     assert "persistence_action=persistence_action" in workflow
+
+    # The legacy all-fields queue-stall warning was too noisy for operations.
+    assert "[파일크롤링추적][큐정체]" not in workflow
 
     # Study progress is applied only after the callback's status-Y finalization.
     _assert_before(

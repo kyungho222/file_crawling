@@ -3106,19 +3106,13 @@ class BoardContentFilePipelineMixin:
                         _collection_queue_stored_count(),
                     )
                     await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
-                    await self._confirm_file_selection_for_queue(
-                        info=file_meta,
-                        url=file_url_key or file_url,
-                        file_name=file_name,
-                        file_size=int(file_meta.get("declared_file_size_bytes") or 0),
-                    )
                     _log_file_url_status(
                         stage="download_enqueue",
                         status="queued",
                         process_url=file_url or post_url,
                         post_url=post_url,
                         file_url=file_url,
-                        selected="yes",
+                        selected="pending",
                         saved="pending",
                         learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                         name=file_name,
@@ -3157,19 +3151,13 @@ class BoardContentFilePipelineMixin:
                     _collection_queue_stored_count(),
                 )
                 await _put_collection_queue_with_trace(file_meta, file_url=file_url, file_name=file_name)
-                await self._confirm_file_selection_for_queue(
-                    info=file_meta,
-                    url=file_url_key or file_url,
-                    file_name=file_name,
-                    file_size=int(file_meta.get("declared_file_size_bytes") or 0),
-                )
                 _log_file_url_status(
                     stage="download_enqueue",
                     status="queued",
                     process_url=file_url or post_url,
                     post_url=post_url,
                     file_url=file_url,
-                    selected="yes",
+                    selected="pending",
                     saved="pending",
                     learn="skipped" if bool(getattr(self, "file_pipeline_skip_learning", False)) else "pending",
                     name=file_name,
@@ -3582,15 +3570,16 @@ class BoardContentFilePipelineMixin:
             )
             return "", 0
 
-    async def _confirm_file_selection_for_queue(
+    async def _confirm_file_selection_for_persist(
         self,
         *,
         info: Dict[str, Any],
         url: str,
         file_name: str,
         file_size: int,
+        row_id: Any,
     ) -> bool:
-        """Count a document only after its download work was accepted by the queue."""
+        """Count a document only after a new LEARN_LIST row was created."""
         original_meta = info.get("original_meta") if isinstance(info.get("original_meta"), dict) else {}
         if info.get("_file_selection_counted") or original_meta.get("_file_selection_counted"):
             return False
@@ -3610,12 +3599,14 @@ class BoardContentFilePipelineMixin:
                 source_url=info.get("source_page") or info.get("source_url"),
                 file_url=url,
                 file_name=file_name,
+                db_id=row_id,
             )
         except Exception:
             pass
         logger.info(
-            "[FileCounterTrace][selection_queued] job_id=%s file=%s declared_size=%s file_url=%s",
+            "[FileCounterTrace][selection_persisted] job_id=%s row_id=%s file=%s size=%s file_url=%s",
             getattr(self, "job_id", None),
+            row_id,
             (file_name or "")[:180],
             file_size,
             (url or "")[:220],
@@ -7131,15 +7122,6 @@ class BoardContentFilePipelineMixin:
             logger.error(f"[FileLearningError] {url} | {e}")
             _record_file_study("failed", str(e), path=upload_path or file_path)
             await self._mark_study_done(url=save_key, outcome="failed")
-        try:
-            append_stage_urls(
-                stage="save",
-                urls=[{"url": url_key, "file_path": info.get("file_path") or info.get("local_path")}],
-                job_id=getattr(self, "job_id", None),
-                db_name=getattr(self, "db_name", None),
-            )
-        except Exception:
-            pass
         if self.progress_callback:
             self.progress_callback(self.get_stats())
         logger.debug(
@@ -7659,20 +7641,6 @@ class BoardContentFilePipelineMixin:
                 progress_trace,
                 worker_health,
             )
-            logger.warning(
-                "[파일크롤링추적][큐정체] 작업ID=%s 정체초=%.1f collection_미완료=%s "
-                "큐적재=%s 버퍼=%s 현재저장=%s 학습완료=%s 글로벌등록=%s 워커=%s 큐상태=%s",
-                getattr(self, "job_id", None),
-                stagnant_sec,
-                snapshot.get("collection_batch_queue_unfinished", 0),
-                snapshot.get("collection_batch_queue", 0),
-                snapshot.get("collection_batch_queue_buffer", 0),
-                stats.get("save_count", 0),
-                stats.get("file_study_done_count", stats.get("study_done_count", 0)),
-                registered,
-                worker_health,
-                snapshot,
-            )
             last_change_at = now
 
     async def _ensure_file_local_finalize_workers(self) -> None:
@@ -8099,40 +8067,12 @@ class BoardContentFilePipelineMixin:
                                 file_name=file_name,
                                 detail=f"size={file_size}",
                             )
-                            # The storage counter is intentionally advanced at
-                            # the durable-file boundary, before MariaDB/learning
-                            # work can add their own latency or fail.
-                            await self._mark_save_done(url=save_key, ok=True)
-                            try:
-                                append_stage_urls(
-                                    stage="save",
-                                    urls=[{"url": save_key, "file_path": file_path}],
-                                    job_id=getattr(self, "job_id", None),
-                                    db_name=getattr(self, "db_name", None),
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "[FilePersist][storage_saved_stage_append_failed] job_id=%s file_url=%s err=%s",
-                                    getattr(self, "job_id", None),
-                                    (url or "")[:220],
-                                    exc,
-                                )
                             logger.info(
-                                "[FilePersist][storage_saved_counted] job_id=%s file_url=%s size=%s",
+                                "[FilePersist][storage_ready_for_persist] job_id=%s file_url=%s size=%s",
                                 getattr(self, "job_id", None),
                                 (url or "")[:220],
                                 file_size,
                             )
-                            if self.progress_callback:
-                                try:
-                                    self.progress_callback(self.get_stats())
-                                except Exception:
-                                    logger.debug(
-                                        "[FilePersist][storage_saved_progress_publish_failed] job_id=%s file_url=%s",
-                                        getattr(self, "job_id", None),
-                                        (url or "")[:220],
-                                        exc_info=True,
-                                    )
                         except Exception as exc:
                             path_ok = False
                             file_size = 0
@@ -8266,6 +8206,7 @@ class BoardContentFilePipelineMixin:
                                 file_url=url,
                                 file_name=file_name,
                             )
+                            await self._mark_save_skipped(url=save_key)
                             continue
                         throttle_sec = _file_crawl_save_throttle_seconds()
                         if throttle_sec > 0:
@@ -8330,6 +8271,7 @@ class BoardContentFilePipelineMixin:
                                 file_url=url,
                                 file_name=file_name,
                             )
+                            await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_ensure_timeout post_url=%s file_url=%s file=%s",
@@ -8407,6 +8349,7 @@ class BoardContentFilePipelineMixin:
                                 file_url=url,
                                 file_name=file_name,
                             )
+                            await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_no_row post_url=%s file_url=%s file=%s",
@@ -8454,6 +8397,7 @@ class BoardContentFilePipelineMixin:
                                 file_name=file_name,
                                 row_id=row_out,
                             )
+                            await self._mark_save_done(url=save_key, ok=False)
                             await self._mark_study_done(url=save_key, outcome="skipped")
                             logger.info(
                                 "[FilePersist][persist_result] job_id=%s worker=%s result=failed reason=learn_list_invalid_row_id row_id=%s post_url=%s file_url=%s file=%s",
@@ -8527,11 +8471,12 @@ class BoardContentFilePipelineMixin:
                                 row_id=row_out,
                                 persistence_action="existing_row",
                             )
+                            await self._mark_save_skipped(url=save_key)
                             continue
                         try:
                             self._record_job_result_stage(
                                 url=save_key,
-                                stage="save",
+                                stage="save" if persistence_action == "insert" else "persist",
                                 status="success",
                                 source_url=info.get("source_page") or info.get("source_url"),
                                 file_url=url,
@@ -8557,6 +8502,33 @@ class BoardContentFilePipelineMixin:
                             row_id=row_out,
                             persistence_action=persistence_action,
                         )
+                        if persistence_action == "insert":
+                            await self._confirm_file_selection_for_persist(
+                                info=info,
+                                url=save_key,
+                                file_name=file_name,
+                                file_size=file_size,
+                                row_id=row_out,
+                            )
+                            await self._mark_save_done(url=save_key, ok=True)
+                            try:
+                                append_stage_urls(
+                                    stage="save",
+                                    urls=[{"url": save_key, "file_path": file_path}],
+                                    job_id=getattr(self, "job_id", None),
+                                    db_name=getattr(self, "db_name", None),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[FilePersist][insert_stage_append_failed] job_id=%s file_url=%s err=%s",
+                                    getattr(self, "job_id", None),
+                                    (url or "")[:220],
+                                    exc,
+                                )
+                            if self.progress_callback:
+                                self.progress_callback(self.get_stats())
+                        else:
+                            await self._mark_save_skipped(url=save_key)
                         logger.info(
                             "[FilePersist][persist_result] job_id=%s worker=%s result=saved persistence=%s db=%s table=%s row_id=%s post_url=%s file_url=%s file=%s size=%s",
                             getattr(self, "job_id", None), trace_key, persistence_action,
@@ -8683,21 +8655,6 @@ class BoardContentFilePipelineMixin:
                                 job_id=getattr(self, "job_id", ""),
                                 db_name=getattr(self, "db_name", ""),
                             )
-                            try:
-                                append_stage_urls(
-                                    stage="save",
-                                    urls=[
-                                        {
-                                            "url": url_key,
-                                            "file_path": info.get("file_path") or info.get("local_path"),
-                                            "db_id": str(pre_learn_list_id) if pre_learn_list_id else None,
-                                        }
-                                    ],
-                                    job_id=getattr(self, "job_id", None),
-                                    db_name=getattr(self, "db_name", None),
-                                )
-                            except Exception:
-                                pass
                             if self.progress_callback:
                                 self.progress_callback(self.get_stats())
                             logger.debug(

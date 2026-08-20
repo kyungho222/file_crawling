@@ -7,8 +7,8 @@
 - 학습 실패/성공 집계는 file_study_* (게시판 study_*와 분리)
 - scan_count(잠금 전): 고유 상세(시작 시점 start_urls 기준 1회 카운트) + 고유 첨부 URL 수
   (= Post base + File 증분, 상세·첨부 이중 합산 없음)
-- collection_count: 이미지 등 비문서류/사전 중복을 제외하고 다운로드 큐에 등록된 문서 수
-- save_count: 실제 스토리지 파일 검증 완료 시에만 증가(LEARN_LIST 저장과 분리)
+- collection_count: MariaDB LEARN_LIST 신규 row INSERT가 성공한 문서 수
+- save_count: MariaDB LEARN_LIST 신규 row INSERT 성공 시에만 증가
 - study_count: 외부 임베딩 콜백에서 LEARN_LIST status=Y 반영이 성공한 수
 - get_stats()는 SSE/UI 호환을 위해 study_*에 file_study_* 별칭을 실어 준다.
 
@@ -159,8 +159,8 @@ class FileCrawlBoardMixin:
         st = getattr(self, "stats", None)
         if not isinstance(st, dict):
             return
-        # UI 선별은 비문서와 사전 중복을 통과해 다운로드 큐에 등록된 문서다.
-        # 저장/학습 완료 여부와는 별도의 진행 단계로 유지한다.
+        # UI 선별은 MariaDB LEARN_LIST 신규 행 생성에 성공한 문서다.
+        # 다운로드 큐 등록만으로는 카운트하지 않아 저장 카운트와 일치한다.
         try:
             selected = int(st.get("file_attachment_selection_confirmed_total", 0) or 0)
         except Exception:
@@ -181,7 +181,7 @@ class FileCrawlBoardMixin:
 
     def get_stats(self) -> Dict[str, Any]:
         # board.get_stats()는 board 모드의 상관관계를 적용할 수 있으므로, 파일 모드는
-        # 선별(큐 등록)과 저장(스토리지 검증)을 독립된 눈금으로 복구한다.
+        # 선별과 저장은 같은 MariaDB 신규 row INSERT 경계에서 확정한다.
         try:
             confirmed_selection = max(
                 0,
