@@ -6837,6 +6837,7 @@ class BoardContentWorkflow:
                         scope_path_prefix=stream_cfg.get("scope_path_prefix"),
                         start_urls_order=stream_cfg.get("start_urls_order"),
                         use_category_rules=stream_cfg.get("use_category_rules", True),
+                        job_id=getattr(self, "job_id", None),
                     ):
                         if self.stop_event.is_set():
                             break
@@ -26665,6 +26666,5 @@ class BoardContentWorkflow:
         except Exception as e:
             logger.error(f"[SummaryAPI] 호출 실패: {e}") # 에러 로그 기록
         return None
-
 
 

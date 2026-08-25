@@ -3,7 +3,7 @@ import logging
 import time
 import os
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Dict, Tuple
 
 logger = logging.getLogger("backend.shared.crawl_monitor")
 
@@ -16,6 +16,9 @@ DEFAULT_STOP_COUNT = 10800
 _WORKFLOW_ACTIVE_STATUSES = frozenset({"running", "unknown", ""})
 _WORKFLOW_TERMINAL_STATUSES = frozenset({"completed", "stopped", "failed", "done", "error", "fail", "exception"})
 _WORKFLOW_ACTIVE_STATES = frozenset({"running", "stopping", "init"})
+_AUTO_STOP_CONFIG_CACHE_TTL_SEC = 300.0
+_AUTO_STOP_CONFIG_FETCH_TIMEOUT_SEC = 3.0
+_AUTO_STOP_CONFIG_CACHE: Dict[tuple, Tuple[float, Dict[str, Any], str]] = {}
 
 
 def _workflow_state_norm(workflow: Any) -> str:
@@ -93,74 +96,100 @@ def _build_auto_stop_config_candidates(*, chat_bot_id: str | None, workflow: Any
 
 async def _load_auto_stop_config(
     *,
-    fetcher: Callable[..., Awaitable[dict[str, Any]]],
+    fetcher: Callable[..., Awaitable[list[Any]]],
     workflow: Any,
     chat_bot_id: str | None,
     db_name: str,
     job_id: str,
     keys: list[str],
-    retries: int = 10,
-    retry_delay_sec: float = 1.0,
+    fetch_timeout_sec: float = _AUTO_STOP_CONFIG_FETCH_TIMEOUT_SEC,
 ) -> tuple[dict[str, Any], str]:
     candidates = _build_auto_stop_config_candidates(chat_bot_id=chat_bot_id, workflow=workflow)
     candidate_sources = ",".join(source for _, _, source in candidates)
     primary_id = _normalize_candidate_id(chat_bot_id) or _normalize_candidate_id(getattr(workflow, "unique_id", None))
+    normalized_keys = tuple(sorted(str(key).strip() for key in keys if str(key or "").strip()))
+    candidate_ids = [candidate_id for candidate_id, _, _ in candidates]
+    resolved_cache_key = ("resolved", db_name, tuple(candidate_ids), normalized_keys)
+    defaults_cache_key = ("defaults", db_name, primary_id or "", normalized_keys)
+    now = time.monotonic()
+    for cache_key in (resolved_cache_key, defaults_cache_key):
+        cached = _AUTO_STOP_CONFIG_CACHE.get(cache_key)
+        if cached and now - cached[0] <= _AUTO_STOP_CONFIG_CACHE_TTL_SEC:
+            return dict(cached[1]), cached[2]
 
-    for attempt in range(1, retries + 1):
-        had_fetch_error = False
-        for candidate_id, match_chat_bot_id, source in candidates:
-            try:
-                conf = await fetcher(
-                    chat_bot_id=candidate_id,
-                    keys=keys,
-                    dbname=db_name,
-                    match_chat_bot_id=match_chat_bot_id,
-                )
-            except Exception as exc:
-                had_fetch_error = True
+    try:
+        rows = await asyncio.wait_for(
+            fetcher(candidate_ids=candidate_ids, keys=keys, dbname=db_name),
+            timeout=max(0.1, float(fetch_timeout_sec)),
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[AutoStop] Config fetch timeout; using defaults | job_id=%s db=%s bot_id=%s timeout_sec=%.1f",
+            job_id,
+            db_name,
+            primary_id,
+            max(0.1, float(fetch_timeout_sec)),
+        )
+        return {}, "defaults"
+    except Exception as exc:
+        logger.warning(
+            "[AutoStop] Config fetch error; using defaults | job_id=%s db=%s bot_id=%s err=%s",
+            job_id,
+            db_name,
+            primary_id,
+            exc,
+        )
+        return {}, "defaults"
+
+    def _row_value(row: Any, key: str, index: int) -> Any:
+        if isinstance(row, dict):
+            if key in row:
+                return row.get(key)
+            for row_key, value in row.items():
+                if str(row_key).strip().strip("`").lower() == key:
+                    return value
+        try:
+            return row[index]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    common_values: Dict[str, Any] = {}
+    candidate_values: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        key = str(_row_value(row, "key", 1) or "").strip()
+        if not key:
+            continue
+        candidate_id = _normalize_candidate_id(_row_value(row, "chat_bot_id", 0))
+        value = _row_value(row, "value", 2)
+        if not candidate_id or candidate_id.lower() == "default":
+            common_values.setdefault(key, value)
+        else:
+            candidate_values.setdefault(candidate_id, {})[key] = value
+
+    for candidate_id, _, source in candidates:
+        conf = dict(common_values)
+        if candidate_id:
+            conf.update(candidate_values.get(candidate_id, {}))
+        if _config_has_any_value(conf, keys):
+            _AUTO_STOP_CONFIG_CACHE[resolved_cache_key] = (time.monotonic(), dict(conf), source)
+            if source != "chat_bot_id":
                 logger.warning(
-                    "[AutoStop] Config fetch error (retry %d, source=%s): %s",
-                    attempt,
+                    "[AutoStop] Config resolved via fallback | source=%s job_id=%s db=%s bot_id=%s",
                     source,
-                    exc,
+                    job_id,
+                    db_name,
+                    primary_id,
                 )
-                continue
+            return conf, source
 
-            conf = conf or {}
-            if _config_has_any_value(conf, keys):
-                if source != "chat_bot_id" or attempt > 1:
-                    logger.warning(
-                        "[AutoStop] Config resolved via fallback | source=%s retry=%s job_id=%s db=%s bot_id=%s",
-                        source,
-                        attempt,
-                        job_id,
-                        db_name,
-                        primary_id,
-                    )
-                return conf, source
-
-        if not had_fetch_error:
-            logger.warning(
-                "[AutoStop] Config not found, using defaults | job_id=%s db=%s bot_id=%s candidates=%s",
-                job_id,
-                db_name,
-                primary_id,
-                candidate_sources,
-            )
-            break
-        if attempt < retries:
-            logger.warning(
-                "[AutoStop] Config fetch failed, retrying... (%d/%d) | job_id=%s db=%s bot_id=%s candidates=%s",
-                attempt,
-                retries,
-                job_id,
-                db_name,
-                primary_id,
-                candidate_sources,
-            )
-        if attempt < retries and retry_delay_sec > 0:
-            await asyncio.sleep(retry_delay_sec)
-
+    logger.warning(
+        "[AutoStop] Config not found, using defaults | job_id=%s db=%s bot_id=%s candidates=%s",
+        job_id,
+        db_name,
+        primary_id,
+        candidate_sources,
+    )
+    _AUTO_STOP_CONFIG_CACHE[defaults_cache_key] = (time.monotonic(), {}, "defaults")
     return {}, "defaults"
 
 
@@ -205,7 +234,7 @@ async def monitor_auto_stop(
 
         try:
             # DB 설정값, 시간, 중단 기능을 가져옵니다.
-            from db.crawl_db_manager import get_config_values_by_keys
+            from db.crawl_db_manager import get_config_rows_by_candidate_ids
             from utils.timezone_utils import get_local_now
             from backend.router import stop_crawl
         except Exception as exc:
@@ -236,14 +265,13 @@ async def monitor_auto_stop(
 
         # 2. 초기 설정값 로딩 (최대 10회 재시도)
         conf, config_source = await _load_auto_stop_config(
-            fetcher=get_config_values_by_keys,
+            fetcher=get_config_rows_by_candidate_ids,
             workflow=workflow,
             chat_bot_id=target_id or workflow_unique_id,
             db_name=db_name,
             job_id=job_id,
             keys=["week_count", "page_count", "stop_count"],
-            retries=10,
-            retry_delay_sec=1.0,
+            fetch_timeout_sec=_AUTO_STOP_CONFIG_FETCH_TIMEOUT_SEC,
         )
 
         if not conf:
@@ -348,14 +376,13 @@ async def monitor_auto_stop(
             if now_ts - last_config_ts >= refresh_config_sec:
                 try:
                     conf, _ = await _load_auto_stop_config(
-                        fetcher=get_config_values_by_keys,
+                        fetcher=get_config_rows_by_candidate_ids,
                         workflow=workflow,
                         chat_bot_id=target_id or workflow_unique_id,
                         db_name=db_name,
                         job_id=job_id,
                         keys=["week_count", "page_count", "stop_count"],
-                        retries=1,
-                        retry_delay_sec=0.0,
+                        fetch_timeout_sec=_AUTO_STOP_CONFIG_FETCH_TIMEOUT_SEC,
                     )
                     conf = conf or {}
                     week_limit = _parse_int_or_none(conf.get("week_count"))

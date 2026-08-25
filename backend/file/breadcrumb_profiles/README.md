@@ -1,4 +1,18 @@
-# File Breadcrumb Profiles
+# Legacy File Breadcrumb Profiles
+
+The canonical selector configuration location is now:
+
+```text
+services/site_config/domains/<normalized-domain>.json
+```
+
+For example, `services/site_config/domains/gwangjin.go.kr.json` contains
+`breadcrumb_selectors`, `breadcrumb_category_index`, and
+`breadcrumb_title_fallback`. The file crawler loads that configuration first.
+
+This directory remains a read-only compatibility fallback for previously
+registered breadcrumb profiles. Add or update selector rules in
+`services/site_config/domains/`, not here.
 
 Each domain has its own directory and profile file:
 

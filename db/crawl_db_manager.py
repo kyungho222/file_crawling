@@ -1725,6 +1725,77 @@ async def get_config_values_by_keys(
         return {}
 
 
+async def get_config_rows_by_candidate_ids(
+    candidate_ids: List[str | None],
+    keys: List[str],
+    *,
+    dbname: str = "chatty",
+) -> List[Any]:
+    """Fetch candidate and shared configuration rows in one query.
+
+    Resolution priority remains the caller's responsibility. This helper keeps
+    the database interaction single-shot for optional monitor configuration.
+    """
+    uniq_keys = list(dict.fromkeys(str(key).strip() for key in keys if str(key or "").strip()))
+    if not uniq_keys:
+        return []
+    normalized_ids = list(
+        dict.fromkeys(
+            str(candidate_id).strip()
+            for candidate_id in candidate_ids
+            if str(candidate_id or "").strip()
+        )
+    )
+    key_placeholders = ",".join(["%s"] * len(uniq_keys))
+    shared_clause = "`chat_bot_id` IS NULL OR `chat_bot_id`='' OR `chat_bot_id`='default'"
+    if normalized_ids:
+        id_placeholders = ",".join(["%s"] * len(normalized_ids))
+        chatbot_clause = f"(`chat_bot_id` IN ({id_placeholders}) OR {shared_clause})"
+        params = tuple([*normalized_ids, *uniq_keys])
+    else:
+        chatbot_clause = f"({shared_clause})"
+        params = tuple(uniq_keys)
+    sql = (
+        "SELECT `chat_bot_id`, `key`, `value` FROM `ASADAL_CRAWLING_CONFIG` "
+        f"WHERE {chatbot_clause} AND `key` IN ({key_placeholders})"
+    )
+    if _use_local_db():
+        try:
+            _ensure_local_db_initialized()
+            conn = sqlite3.connect(_local_db_path())
+            try:
+                cur = conn.cursor()
+                key_placeholders_q = ",".join(["?"] * len(uniq_keys))
+                shared_clause_q = "chat_bot_id IS NULL OR chat_bot_id='' OR chat_bot_id='default'"
+                if normalized_ids:
+                    id_placeholders_q = ",".join(["?"] * len(normalized_ids))
+                    chatbot_clause_q = f"(chat_bot_id IN ({id_placeholders_q}) OR {shared_clause_q})"
+                else:
+                    chatbot_clause_q = f"({shared_clause_q})"
+                cur.execute(
+                    "SELECT chat_bot_id, key, value FROM ASADAL_CRAWLING_CONFIG "
+                    f"WHERE {chatbot_clause_q} AND key IN ({key_placeholders_q})",
+                    params,
+                )
+                return cur.fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Local sqlite config candidate read failed: %s", exc)
+            return []
+    try:
+        return await _execute_query(
+            sql,
+            params,
+            fetch=True,
+            dbname=dbname,
+            op_name="auto_stop_config_candidates",
+        )
+    except Exception as exc:
+        logger.warning("ASADAL_CRAWLING_CONFIG candidate lookup failed: %s", exc)
+        return []
+
+
 def _parse_int_with_commas(value: str, default: int) -> int:
     try:
         s = (value or "").replace(",", "").strip()

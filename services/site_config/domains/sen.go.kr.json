@@ -1,0 +1,17 @@
+{
+  "attachment_selectors": [
+    ".print-box-wrap a[href]",
+    ".print-box-type01 a[href]",
+    ".print-box-type02 a[href]",
+    "a[download][href]"
+  ],
+  "attachment_name_attributes": [
+    "download",
+    "title",
+    "aria-label"
+  ],
+  "detail_title_selectors": [
+    "h4.typo-title02",
+    ".title"
+  ]
+}

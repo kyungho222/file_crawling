@@ -5,7 +5,7 @@ import html as html_lib
 import os
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 try:
@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
 
 from backend.board.anseong_file import resolve_anseong_yhlib_download_url
 from backend.board.yongin_board import resolve_yongin_file_download_url
+from backend.file.site_config import load_file_site_config
 from utils.attachment_url_normalize import canonicalize_attachment_url_for_learn_list
 from utils.attachment_display_name import is_generated_attachment_storage_name
 from utils.file import parse_display_file_size_bytes, strip_fallback_download_label, strip_trailing_file_size
@@ -350,7 +351,16 @@ def _find_attachment_roots(soup: Any) -> List[Any]:
     return roots
 
 
-def _candidate_nodes(soup: Any) -> List[Any]:
+def _config_string_list(site_config: Optional[Dict[str, Any]], key: str) -> List[str]:
+    raw = site_config.get(key) if isinstance(site_config, dict) else None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(value).strip() for value in raw if str(value or "").strip()]
+
+
+def _candidate_nodes(soup: Any, *, site_config: Optional[Dict[str, Any]] = None) -> List[Any]:
     nodes: List[Any] = []
     seen: set[int] = set()
 
@@ -359,6 +369,13 @@ def _candidate_nodes(soup: Any) -> List[Any]:
         if ident not in seen:
             seen.add(ident)
             nodes.append(node)
+
+    for selector in _config_string_list(site_config, "attachment_selectors"):
+        try:
+            for node in soup.select(selector):
+                add(node)
+        except Exception:
+            continue
 
     roots = _find_attachment_roots(soup)
     for root in roots:
@@ -423,15 +440,23 @@ def _resolve_url(
     return (full, False, "href") if _is_download_url(full) else ("", False, "")
 
 
-def _candidate_name(node: Any, href: str) -> str:
+def _candidate_name(
+    node: Any,
+    href: str,
+    *,
+    name_attributes: Optional[List[str]] = None,
+) -> str:
     values = []
     download_name = ""
     try:
         download_name = _clean_name(node.get("download") or "")
-        values.extend([
-            node.get("download") or "", node.get("title") or "", node.get("aria-label") or "",
-            node.get("alt") or "", node.get("value") or "", _node_text(node),
-        ])
+        attributes = []
+        for attribute in list(name_attributes or []) + ["download", "title", "aria-label", "alt", "value"]:
+            key = str(attribute or "").strip()
+            if key and key not in attributes:
+                attributes.append(key)
+        values.extend([node.get(attribute) or "" for attribute in attributes])
+        values.append(_node_text(node))
     except Exception:
         pass
     href_ext = infer_attachment_extension(href)
@@ -675,20 +700,36 @@ def _dedup_key(url: str) -> str:
     return canonicalize_attachment_url_for_learn_list(url) or canonicalize_url_for_dedup(url) or url.lower()
 
 
-def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool = False) -> List[Dict[str, Any]]:
+def extract_fast_attachments(
+    html: str,
+    base_url: str,
+    *,
+    force_full_scan: bool = False,
+    site_config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     if not html or BeautifulSoup is None:
         return []
-    scan_html = str(html or "") if force_full_scan else _attachment_scan_html(html)
+    # A configured selector is a site-level parsing contract. Read it before
+    # applying the generic lightweight HTML slice so its target cannot be cut
+    # out of a large page.
+    resolved_site_config = site_config if isinstance(site_config, dict) else load_file_site_config(base_url)
+    configured_attachment_selectors = _config_string_list(resolved_site_config, "attachment_selectors")
+    scan_html = (
+        str(html or "")
+        if force_full_scan or configured_attachment_selectors
+        else _attachment_scan_html(html)
+    )
     if not scan_html:
         return []
     try:
         soup = BeautifulSoup(scan_html, "html.parser")  # type: ignore[operator]
     except Exception:
         return []
+    name_attributes = _config_string_list(resolved_site_config, "attachment_name_attributes")
     out: List[FastAttachment] = []
     seen: set[str] = set()
     script_blob = _script_text_blob(soup)
-    for node in _candidate_nodes(soup):
+    for node in _candidate_nodes(soup, site_config=resolved_site_config):
         try:
             raw = node.get("href") or node.get("data-href") or node.get("data-url") or node.get("data-download-url") or node.get("formaction") or ""
             onclick = node.get("onclick") or ""
@@ -708,7 +749,7 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
                 reason = "scripted_file_download"
             else:
                 continue
-        name = _candidate_name(node, href)
+        name = _candidate_name(node, href, name_attributes=name_attributes)
         try:
             download_name = _clean_name(node.get("download") or "")
         except Exception:

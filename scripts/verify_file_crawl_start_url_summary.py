@@ -11,7 +11,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
-from backend.shared.file_crawl_post_urls import build_file_crawl_start_url_summary
+from backend.shared.file_crawl_post_urls import (
+    build_file_crawl_start_url_summary,
+    format_file_crawl_start_url_summary,
+)
 
 
 def main() -> None:
@@ -47,6 +50,10 @@ def main() -> None:
         "path_prefix": "/board",
         "learn_list_id": 42,
     }
+    assert format_file_crawl_start_url_summary(summary) == (
+        "job_id=job-1 db=sample type=page learn_list_id=42 "
+        "sql_rows=12 excluded=9 final_start_urls=3"
+    )
     print("file crawl start URL summary contract ok")
 
 

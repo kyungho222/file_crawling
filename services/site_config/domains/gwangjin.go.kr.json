@@ -1,0 +1,8 @@
+{
+  "breadcrumb_selectors": [
+    ".hgroup > p",
+    ".location"
+  ],
+  "breadcrumb_category_index": -2,
+  "breadcrumb_title_fallback": false
+}

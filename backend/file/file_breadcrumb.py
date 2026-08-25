@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
+from backend.file.site_config import load_file_site_config
+
 try:
     from bs4 import BeautifulSoup, NavigableString  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
@@ -64,7 +66,19 @@ def _profile_domain_candidates(detail_url: str) -> List[str]:
 
 
 def _load_breadcrumb_profile(detail_url: str) -> Dict[str, Any]:
-    """Load an optional domain profile without making it a crawl dependency."""
+    """Load canonical site config first, then retain the legacy profile fallback."""
+    canonical_profile: Dict[str, Any] = {}
+    site_config = load_file_site_config(detail_url)
+    selectors = site_config.get("breadcrumb_selectors") if isinstance(site_config, dict) else None
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    if isinstance(selectors, list):
+        canonical_profile["selectors"] = [str(value).strip() for value in selectors if str(value or "").strip()]
+    if isinstance(site_config, dict) and "breadcrumb_category_index" in site_config:
+        canonical_profile["category_index"] = site_config.get("breadcrumb_category_index")
+    if isinstance(site_config, dict) and "breadcrumb_title_fallback" in site_config:
+        canonical_profile["title_fallback"] = site_config.get("breadcrumb_title_fallback")
+
     for domain in _profile_domain_candidates(detail_url):
         path = _BREADCRUMB_PROFILE_DIR / domain / f"{domain}.json"
         try:
@@ -73,16 +87,31 @@ def _load_breadcrumb_profile(detail_url: str) -> Dict[str, Any]:
             continue
         cached = _PROFILE_CACHE.get(str(path))
         if cached and cached[0] == stat.st_mtime_ns:
-            return cached[1]
+            legacy_profile = cached[1]
+            break
         try:
             with path.open("r", encoding="utf-8") as profile_file:
                 data = json.load(profile_file)
-            profile = data if isinstance(data, dict) else {}
+            loaded_legacy_profile = data if isinstance(data, dict) else {}
         except (OSError, ValueError, TypeError):
-            profile = {}
-        _PROFILE_CACHE[str(path)] = (stat.st_mtime_ns, profile)
-        return profile
-    return {}
+            loaded_legacy_profile = {}
+        _PROFILE_CACHE[str(path)] = (stat.st_mtime_ns, loaded_legacy_profile)
+        legacy_profile = loaded_legacy_profile
+        break
+    else:
+        legacy_profile = {}
+
+    if not canonical_profile:
+        return legacy_profile
+    legacy_selectors = _profile_selectors(legacy_profile)
+    profile_selectors = _profile_selectors(canonical_profile)
+    canonical_profile["selectors"] = profile_selectors + [
+        selector for selector in legacy_selectors if selector not in profile_selectors
+    ]
+    for key in ("category_index", "title_fallback"):
+        if key not in canonical_profile and key in legacy_profile:
+            canonical_profile[key] = legacy_profile[key]
+    return canonical_profile
 
 
 def _profile_selectors(profile: Dict[str, Any]) -> List[str]:
@@ -356,6 +385,21 @@ def inspect_file_breadcrumb_from_html(html: str, *, detail_url: str = "") -> Dic
 
 
 def extract_file_web_title_from_html(html: str, *, detail_url: str = "") -> str:
+    if html and BeautifulSoup:
+        try:
+            soup = BeautifulSoup(html, "html.parser")  # type: ignore[operator]
+            site_config = load_file_site_config(detail_url)
+            selectors = site_config.get("detail_title_selectors") if isinstance(site_config, dict) else None
+            if isinstance(selectors, str):
+                selectors = [selectors]
+            for selector in selectors if isinstance(selectors, list) else []:
+                node = soup.select_one(str(selector))
+                if node is not None:
+                    title = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+                    if title:
+                        return title
+        except Exception:
+            pass
     tokens = extract_file_breadcrumb_tokens_from_html(html, detail_url=detail_url)
     if not tokens:
         return ""

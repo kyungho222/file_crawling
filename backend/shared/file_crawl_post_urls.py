@@ -100,9 +100,8 @@ _EXPLORATION_CATEGORY_META_COLUMNS = (
     "assigned_cate2",
 )
 _LEARN_LIST_TABLE = "ASADAL_CRAWLING_LEARN_LIST"
-# Temporary exploration source switch requested for file crawling only.
-# Keep the shared query default as ``post`` so board crawling is unaffected.
-_FILE_CRAWL_EXPLORATION_RECORD_TYPE = "page"
+# File crawling uses board/detail exploration rows.
+_FILE_CRAWL_EXPLORATION_RECORD_TYPE = "post"
 
 
 def build_file_crawl_start_url_summary(
@@ -154,7 +153,28 @@ def build_file_crawl_start_url_summary(
 
 
 def _log_file_crawl_start_url_summary(summary: Dict[str, Any]) -> None:
-    logger.info("[FileCrawlStartUrls][summary] %s", summary)
+    job_id = str(summary.get("job_id") or "").strip()
+    if not job_id:
+        return
+    logger.info(
+        "[FileCrawlStartUrls] %s",
+        format_file_crawl_start_url_summary(summary),
+    )
+
+
+def format_file_crawl_start_url_summary(summary: Dict[str, Any]) -> str:
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    sql_rows = max(0, int(summary.get("sql_rows") or 0))
+    final_start_urls = max(0, int(summary.get("final_start_urls") or 0))
+    return (
+        f"job_id={str(summary.get('job_id') or '').strip() or '-'} "
+        f"db={str(summary.get('db_name') or '').strip() or '-'} "
+        f"type={str(filters.get('record_type') or '-').strip() or '-'} "
+        f"learn_list_id={filters.get('learn_list_id') if filters.get('learn_list_id') is not None else '-'} "
+        f"sql_rows={sql_rows} "
+        f"excluded={max(0, sql_rows - final_start_urls)} "
+        f"final_start_urls={final_start_urls}"
+    )
 
 
 def _category_debug_log_enabled() -> bool:
