@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>파일 크롤링 SimHash 요청 검증</title>
+  <style>
+    :root { --ink:#192534; --muted:#617085; --line:#cbd7e4; --panel:#fff; --bg:#edf2f7; --blue:#076de8; --accent:#7a2ca7; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); background:var(--bg); font:14px/1.45 "Noto Sans KR","Segoe UI",Arial,sans-serif; }
+    main { max-width:1500px; margin:auto; padding:28px; } header { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding-bottom:18px; border-bottom:1px solid var(--line); } h1,h2 { margin:0; } h1 { font-size:22px; } h2 { font-size:15px; } p { margin:7px 0 0; } .muted { color:var(--muted); } .layout { display:grid; grid-template-columns:minmax(420px, 1fr) minmax(440px, 1.1fr); gap:16px; margin-top:18px; } .panel { min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:16px; } label { display:block; margin-top:12px; font-weight:600; } input { width:100%; margin-top:5px; border:1px solid #b9c7d6; border-radius:4px; padding:9px; font:14px Consolas,monospace; } button { margin-top:12px; border:0; border-radius:4px; padding:9px 12px; color:#fff; background:var(--blue); cursor:pointer; font-weight:700; } button.secondary { color:var(--ink); background:#e5edf6; } .summary { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:10px; margin:16px 0; } .metric { border:1px solid var(--line); border-radius:5px; padding:12px; background:#f8fbff; } .metric strong { display:block; color:var(--blue); font-size:22px; margin-top:4px; } .metric span { color:var(--muted); font-size:12px; } .scroll { height:660px; overflow:auto; border:1px solid var(--line); border-radius:4px; } table { width:100%; border-collapse:collapse; } th,td { padding:8px; text-align:left; vertical-align:top; border-bottom:1px solid #dce5ee; } th { position:sticky; top:0; background:#fff; z-index:1; color:var(--muted); } tr { cursor:pointer; } tr:hover, tr.selected { background:#f6ecff; } .mono { font:12px Consolas,monospace; word-break:break-all; } pre { height:660px; overflow:auto; margin:12px 0 0; padding:12px; border-radius:4px; background:#172330; color:#dce8f5; white-space:pre-wrap; word-break:break-word; font:12px/1.5 Consolas,monospace; } .empty { padding:32px; color:var(--muted); text-align:center; } @media (max-width:900px) { main { padding:12px; } header,.layout { display:block; } .layout .panel + .panel { margin-top:12px; } .summary { grid-template-columns:1fr; } .scroll,pre { height:420px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><h1>파일 크롤링 SimHash 요청 검증</h1><p class="muted">마스킹 후 외부 SimHash 서버로 전송하는 실제 payload를 현재 프로세스 메모리에서 확인합니다.</p></div>
+      <a href="/file-crawl-stage-lab" class="muted">단계 검증으로 돌아가기</a>
+    </header>
+    <div class="summary"><div class="metric"><span>현재 표시 요청</span><strong id="count">0</strong></div><div class="metric"><span>마지막 요청 ID</span><strong class="mono" id="last-request">-</strong></div><div class="metric"><span>연결 상태</span><strong id="connection">연결 중</strong></div></div>
+    <section class="panel"><h2>필터</h2><label>운영 Job ID<input id="job-id" placeholder="비워 두면 전체 요청"></label><button id="apply" type="button">필터 적용</button><button id="clear" class="secondary" type="button">필터 해제</button></section>
+    <div class="layout"><section class="panel"><h2>실시간 요청</h2><div class="scroll"><table><thead><tr><th>시각</th><th>요청 / 행 ID</th><th>파일명</th><th>본문</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="empty">요청 대기 중</td></tr></tbody></table></div></section><section class="panel"><h2>실제 전송 Payload</h2><pre id="payload">행을 선택하면 마스킹된 실제 payload가 표시됩니다.</pre></section></div>
+  </main>
+  <script>
+    const ROOT = location.pathname.startsWith('/Ai_Pro_filecrawler/') ? '/Ai_Pro_filecrawler' : '';
+    const API = `${ROOT}/file-crawl-stage-lab/api/simhash`;
+    let rows = [], source = null, selected = null, lastSequence = 0;
+    const el = id => document.getElementById(id);
+    const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const jobId = () => el('job-id').value.trim();
+    function render() { el('count').textContent = rows.length; el('last-request').textContent = rows.length ? rows[rows.length - 1].request_id || '-' : '-'; el('rows').innerHTML = rows.length ? rows.map(entry => `<tr class="${selected === entry.sequence ? 'selected' : ''}" data-sequence="${entry.sequence}"><td>${esc(entry.recorded_at)}</td><td class="mono">${esc(entry.request_id)}<br>id=${esc(entry.learn_list_row_id)}</td><td>${esc(entry.title)}</td><td>${esc(entry.content_chars)} chars<br><span class="mono">${esc(entry.content_sha256)}</span></td></tr>`).join('') : '<tr><td colspan="4" class="empty">요청 대기 중</td></tr>'; document.querySelectorAll('[data-sequence]').forEach(row => row.onclick = () => { selected = Number(row.dataset.sequence); const entry = rows.find(item => item.sequence === selected); el('payload').textContent = JSON.stringify(entry?.payload || {}, null, 2); render(); }); }
+    function add(entry) { if (!entry || rows.some(item => item.sequence === entry.sequence)) return; rows.push(entry); rows.sort((a,b) => a.sequence - b.sequence); lastSequence = Math.max(lastSequence, Number(entry.sequence) || 0); if (!selected) { selected = entry.sequence; el('payload').textContent = JSON.stringify(entry.payload, null, 2); } render(); }
+    async function load() { const query = new URLSearchParams(); if (jobId()) query.set('job_id', jobId()); const response = await fetch(`${API}/requests?${query}`, {cache:'no-store'}); if (!response.ok) throw new Error(await response.text()); const data = await response.json(); rows = []; lastSequence = 0; (data.requests || []).forEach(add); render(); }
+    function connect() { source?.close(); const query = new URLSearchParams(); query.set('after_sequence', String(lastSequence)); if (jobId()) query.set('job_id', jobId()); source = new EventSource(`${API}/events?${query}`); source.addEventListener('simhash_request', event => { add(JSON.parse(event.data)); el('connection').textContent = '연결됨'; }); source.onerror = () => { el('connection').textContent = '재연결 중'; }; source.onopen = () => { el('connection').textContent = '연결됨'; }; }
+    async function reset() { selected = null; el('payload').textContent = '행을 선택하면 마스킹된 실제 payload가 표시됩니다.'; await load(); connect(); }
+    el('apply').onclick = () => reset().catch(error => { el('connection').textContent = error.message; }); el('clear').onclick = () => { el('job-id').value = ''; reset().catch(error => { el('connection').textContent = error.message; }); }; reset().catch(error => { el('connection').textContent = error.message; });
+  </script>
+</body>
+</html>

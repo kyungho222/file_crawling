@@ -624,7 +624,13 @@ class IntegratedWorkflow:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _update_crawling_log_save_immediate(self) -> None:
-        await self._update_crawling_log_stats_async(force=True, reason="save_immediate")
+        # Save progress is published through Redis/SSE immediately.  Do not
+        # synchronously contend on the crawling-log row for every file.
+        logger.debug(
+            "[Workflow][CrawlingLog] deferred save progress | job_id=%s db=%s",
+            getattr(self, "job_id", ""),
+            getattr(self, "db_name", ""),
+        )
 
     async def _update_crawling_log_stats_async(
         self,
@@ -634,6 +640,10 @@ class IntegratedWorkflow:
         reason: str = "progress",
     ) -> None:
         if not (getattr(self, "job_id", None) and getattr(self, "db_name", None)):
+            return
+        if status is None:
+            # Redis/SSE owns live counters.  ASADAL_CRAWLING_LOG is refreshed
+            # explicitly by the dashboard or once at a terminal state.
             return
         async with self._crawling_log_update_lock:
             now = time.monotonic()

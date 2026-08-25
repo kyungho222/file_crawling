@@ -5,7 +5,7 @@ File crawl uses existing ASADAL_CRAWLING_EXPLORATION post rows as the
 source of detail pages. Category mapping is handled later from direct board category values and `_category` file-root mapping.
 
 Rules:
-- Load DB rows with type='post' as start_urls for FileDownloadWorkflow.
+- Load DB rows with the temporary file-crawl exploration type as start_urls for FileDownloadWorkflow.
 - Do not use legacy url_pattern/cate_match category routing for file crawling.
 - Preserve direct board category values only when they are explicitly present on the source row/item.
 - Select exploration post rows scoped by contents/target domains and service path.
@@ -100,6 +100,61 @@ _EXPLORATION_CATEGORY_META_COLUMNS = (
     "assigned_cate2",
 )
 _LEARN_LIST_TABLE = "ASADAL_CRAWLING_LEARN_LIST"
+# Temporary exploration source switch requested for file crawling only.
+# Keep the shared query default as ``post`` so board crawling is unaffected.
+_FILE_CRAWL_EXPLORATION_RECORD_TYPE = "page"
+
+
+def build_file_crawl_start_url_summary(
+    *,
+    db_name: Optional[str],
+    chat_bot_id: Optional[str],
+    job_id: Optional[str],
+    sql_rows: int,
+    scanned: int,
+    deduped: int,
+    domain_skipped: int,
+    missing_query_skipped: int,
+    query_pattern_skipped: int,
+    final_start_urls: int,
+    record_type: str,
+    require_active: bool,
+    dedupe_urls: bool,
+    date_filter_enabled: bool,
+    target_domains: Optional[List[str]],
+    path_prefix: str,
+    learn_list_id: Optional[int],
+    sql_condition: str = "",
+) -> Dict[str, Any]:
+    """Build the stable, job-level start URL diagnostics payload."""
+
+    return {
+        "job_id": str(job_id or ""),
+        "db_name": str(db_name or ""),
+        "chat_bot_id": str(chat_bot_id or ""),
+        "sql_rows": max(0, int(sql_rows or 0)),
+        "scanned": max(0, int(scanned or 0)),
+        "not_scannable": max(0, int(sql_rows or 0) - int(scanned or 0)),
+        "deduped": max(0, int(deduped or 0)),
+        "domain_skipped": max(0, int(domain_skipped or 0)),
+        "missing_query_skipped": max(0, int(missing_query_skipped or 0)),
+        "query_pattern_skipped": max(0, int(query_pattern_skipped or 0)),
+        "final_start_urls": max(0, int(final_start_urls or 0)),
+        "filters": {
+            "record_type": str(record_type or ""),
+            "active_only": bool(require_active),
+            "dedupe_urls": bool(dedupe_urls),
+            "date_filter_enabled": bool(date_filter_enabled),
+            "target_domains": [str(domain) for domain in (target_domains or []) if str(domain or "").strip()],
+            "path_prefix": str(path_prefix or ""),
+            "learn_list_id": learn_list_id,
+        },
+        "sql_condition": str(sql_condition or "")[:1200],
+    }
+
+
+def _log_file_crawl_start_url_summary(summary: Dict[str, Any]) -> None:
+    logger.info("[FileCrawlStartUrls][summary] %s", summary)
 
 
 def _category_debug_log_enabled() -> bool:
@@ -1134,6 +1189,7 @@ async def stream_post_urls_for_file_crawl(
     dedupe_urls: bool = True,
     learn_list_id_scope: Optional[Union[int, str]] = None,
     scope_by_contents_learn_list_id: bool = False,
+    job_id: Optional[str] = None,
 ) -> AsyncIterable[List[Dict[str, Any]]]:
     """
     Stream exploration post URLs for file crawling.
@@ -1302,6 +1358,7 @@ async def stream_post_urls_for_file_crawl(
             chat_bot_id=chat_bot_id,
             target_domains=[] if fallback_scope_active else list(final_domains or []),
             path_prefix="" if fallback_scope_active else effective_path_prefix,
+            record_type=_FILE_CRAWL_EXPLORATION_RECORD_TYPE,
             include_empty_type=use_category_rules,
             dedupe_urls=dedupe_urls,
             date_condition=exploration_date_condition,
@@ -1504,21 +1561,27 @@ async def stream_post_urls_for_file_crawl(
         if len(batch) >= max(1, int(batch_size or 200)):
             yield batch
             batch = []
-    logger.debug(
-        "[START_URLS_RULE_TRACE][file] emit summary | db=%s chat_bot_id=%s scanned=%s deduped=%s domain_skipped=%s missing_query_skipped=%s unmatched=%s matched=%s emitted=%s sample_matched=%s sample_unmatched=%s sample_domain_skipped=%s sample_missing_query=%s",
-        db_name,
-        chat_bot_id,
-        scanned_count,
-        deduped_count,
-        domain_skipped_count,
-        missing_query_skipped_count,
-        unmatched_count,
-        matched_count,
-        matched_count,
-        matched_samples,
-        unmatched_samples,
-        domain_skipped_samples,
-        missing_query_skipped_samples,
+    _log_file_crawl_start_url_summary(
+        build_file_crawl_start_url_summary(
+            db_name=db_name,
+            chat_bot_id=chat_bot_id,
+            job_id=job_id,
+            sql_rows=n_exploration,
+            scanned=scanned_count,
+            deduped=deduped_count,
+            domain_skipped=domain_skipped_count,
+            missing_query_skipped=missing_query_skipped_count,
+            query_pattern_skipped=unmatched_count,
+            final_start_urls=matched_count,
+            record_type=_FILE_CRAWL_EXPLORATION_RECORD_TYPE,
+            require_active=True,
+            dedupe_urls=dedupe_urls,
+            date_filter_enabled=exploration_date_filter_enabled,
+            target_domains=final_domains,
+            path_prefix=effective_path_prefix,
+            learn_list_id=resolved_learn_list_id,
+            sql_condition=condition,
+        )
     )
     if batch:
         yield batch
@@ -1624,6 +1687,7 @@ async def stream_post_urls_for_file_crawl_paged(
     dedupe_urls: bool = True,
     learn_list_id_scope: Optional[Union[int, str]] = None,
     scope_by_contents_learn_list_id: bool = False,
+    job_id: Optional[str] = None,
 ) -> AsyncIterable[List[Dict[str, Any]]]:
     """
     Stream exploration post URLs in pages for large file crawl jobs.
@@ -1750,6 +1814,7 @@ async def stream_post_urls_for_file_crawl_paged(
             chat_bot_id=chat_bot_id,
             target_domains=[] if fallback_scope_active else list(final_domains or []),
             path_prefix="" if fallback_scope_active else effective_path_prefix,
+            record_type=_FILE_CRAWL_EXPLORATION_RECORD_TYPE,
             include_empty_type=use_category_rules,
             dedupe_urls=dedupe_urls,
             require_active=True,
@@ -1985,22 +2050,27 @@ async def stream_post_urls_for_file_crawl_paged(
         )
         return
 
-    logger.debug(
-        "[START_URLS_RULE_TRACE][file][paged] emit summary | db=%s chat_bot_id=%s fetched_rows=%s scanned=%s deduped=%s domain_skipped=%s missing_query_skipped=%s unmatched=%s matched=%s emitted=%s sample_matched=%s sample_unmatched=%s sample_domain_skipped=%s sample_missing_query=%s",
-        db_name,
-        chat_bot_id,
-        page_row_count,
-        scanned_count,
-        deduped_count,
-        domain_skipped_count,
-        missing_query_skipped_count,
-        unmatched_count,
-        matched_count,
-        matched_count,
-        matched_samples,
-        unmatched_samples,
-        domain_skipped_samples,
-        missing_query_skipped_samples,
+    _log_file_crawl_start_url_summary(
+        build_file_crawl_start_url_summary(
+            db_name=db_name,
+            chat_bot_id=chat_bot_id,
+            job_id=job_id,
+            sql_rows=page_row_count,
+            scanned=scanned_count,
+            deduped=deduped_count,
+            domain_skipped=domain_skipped_count,
+            missing_query_skipped=missing_query_skipped_count,
+            query_pattern_skipped=unmatched_count,
+            final_start_urls=matched_count,
+            record_type=_FILE_CRAWL_EXPLORATION_RECORD_TYPE,
+            require_active=True,
+            dedupe_urls=dedupe_urls,
+            date_filter_enabled=exploration_date_filter_enabled,
+            target_domains=final_domains,
+            path_prefix=effective_path_prefix,
+            learn_list_id=resolved_learn_list_id,
+            sql_condition=condition,
+        )
     )
     if batch:
         if shuffle_order:

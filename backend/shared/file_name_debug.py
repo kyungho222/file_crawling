@@ -14,16 +14,7 @@ _SENTINEL_PATH = _LOG_DIR / "filename_debug.on"
 
 
 def file_name_debug_enabled() -> bool:
-    try:
-        for key in ("FILE_NAME_DEBUG", "CRAWL_DEBUG_FLOW"):
-            if str(os.getenv(key, "0")).strip().lower() in {"1", "true", "yes", "on"}:
-                return True
-    except Exception:
-        pass
-    try:
-        return _SENTINEL_PATH.exists()
-    except Exception:
-        return False
+    return False
 
 
 def file_name_debug_log_path() -> str:

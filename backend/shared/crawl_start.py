@@ -808,6 +808,12 @@ def _resolve_start_urls_date_filter_enabled(data: Dict[str, Any]) -> bool:
     ):
         if key in data:
             return bool_from_payload(data.get(key))
+    # 파일 크롤링은 프론트가 기간값만 전달하는 경우에도 Exploration 단계에서
+    # 1차로 범위를 줄인다. 명시적인 false는 위에서 그대로 존중한다.
+    if str(data.get("colle") or "").strip().lower() == "file":
+        target_date = data.get("start_urls_target_date") or data.get("target_date")
+        if isinstance(target_date, (list, tuple)) and len(target_date) >= 2:
+            return bool(str(target_date[0] or "").strip() and str(target_date[1] or "").strip())
     return False
 
 
@@ -820,8 +826,8 @@ def _normalize_start_urls_target_date(data: Dict[str, Any], *, enabled: bool) ->
     except Exception:
         today_iso = datetime.now().date().isoformat()
 
-    raw = data.get("start_urls_target_date")
-    if isinstance(raw, list):
+    raw = data.get("start_urls_target_date") or data.get("target_date")
+    if isinstance(raw, (list, tuple)):
         start_raw = str(raw[0] or "").strip() if len(raw) >= 1 else ""
         end_raw = str(raw[1] or "").strip() if len(raw) >= 2 else ""
     else:
@@ -6472,4 +6478,3 @@ async def _prepare_crawl(data: Dict[str, Any]):
         data["colle"] = detect_board_crawl(data).get("mode", "file")
         
     return None, db, data.get("job_id"), data.get("chat_bot_id")
-

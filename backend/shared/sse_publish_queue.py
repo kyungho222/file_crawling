@@ -113,6 +113,18 @@ def _sse_db_update_interval_seconds() -> float:
     return max(0.0, min(sec, 60.0))
 
 
+def _should_write_crawling_log_from_sse(status: Any) -> bool:
+    """Keep progress delivery in Redis/SSE; persist only terminal snapshots.
+
+    A non-terminal payload can arrive several times per second.  Writing each
+    coalesced payload to ASADAL_CRAWLING_LOG makes a slow MariaDB row update
+    compete with the crawl itself, while the UI already has the same snapshot
+    in Redis.  The explicit dashboard sync endpoint is used for an on-demand
+    non-terminal database refresh.
+    """
+    return _is_terminal_status(status)
+
+
 def _sse_db_update_before_publish_timeout_seconds() -> float:
     try:
         sec = float(os.getenv("SSE_DB_UPDATE_BEFORE_PUBLISH_TIMEOUT_SECONDS", "2.0") or "2.0")
@@ -658,9 +670,7 @@ async def _sse_publish_worker() -> None:
                     _payload_status = (payload or {}).get("status")
                     _terminal = _is_terminal_status(_payload_status)
                     status_val = _payload_status if _terminal else "start"
-                    now_ts = time.time()
-                    last_db_ts = _sse_last_db_update_ts_by_job.get(job_id, 0.0)
-                    should_update_db = bool(_terminal) or ((now_ts - last_db_ts) >= _sse_db_update_interval_seconds())
+                    should_update_db = _should_write_crawling_log_from_sse(_payload_status)
                     if should_update_db:
                         _schedule_crawling_log_update(job_id, payload, db_name, status_val)
                         timeout_sec = _sse_db_update_before_publish_timeout_seconds()

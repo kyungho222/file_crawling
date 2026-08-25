@@ -2001,11 +2001,44 @@ async def _fetch_category_root_by_names(
     quoted = {str(n or "").strip() for n in candidate_names if str(n or "").strip()}
     if not quoted:
         return None
+    all_rows = await _fetch_category_rows_cached(category_table=category_table, db_name=db_name)
     rows = [
-        row for row in await _fetch_category_rows_cached(category_table=category_table, db_name=db_name)
+        row for row in all_rows
         if _category_row_is_used(row) and str(row.get("cate_name") or "").strip() in quoted
     ]
     rows.sort(key=lambda row: (len(str(row.get("cate_treecode") or "")), str(row.get("cate_treecode") or "")))
+    if not rows:
+        normalized_candidates = {
+            re.sub(r"[\s\u200b\u200c\u200d\ufeff]+", "", name).lower()
+            for name in quoted
+        }
+        name_match_rows = []
+        for row in all_rows:
+            raw_name = str(row.get("cate_name") or "")
+            visible_name = re.sub(r"[\s\u200b\u200c\u200d\ufeff]+", "", raw_name).lower()
+            if raw_name.strip() in quoted or visible_name in normalized_candidates:
+                name_match_rows.append(
+                    {
+                        "cate_code": str(row.get("cate_code") or ""),
+                        "cate_treecode": str(row.get("cate_treecode") or ""),
+                        "cate_name_repr": repr(raw_name),
+                        "cate_use_repr": repr(row.get("cate_use")),
+                        "usable": _category_row_is_used(row),
+                    }
+                )
+        logger.warning(
+            "[CategorySync][root_lookup_miss]\n"
+            "DB=%s\n"
+            "카테고리테이블=%s\n"
+            "후보명=%s\n"
+            "캐시로드행수=%s\n"
+            "이름일치행=%s",
+            db_name,
+            category_table,
+            sorted(quoted),
+            len(all_rows),
+            name_match_rows[:10],
+        )
     return dict(rows[0]) if rows else None
 
 
@@ -2313,11 +2346,17 @@ def _looks_like_category_code(value: Any) -> bool:
 
 
 def sanitize_file_learning_category_codes(cate1: Any, cate2: Any) -> Tuple[str, str]:
-    """Keep LEARN_LIST file category columns code-only at persistence boundaries."""
+    """Keep file LEARN_LIST categories code-only and structurally paired.
+
+    File child categories have meaning only beneath the fixed file-learning
+    root.  Never persist a cate2 value when cate1 is absent or invalid.
+    """
     normalized_cate1 = str(cate1 or "").strip()
     normalized_cate2 = str(cate2 or "").strip()
+    if not _looks_like_category_code(normalized_cate1):
+        return ("", "")
     return (
-        normalized_cate1 if _looks_like_category_code(normalized_cate1) else "",
+        normalized_cate1,
         normalized_cate2 if _looks_like_category_code(normalized_cate2) else "",
     )
 
@@ -3568,9 +3607,17 @@ async def learn_list_merge_cate_on_duplicate_row(
             *coalesce_learn_list_cates(meta)
         )
         if n1 or n2:
-            if "cate1" in cols and should_update_category_field(sub_cate_mode, db_c1, n1):
+            # A prior legacy write can leave a display name in a code column.
+            # Replace that invalid value even in the normal non-overwrite mode.
+            if "cate1" in cols and n1 and (
+                not _looks_like_category_code(db_c1)
+                or should_update_category_field(sub_cate_mode, db_c1, n1)
+            ):
                 category_update_values["cate1"] = n1
-            if has_c2 and should_update_category_field(sub_cate_mode, db_c2, n2):
+            if has_c2 and n2 and (
+                not _looks_like_category_code(db_c2)
+                or should_update_category_field(sub_cate_mode, db_c2, n2)
+            ):
                 category_update_values["cate2"] = n2
             if category_update_values:
                 category_log_payload = (
@@ -3631,8 +3678,8 @@ async def learn_list_merge_cate_on_duplicate_row(
         updated = True
         if category_log_payload is not None:
             db_c1, db_c2, n1, n2 = category_log_payload
-            logger.warning(
-                "[LearnList][??????][file] ??? ??? | id=%s ???=(%r,%r) -> ???=(%r,%r)",
+            logger.info(
+                "[LearnList][파일][분류백필] 행ID=%s 이전=(%r,%r) 이후=(%r,%r)",
                 rid,
                 db_c1,
                 db_c2,
@@ -3920,6 +3967,7 @@ async def insert_into_learn_list(
             content_value = get_file_upload_content_url(access_base, domain, chat_bot_id, storage_filename)
         except Exception:
             content_value = get_file_upload_content_url(normalize_access_url(None, db_name), "dev.han.kr", chat_bot_id, storage_filename)
+        file_info["_learn_list_content_url"] = content_value
 
         # 4. ???占쏙옙 ??占??占쎄쑴占?
         try:
@@ -3939,6 +3987,14 @@ async def insert_into_learn_list(
             "size": file_size,
             "created_at": datetime.now(),
         }
+        try:
+            from backend.shared.file_simhash_generation import normalize_decimal_simhash
+
+            simhash_decimal = normalize_decimal_simhash(file_info.get("simhash_decimal"))
+            if simhash_decimal:
+                data["hash"] = simhash_decimal
+        except Exception:
+            pass
         if _fp:
             data["content_address"] = _fp
         content_updated_at = (
@@ -3954,7 +4010,9 @@ async def insert_into_learn_list(
 
         # 6. ?占싼됱쓥 ?袁り숲占?占?筌롳옙?? ?占쎈떽? (cols??1b?占?占쏙옙 ??占? ?類ｋ궖)
         if cols:
-            _cc1, _cc2 = coalesce_learn_list_cates(file_info)
+            _cc1, _cc2 = sanitize_file_learning_category_codes(
+                *coalesce_learn_list_cates(file_info)
+            )
             data["cate1"] = _cc1
             if "cate2" in cols:
                 data["cate2"] = _cc2
@@ -3976,6 +4034,18 @@ async def insert_into_learn_list(
             _ensure_learn_list_hash_columns_null(data, cols)
         else:
             data = _filter_learn_list_visible_write_data(data)
+
+        payload_hash = str(data.get("hash") or "").strip()
+        logger.info(
+            "[FileSimHash][persist_payload] job_id=%s db=%s table=%s file_url=%s has_hash=%s hash_length=%s hash_column=%s",
+            file_info.get("job_id"),
+            db_name,
+            table_name,
+            str(file_info.get("url") or "")[:220],
+            bool(payload_hash),
+            len(payload_hash),
+            bool(not cols or "hash" in cols),
+        )
 
         if _content_author_debug_enabled():
             original_meta = file_info.get("original_meta") if isinstance(file_info.get("original_meta"), dict) else {}
@@ -7576,6 +7646,7 @@ async def update_file_categories_by_subject_names(
             request_cookies=request_cookies,
             create_missing=False,
         )
+        mapped_c1, mapped_c2 = sanitize_file_learning_category_codes(mapped_c1, mapped_c2)
         _FILE_UPDATE_ONLY_MAPPING_CACHE[mapping_cache_key] = (mapped_c1, mapped_c2)
         logger.debug(
             "[CategorySync][file-update-only] mapping lookup done | db=%s chat_bot_id=%s board_cate2=%s mapped=(%s,%s)",
@@ -7585,6 +7656,7 @@ async def update_file_categories_by_subject_names(
             mapped_c1,
             mapped_c2,
         )
+    mapped_c1, mapped_c2 = sanitize_file_learning_category_codes(mapped_c1, mapped_c2)
     if not mapped_c2:
         logger.warning(
             "[CategorySync][file-update-only] mapping empty: file-learning child category not found | db=%s chat_bot_id=%s board_cate2=%s mapped=(%s,%s)",
@@ -7927,6 +7999,8 @@ async def bulk_update_file_categories_by_source_pages(
                 create_missing=False,
             )
             mapping_cache[mapping_key] = (mapped_c1, mapped_c2)
+        mapped_c1, mapped_c2 = sanitize_file_learning_category_codes(mapped_c1, mapped_c2)
+        mapping_cache[mapping_key] = (mapped_c1, mapped_c2)
         if len(missing) < 20 and not (mapped_c1 or mapped_c2):
             missing.append(
                 {

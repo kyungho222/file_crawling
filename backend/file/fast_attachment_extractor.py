@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
 from backend.board.anseong_file import resolve_anseong_yhlib_download_url
 from backend.board.yongin_board import resolve_yongin_file_download_url
 from utils.attachment_url_normalize import canonicalize_attachment_url_for_learn_list
+from utils.attachment_display_name import is_generated_attachment_storage_name
 from utils.file import parse_display_file_size_bytes, strip_fallback_download_label, strip_trailing_file_size
 from utils.url import canonicalize_url_for_dedup, extract_download_url_from_js, normalize_attachment_href
 
@@ -109,6 +110,7 @@ class FastAttachment:
     href: str
     name: str
     post_url: str
+    download_name: str = ""
     reason: str = "href"
     source: str = "fast_file_front"
     needs_response_validation: bool = False
@@ -423,13 +425,27 @@ def _resolve_url(
 
 def _candidate_name(node: Any, href: str) -> str:
     values = []
+    download_name = ""
     try:
+        download_name = _clean_name(node.get("download") or "")
         values.extend([
             node.get("download") or "", node.get("title") or "", node.get("aria-label") or "",
             node.get("alt") or "", node.get("value") or "", _node_text(node),
         ])
     except Exception:
         pass
+    href_ext = infer_attachment_extension(href)
+    # The site-provided <a download="..."> value is the authoritative
+    # attachment title. Do not replace it with nearby card labels or href.
+    if download_name and not is_generated_attachment_storage_name(download_name):
+        if infer_attachment_extension(download_name):
+            return download_name
+        if href_ext:
+            return f"{download_name}{href_ext}"
+    if any(is_generated_attachment_storage_name(value) for value in values) or is_generated_attachment_storage_name(_name_from_url(href)):
+        contextual = _contextual_title_name(node, *values)
+        if contextual:
+            return contextual if not href_ext or contextual.lower().endswith(href_ext) else f"{contextual}{href_ext}"
     for value in values:
         name = _clean_name(value)
         if name and infer_attachment_extension(name):
@@ -446,7 +462,6 @@ def _candidate_name(node: Any, href: str) -> str:
     except Exception:
         pass
 
-    href_ext = infer_attachment_extension(href)
     if href_ext:
         for value in values:
             name = strip_fallback_download_label(_clean_name(value))
@@ -694,6 +709,10 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
             else:
                 continue
         name = _candidate_name(node, href)
+        try:
+            download_name = _clean_name(node.get("download") or "")
+        except Exception:
+            download_name = ""
         if _is_noise_attachment_asset(href, name):
             continue
         if not (_is_download_url(href) or infer_attachment_extension(name)):
@@ -707,6 +726,7 @@ def extract_fast_attachments(html: str, base_url: str, *, force_full_scan: bool 
                 href=href,
                 name=name,
                 post_url=base_url,
+                download_name=download_name,
                 reason=reason,
                 needs_response_validation=needs_validation,
                 declared_file_size_bytes=parse_display_file_size_bytes(_node_text(node)) or 0,

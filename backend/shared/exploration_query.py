@@ -27,6 +27,7 @@ class ExplorationQuerySpec:
     chat_bot_id: Optional[str] = None
     target_domains: List[str] = field(default_factory=list)
     path_prefix: str = ""
+    record_type: str = "post"
     include_empty_type: bool = False
     dedupe_urls: bool = True
     require_active: bool = True
@@ -48,10 +49,12 @@ class ExplorationQueryConditions:
 def build_exploration_conditions(spec: ExplorationQuerySpec) -> ExplorationQueryConditions:
     """Build current and legacy WHERE conditions for exploration URL queries."""
 
+    record_type = str(spec.record_type or "post").strip().lower() or "post"
+    record_type_literal = sql_single_quoted_literal(record_type)
     base_type_condition = (
-        "(`type` = 'post' OR `type` IS NULL OR `type` = '')"
+        f"(`type` = '{record_type_literal}' OR `type` IS NULL OR `type` = '')"
         if spec.include_empty_type
-        else "`type` = 'post'"
+        else f"`type` = '{record_type_literal}'"
     )
     legacy_base_condition = (
         base_type_condition

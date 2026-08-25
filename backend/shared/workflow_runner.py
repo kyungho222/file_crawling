@@ -2088,7 +2088,12 @@ async def run_workflow_task(
         ui_colle = getattr(workflow, "ui_colle", None)
 
         def _file_live_db_progress_enabled() -> bool:
-            return True
+            # File crawl progress is already delivered through Redis/SSE.
+            # Persisting the same snapshot every few seconds can hold the
+            # crawling-log row lock long enough to delay crawl work.  Active
+            # users can request an explicit dashboard sync; terminal states
+            # continue to update the database through their normal path.
+            return False
 
         def _live_db_progress_flush_interval() -> float:
             return 2.0

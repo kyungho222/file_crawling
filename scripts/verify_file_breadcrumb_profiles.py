@@ -2,7 +2,10 @@
 
 from pathlib import Path
 
-from backend.file.file_breadcrumb import extract_file_category_breadcrumb_from_html
+from backend.file.file_breadcrumb import (
+    extract_file_breadcrumb_tokens_from_html,
+    extract_file_category_breadcrumb_from_html,
+)
 
 
 def main() -> None:
@@ -27,6 +30,27 @@ def main() -> None:
             )
             == "재정"
         )
+        menu_info_html = (
+            '<script>const menuInfo = {'
+            '"dpt1_menu_nm":"알림·소식·소통",'
+            '"dpt2_menu_nm":"웹진",'
+            '"dpt3_menu_nm":"지난호 다시보기"'
+            '};</script>'
+        )
+        assert extract_file_breadcrumb_tokens_from_html(menu_info_html) == [
+            "알림·소식·소통",
+            "웹진",
+            "지난호 다시보기",
+        ]
+        assert extract_file_category_breadcrumb_from_html(menu_info_html) == "웹진"
+        json_response = (
+            '{"WebzineBoard":{},"menuInfo":{'
+            '"dpt1_menu_nm":"알림·소식·소통",'
+            '"dpt2_menu_nm":"웹진",'
+            '"dpt3_menu_nm":"지난호 다시보기"'
+            '}}'
+        )
+        assert extract_file_category_breadcrumb_from_html(json_response) == "웹진"
         print("file breadcrumb profile tests passed")
     finally:
         profile_path.unlink(missing_ok=True)

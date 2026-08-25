@@ -416,3 +416,42 @@ async def get_file_crawl_job(job_id: str) -> Dict[str, Any]:
     if not _is_file_job(jid, workflow):
         raise HTTPException(status_code=404, detail="not a file crawl job")
     return _job_detail(jid, workflow)
+
+
+@router.post("/api/jobs/{job_id}/sync-crawl-log")
+async def sync_file_crawl_log(job_id: str) -> Dict[str, Any]:
+    """Persist the current in-memory file workflow counters on explicit demand."""
+    jid = str(job_id or "").strip()
+    workflow = crawler_state.workflows.get(jid)
+    if workflow is None or not _is_file_job(jid, workflow):
+        raise HTTPException(status_code=404, detail="active file crawl job not found")
+
+    db_name = str(getattr(workflow, "db_name", "") or "").strip()
+    if not db_name:
+        raise HTTPException(status_code=409, detail="workflow db_name is unavailable")
+    stats = _workflow_stats(workflow)
+    from db.crawl_db_manager import update_crawling_log_counters
+
+    applied = await update_crawling_log_counters(
+        jid,
+        scan=int(stats.get("scan_count", 0) or 0),
+        collection=int(stats.get("collection_count", 0) or 0),
+        saved=int(stats.get("save_count", 0) or 0),
+        study=int(stats.get("study_success_count", stats.get("study_count", 0)) or 0),
+        dbname=db_name,
+        log_id=getattr(workflow, "craw_id", None),
+        colle="file",
+        force=True,
+    )
+    if not applied:
+        raise HTTPException(status_code=409, detail="crawling_log update was not applied")
+    logger.info(
+        "[FileCrawlDashboard][crawl_log_sync] job_id=%s db=%s scan=%s collection=%s save=%s study=%s",
+        jid,
+        db_name,
+        stats.get("scan_count", 0),
+        stats.get("collection_count", 0),
+        stats.get("save_count", 0),
+        stats.get("study_success_count", stats.get("study_count", 0)),
+    )
+    return {"job_id": jid, "db_name": db_name, "applied": True, "stats": stats}

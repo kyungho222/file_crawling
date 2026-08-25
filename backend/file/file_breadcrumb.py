@@ -35,6 +35,17 @@ _BREADCRUMB_SELECTORS = [
 
 _BREADCRUMB_PROFILE_DIR = Path(__file__).with_name("breadcrumb_profiles")
 _PROFILE_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+_MENU_INFO_ASSIGNMENT_RE = re.compile(
+    r"(?:[\"']menuInfo[\"']|\b(?:var|let|const)\s+menuInfo)\s*(?:=|:)\s*",
+    re.IGNORECASE,
+)
+_MENU_INFO_DEPTH_FIELDS = (
+    "dpt1_menu_nm",
+    "dpt2_menu_nm",
+    "dpt3_menu_nm",
+    "dpt4_menu_nm",
+    "dpt5_menu_nm",
+)
 
 
 def _profile_domain_candidates(detail_url: str) -> List[str]:
@@ -202,6 +213,39 @@ def _tokens_from_title(soup) -> List[str]:
         tokens = tokens[1:]
     return tokens
 
+
+def _tokens_from_menu_info_text(text: str) -> List[str]:
+    """Read a menuInfo object from either an HTML script or a JSON detail response."""
+    decoder = json.JSONDecoder()
+    for match in _MENU_INFO_ASSIGNMENT_RE.finditer(str(text or "")):
+        object_start = text.find("{", match.end())
+        if object_start < 0:
+            continue
+        try:
+            menu_info, _ = decoder.raw_decode(text[object_start:])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(menu_info, dict):
+            continue
+        tokens = _clean_breadcrumb_tokens(
+            [str(menu_info.get(field) or "").strip() for field in _MENU_INFO_DEPTH_FIELDS]
+        )
+        if len(tokens) >= 2:
+            return tokens
+    return []
+
+
+def _tokens_from_script_menu_info(soup) -> List[str]:
+    """Read JSON menu depths embedded in detail pages when no DOM breadcrumb exists."""
+    for script in soup.find_all("script"):
+        try:
+            tokens = _tokens_from_menu_info_text(script.get_text(" ", strip=True))
+        except Exception:
+            tokens = []
+        if tokens:
+            return tokens
+    return []
+
 def extract_file_breadcrumb_tokens_from_html(
     html: str,
     *,
@@ -254,6 +298,9 @@ def extract_file_breadcrumb_tokens_from_html(
             cleaned = _clean_breadcrumb_tokens(tokens)
             if len(cleaned) >= 2:
                 return cleaned
+        menu_info_tokens = _tokens_from_menu_info_text(html) or _tokens_from_script_menu_info(soup)
+        if len(menu_info_tokens) >= 2:
+            return menu_info_tokens
         profile_title_fallback = profile.get("title_fallback") if profile else None
         use_title_fallback = include_title_fallback if profile_title_fallback is None else bool(profile_title_fallback)
         if use_title_fallback:
@@ -263,6 +310,49 @@ def extract_file_breadcrumb_tokens_from_html(
         return []
     except Exception:
         return []
+
+
+def inspect_file_breadcrumb_from_html(html: str, *, detail_url: str = "") -> Dict[str, Any]:
+    """Return concise diagnostics for the file breadcrumb extraction path."""
+    if not html or not BeautifulSoup:
+        return {"tokens": [], "source": "unavailable"}
+    try:
+        soup = BeautifulSoup(html, "html.parser")  # type: ignore[operator]
+        profile = _load_breadcrumb_profile(detail_url)
+        profile_selectors = _profile_selectors(profile)
+        selectors = profile_selectors + [
+            selector for selector in _BREADCRUMB_SELECTORS if selector not in profile_selectors
+        ]
+        selector_hits = []
+        for selector in selectors:
+            try:
+                count = len(soup.select(selector))
+            except Exception:
+                count = 0
+            if count:
+                selector_hits.append(f"{selector}:{count}")
+        menu_info_tokens = _tokens_from_menu_info_text(html) or _tokens_from_script_menu_info(soup)
+        title_tokens = _tokens_from_title(soup)
+        tokens = extract_file_breadcrumb_tokens_from_html(html, detail_url=detail_url)
+        if menu_info_tokens and tokens == menu_info_tokens:
+            source = "menu_info_json"
+        elif selector_hits:
+            source = "dom_selector"
+        elif title_tokens and tokens == title_tokens:
+            source = "html_title"
+        else:
+            source = "not_found"
+        return {
+            "profile": bool(profile),
+            "profile_selectors": profile_selectors,
+            "selector_hits": selector_hits,
+            "menu_info_tokens": menu_info_tokens,
+            "title_tokens": title_tokens,
+            "tokens": tokens,
+            "source": source,
+        }
+    except Exception as exc:
+        return {"tokens": [], "source": "inspect_error", "error": f"{type(exc).__name__}: {exc}"}
 
 
 def extract_file_web_title_from_html(html: str, *, detail_url: str = "") -> str:

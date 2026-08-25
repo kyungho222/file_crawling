@@ -36,6 +36,7 @@ from backend.board.gm_file import extract_gm_nftc_filelist_attachments
 from backend.board.yongin_board import resolve_yongin_file_download_url
 from backend.board.yongin_water_board import is_yongin_water_attachment_detail_url
 from backend.file.file_crawl_board_mixin import FileCrawlBoardMixin, ensure_file_study_stat_keys
+from backend.file.file_crawl_stage3 import enqueue_file_crawl_stage3_candidates
 from backend.file.file_detail_category import (
     filter_unexposed_file_detail_cates,
     normalize_file_detail_cates,
@@ -1963,6 +1964,10 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
     ) -> None:
 
         from backend.file.fast_attachment_producer import run_fast_file_attachment_front
+        from backend.file.file_crawl_attachment_snapshot import (
+            append_file_crawl_attachment_snapshot,
+            initialize_file_crawl_attachment_snapshot,
+        )
 
         self.state = WorkflowState.RUNNING
         self.is_running = True
@@ -2006,6 +2011,29 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
             except Exception:
                 pass
 
+        snapshot_job_id = str(getattr(self, "job_id", "") or "").strip()
+        if snapshot_job_id:
+            snapshot_url_count = max(
+                len(start_urls or []),
+                int(getattr(self, "pre_explored_start_urls_count", 0) or 0),
+            )
+            await asyncio.to_thread(
+                initialize_file_crawl_attachment_snapshot,
+                snapshot_job_id,
+                db_name=getattr(self, "db_name", ""),
+                chat_bot_id=getattr(self, "chat_bot_id", ""),
+                loaded_url_count=snapshot_url_count,
+            )
+
+        async def _record_attachment_snapshot(result: Dict[str, Any]) -> None:
+            if not snapshot_job_id:
+                return
+            await asyncio.to_thread(
+                append_file_crawl_attachment_snapshot,
+                snapshot_job_id,
+                result,
+            )
+
         normal_completed = False
         try:
             concurrency = _file_crawl_fast_front_concurrency(kwargs)
@@ -2022,7 +2050,16 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                 post_items=start_urls or [],
                 concurrency=concurrency,
                 timeout_sec=timeout_sec,
-                enqueue=True,
+                # The shared Stage-3 ingress replaces the legacy
+                # _enqueue_file_downloads path for the base file crawler.
+                enqueue=False,
+                # Keep attachment details while this active workflow is inspected.
+                include_attachment_details=True,
+                result_callback=_record_attachment_snapshot,
+                candidate_enqueue_callback=lambda payload: enqueue_file_crawl_stage3_candidates(
+                    self,
+                    **payload,
+                ),
             )
             try:
                 fast_result = self.fast_file_front_result if isinstance(self.fast_file_front_result, dict) else {}
@@ -2040,7 +2077,10 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                     self.stats["file_fast_front_post_count"] = fast_post_count
                     self.stats["file_fast_front_success_count"] = fast_success_count
                     self.stats["file_fast_front_attachment_count"] = fast_attachment_count
-                    self.stats["file_fast_front_enqueued_count"] = fast_enqueued_count
+                    self.stats["file_fast_front_enqueued_count"] = max(
+                        int(self.stats.get("file_fast_front_enqueued_count", 0) or 0),
+                        fast_enqueued_count,
+                    )
                     self.stats["file_fast_front_found_post_count"] = fast_found_posts
                     self.stats["file_detail_fetch_success_count"] = max(
                         int(self.stats.get("file_detail_fetch_success_count", 0) or 0),
@@ -2472,7 +2512,8 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                         ) + len(direct_attachments or [])
                 except Exception:
                     pass
-                await self._enqueue_file_downloads(
+                await enqueue_file_crawl_stage3_candidates(
+                    self,
                     post_url=url,
                     board_url=getattr(it, "board_url", "") or "",
                     reg_date=direct_reg_date_str or None,
@@ -2482,9 +2523,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                     author_kind=direct_author_info.get("author_kind"),
                     author_raw=direct_author_info.get("author_raw"),
                     department_raw=direct_author_info.get("department_raw"),
-                    contact_phone=None,
-                    view_count=None,
-                    sync_after_download=True,
                     detail_cates=(store_cate1, store_cate2),
                     post_title=(getattr(it, "post_title", None) or getattr(it, "title", None) or ""),
                 )
@@ -2904,7 +2942,8 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                     job_id=getattr(self, "job_id", ""),
                     db_name=getattr(self, "db_name", ""),
                 )
-                await self._enqueue_file_downloads(
+                await enqueue_file_crawl_stage3_candidates(
+                    self,
                     post_url=url,
                     board_url=getattr(it, "board_url", ""),
                     reg_date=reg_date_val,
@@ -2914,9 +2953,6 @@ class FileDownloadWorkflow(BoardContentFilePipelineMixin, FileCrawlBoardMixin, B
                     author_kind=author_info.get("author_kind"),
                     author_raw=author_info.get("author_raw"),
                     department_raw=author_info.get("department_raw"),
-                    contact_phone=None,
-                    view_count=None,
-                    sync_after_download=True,
                     detail_cates=(store_cate1, store_cate2),
                     post_title=current_title or "",
                 )

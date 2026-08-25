@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from backend.board.board_meta_extractor import extract_author_info_from_html
@@ -21,8 +22,13 @@ from backend.file.file_detail_category import (
     normalize_file_detail_cates,
     split_detail_cates,
 )
+from backend.file.file_crawl_stage3 import enqueue_file_crawl_stage3_candidates
 from backend.file.html_encoding import decode_html_response_bytes
-from backend.shared.date_utils import parse_date
+from backend.shared.date_utils import is_date_in_range, parse_date
+from core.crawler.file_host_request_gate import (
+    acquire_file_crawl_host_slot,
+    release_file_crawl_host_slot,
+)
 from utils.file import strip_fallback_download_label
 from utils.url import ensure_url_scheme
 
@@ -305,13 +311,48 @@ def normalize_fast_file_post_item(item: Any) -> Optional[FastFilePostItem]:
     )
 
 
-async def _fetch_with_workflow(workflow: Any, url: str, timeout_sec: float) -> str:
+async def _fetch_with_workflow(
+    workflow: Any,
+    url: str,
+    timeout_sec: float,
+    *,
+    playwright_fallback_on_fetch_failure: bool = False,
+) -> str:
+    async def _playwright_retry(reason: str) -> str:
+        fallback = getattr(workflow, "_fetch_html_playwright_detail_fallback", None)
+        if not callable(fallback):
+            return ""
+        logger.info(
+            "[file-fast][detail_playwright_retry] job_id=%s reason=%s url=%s",
+            getattr(workflow, "job_id", ""),
+            reason,
+            url,
+        )
+        try:
+            return str((await fallback(url)) or "")
+        except Exception as exc:
+            logger.debug(
+                "[file-fast][detail_playwright_retry_failed] job_id=%s reason=%s url=%s err=%s",
+                getattr(workflow, "job_id", ""),
+                reason,
+                url,
+                exc,
+            )
+            return ""
+
     fetcher = getattr(workflow, "_fetch_html_static", None)
     if callable(fetcher):
         try:
-            return await fetcher(url, timeout_sec=timeout_sec)
+            html = await fetcher(url, timeout_sec=timeout_sec)
         except TypeError:
-            return await fetcher(url)
+            html = await fetcher(url)
+        except Exception:
+            if playwright_fallback_on_fetch_failure:
+                return await _playwright_retry("static_exception")
+            raise
+        if html or not playwright_fallback_on_fetch_failure:
+            return str(html or "")
+        return await _playwright_retry("static_empty")
     try:
         import aiohttp  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover
@@ -588,6 +629,29 @@ def _extract_minimal_meta(workflow: Any, html: str, item: FastFilePostItem) -> D
     }
 
 
+def _file_attachment_period_decision(workflow: Any, reg_date: Any) -> tuple[bool, str]:
+    """Decide whether an extracted attachment may enter Stage 3 for this period."""
+    start_date = getattr(workflow, "start_date", None)
+    end_date = getattr(workflow, "end_date", None)
+    if not start_date and not end_date:
+        return True, "period_inactive"
+
+    text = str(reg_date or "").strip()
+    if not text:
+        # Preserve the existing file-crawl policy: a missing date must not
+        # silently discard an otherwise valid document.
+        return True, "reg_date_missing"
+    try:
+        parsed = parse_date(text)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        return True, "reg_date_unparseable"
+    if is_date_in_range(parsed, start_date, end_date):
+        return True, "in_range"
+    return False, "out_of_range"
+
+
 def _is_generic_attachment_name(value: Any) -> bool:
     norm = re.sub(r"\s+", " ", str(value or "").strip().lower())
     compact = re.sub(r"[\s:_\-\[\]\(\)\.]+", "", norm)
@@ -703,6 +767,11 @@ async def run_fast_file_attachment_front(
     concurrency: int = 32,
     timeout_sec: float = 20.0,
     enqueue: bool = True,
+    include_attachment_details: bool = False,
+    include_breadcrumb_metadata: bool = False,
+    playwright_fallback_on_fetch_failure: bool = False,
+    result_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    candidate_enqueue_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> Dict[str, Any]:
     raw_items = [
         item
@@ -742,6 +811,51 @@ async def run_fast_file_attachment_front(
         "attachment_count": 0,
         "enqueued_count": 0,
     }
+
+    async def _record_result(result: Dict[str, Any]) -> None:
+        results.append(result)
+        if result_callback is None:
+            return
+        try:
+            callback_result = result_callback(dict(result))
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except Exception as exc:
+            logger.warning(
+                "[file-fast][result_callback_failed] job_id=%s post_url=%s err=%s",
+                getattr(workflow, "job_id", ""),
+                result.get("url") or "",
+                exc,
+            )
+
+    def _attachment_details(attachments: List[Dict[str, Any]], fallback_title: str) -> List[Dict[str, Any]]:
+        if not include_attachment_details:
+            return []
+        return [
+            {
+                "name": _attachment_name(attachment, fallback_title),
+                "url": _attachment_url(attachment),
+                "extension": infer_attachment_extension(
+                    _attachment_name(attachment, fallback_title),
+                    _attachment_url(attachment),
+                ) or "",
+                # Keep the source-provided byte metadata with the stage result.
+                # It lets a later download-only validation stage retain the
+                # production large-lane decision without re-parsing the HTML.
+                "declared_file_size_bytes": int(
+                    attachment.get("declared_file_size_bytes")
+                    or attachment.get("_declared_file_size_bytes")
+                    or 0
+                ),
+                "exact_file_size_bytes": int(
+                    attachment.get("exact_file_size_bytes")
+                    or attachment.get("_exact_file_size_bytes")
+                    or 0
+                ),
+            }
+            for attachment in attachments
+            if isinstance(attachment, dict)
+        ]
     logger.info(
         "[file-fast][config] posts=%s unique_posts=%s duplicate_posts_skipped=%s concurrency=%s worker_queue_max=%s fetch_enqueue_delay_sec=%.3f fetch_delay_scope=per_worker enqueue=%s source_url_dedup=enabled",
         len(raw_items),
@@ -814,30 +928,49 @@ async def run_fast_file_attachment_front(
                         job_id=getattr(workflow, "job_id", ""),
                         db_name=getattr(workflow, "db_name", ""),
                     )
-                    logger.info(
+                    logger.debug(
                         "[파일빠른추출][상세] 게시물=%s\n첨부파일=없음 추출상태=스킵_%s 첨부수=0 큐등록=0",
                         item.url,
                         _ko_fast_skip_reason(skip_reason),
                     )
-                    results.append(
-                        {
-                            "url": item.url,
-                            "attachment_count": 0,
-                            "enqueued_count": 0,
-                            "skip_reason": skip_reason,
-                        }
-                    )
+                    skipped_result = {
+                        "url": item.url,
+                        "attachment_count": 0,
+                        "enqueued_count": 0,
+                        "skip_reason": skip_reason,
+                    }
+                    if include_attachment_details:
+                        skipped_result["attachments"] = []
+                    await _record_result(skipped_result)
                     return
                 await _wait_before_fetch(item.url, "detail", worker_no)
                 if _workflow_stop_requested():
                     logger.debug("[file-fast][stop_skip] stage=before_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                     return
-                html = await _fetch_with_workflow(workflow, item.url, timeout_sec)
+                host = (urlparse(str(item.url or "")).hostname or "").lower()
+                host_slot_acquired = False
+                try:
+                    if host:
+                        await acquire_file_crawl_host_slot(host, requested_limit=limit)
+                        host_slot_acquired = True
+                    html = await _fetch_with_workflow(
+                        workflow,
+                        item.url,
+                        timeout_sec,
+                        playwright_fallback_on_fetch_failure=playwright_fallback_on_fetch_failure,
+                    )
+                finally:
+                    if host_slot_acquired:
+                        await release_file_crawl_host_slot(host)
                 if _workflow_stop_requested():
                     logger.debug("[file-fast][stop_skip] stage=after_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                     return
+                breadcrumb_cate = ""
+                breadcrumb_tokens: List[str] = []
+                breadcrumb_trace: Dict[str, Any] = {}
                 if html:
                     original_cates = (item.cate1, item.cate2)
+                    breadcrumb_probe_needed = not str(item.cate2 or "").strip()
                     item.cate1, item.cate2 = filter_unexposed_file_detail_cates(
                         html,
                         item.cate1,
@@ -851,28 +984,6 @@ async def run_fast_file_attachment_front(
                             original_cates,
                             (item.cate1, item.cate2),
                         )
-                    if not str(item.cate2 or "").strip():
-                        breadcrumb_cate = ""
-                        breadcrumb_tokens = []
-                        try:
-                            from backend.file.file_breadcrumb import (
-                                extract_file_breadcrumb_tokens_from_html,
-                                extract_file_category_breadcrumb_from_html,
-                            )
-
-                            breadcrumb_tokens = extract_file_breadcrumb_tokens_from_html(
-                                html or "",
-                                detail_url=item.url,
-                            )
-                            breadcrumb_cate = extract_file_category_breadcrumb_from_html(
-                                html or "",
-                                detail_url=item.url,
-                            )
-                        except Exception:
-                            breadcrumb_cate = ""
-                            breadcrumb_tokens = []
-                        if breadcrumb_cate:
-                            item.cate2 = breadcrumb_cate
                     attachments = extract_fast_attachments(html or "", item.url)
                     extract_status = "found" if attachments else "empty"
                 else:
@@ -913,6 +1024,47 @@ async def run_fast_file_attachment_front(
                             len(html or ""),
                         )
                 attachments, noise_dropped = _filter_noise_attachments(attachments, item.title)
+                if attachments and (include_breadcrumb_metadata or not str(item.cate2 or "").strip()):
+                    try:
+                        from backend.file.file_breadcrumb import (
+                            extract_file_breadcrumb_tokens_from_html,
+                            extract_file_category_breadcrumb_from_html,
+                            inspect_file_breadcrumb_from_html,
+                        )
+
+                        breadcrumb_tokens = extract_file_breadcrumb_tokens_from_html(
+                            html or "",
+                            detail_url=item.url,
+                        )
+                        breadcrumb_cate = extract_file_category_breadcrumb_from_html(
+                            html or "",
+                            detail_url=item.url,
+                        )
+                        breadcrumb_trace = inspect_file_breadcrumb_from_html(
+                            html or "",
+                            detail_url=item.url,
+                        )
+                    except Exception:
+                        breadcrumb_cate = ""
+                        breadcrumb_tokens = []
+                        breadcrumb_trace = {"source": "extract_error"}
+                    if breadcrumb_cate and not str(item.cate2 or "").strip():
+                        item.cate2 = breadcrumb_cate
+                if html and attachments and breadcrumb_probe_needed:
+                    logger.info(
+                        "[FileBreadcrumbTrace][resolved] job_id=%s db=%s post_url=%s source=%s "
+                        "selector_hits=%s menu_info_tokens=%s tokens=%s cate_before=%s cate_after=%s attachments=%s",
+                        getattr(workflow, "job_id", ""),
+                        getattr(workflow, "db_name", ""),
+                        item.url,
+                        _clip_log_value(breadcrumb_trace.get("source"), 80),
+                        _clip_log_value(breadcrumb_trace.get("selector_hits"), 300),
+                        _clip_log_value(breadcrumb_trace.get("menu_info_tokens"), 300),
+                        _clip_log_value(breadcrumb_trace.get("tokens") or breadcrumb_tokens, 300),
+                        _clip_log_value(original_cates, 160),
+                        _clip_log_value((item.cate1, item.cate2), 160),
+                        len(attachments or []),
+                    )
                 if noise_dropped and not attachments:
                     extract_status = "noise_filtered_empty"
                 elif noise_dropped:
@@ -951,6 +1103,19 @@ async def run_fast_file_attachment_front(
                     author_kind = minimal_meta.get("author_kind")
                     author_raw = minimal_meta.get("author_raw")
                     department_raw = minimal_meta.get("department_raw")
+                period_allowed, period_reason = _file_attachment_period_decision(workflow, reg_date)
+                queue_attachments = attachments if period_allowed else []
+                period_skipped = len(attachments or []) if not period_allowed else 0
+                if period_skipped:
+                    logger.info(
+                        "[기간필터][file][attachment] 기간 외 큐 제외 | job_id=%s post_url=%s reg_date=%s start=%s end=%s attachments=%s",
+                        getattr(workflow, "job_id", ""),
+                        item.url,
+                        reg_date or "",
+                        getattr(workflow, "start_date", None),
+                        getattr(workflow, "end_date", None),
+                        period_skipped,
+                    )
                 for attachment in attachments:
                     if not isinstance(attachment, dict):
                         continue
@@ -982,7 +1147,70 @@ async def run_fast_file_attachment_front(
                 enqueue_missing = 0
                 total_dropped = 0
                 enqueue_reason = ""
-                if enqueue and attachments:
+                if (candidate_enqueue_callback is not None or enqueue) and queue_attachments:
+                    detail_cates = (item.cate1, item.cate2) if (item.cate1 or item.cate2) else None
+                    payload = {
+                        "post_url": item.url,
+                        "board_url": item.board_url or item.url,
+                        "attachments": [dict(attachment) for attachment in queue_attachments if isinstance(attachment, dict)],
+                        "reg_date": reg_date,
+                        "author": author or department,
+                        "department": department,
+                        "author_kind": author_kind,
+                        "author_raw": author_raw,
+                        "department_raw": department_raw,
+                        "detail_cates": detail_cates,
+                        "post_title": item.title,
+                    }
+                    try:
+                        callback = candidate_enqueue_callback
+                        if callback is None:
+                            # ``enqueue=True`` used to call the legacy
+                            # workflow._enqueue_file_downloads path. Keep the
+                            # public switch, but route every caller through
+                            # the shared Stage-3 ingress instead.
+                            callback = lambda stage3_payload: enqueue_file_crawl_stage3_candidates(
+                                workflow,
+                                **stage3_payload,
+                            )
+                        callback_result = callback(payload)
+                        if inspect.isawaitable(callback_result):
+                            callback_result = await callback_result
+                        if isinstance(callback_result, dict):
+                            enqueued = int(callback_result.get("queued", 0) or 0)
+                            duplicate_skipped = int(callback_result.get("duplicate", 0) or 0)
+                            enqueue_candidate_skipped = int(callback_result.get("non_document", 0) or 0)
+                            enqueue_dropped = int(callback_result.get("invalid", 0) or 0)
+                        else:
+                            enqueued = int(callback_result or 0)
+                    except Exception as exc:
+                        enqueue_reason = "stage3_enqueue_failed"
+                        logger.exception(
+                            "[file-fast][stage3_enqueue_failed] job_id=%s post_url=%s err=%s",
+                            getattr(workflow, "job_id", ""),
+                            item.url,
+                            exc,
+                        )
+                    total_dropped = enqueue_dropped + enqueue_candidate_skipped
+                    enqueue_missing = max(0, attachment_count - enqueued - duplicate_skipped - enqueue_candidate_skipped - enqueue_dropped - period_skipped)
+                    if not enqueue_reason:
+                        enqueue_reason = "공용Stage3큐등록" if enqueued else "공용Stage3미등록"
+                elif period_skipped:
+                    enqueue_reason = "기간외제외"
+                    _log_file_url_status(
+                        stage="download_enqueue",
+                        status="skipped",
+                        process_url=item.url,
+                        post_url=item.url,
+                        selected="no",
+                        saved="no",
+                        learn="not_started",
+                        count=period_skipped,
+                        reason="out_of_range",
+                        job_id=getattr(workflow, "job_id", ""),
+                        db_name=getattr(workflow, "db_name", ""),
+                    )
+                elif False:  # Legacy _enqueue_file_downloads branch is intentionally disabled.
                     if _workflow_stop_requested():
                         logger.debug("[file-fast][stop_skip] stage=before_enqueue job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                         return
@@ -1109,38 +1337,50 @@ async def run_fast_file_attachment_front(
                                 await _update_fast_stats()
                     except Exception:
                         pass
-                file_names = [
-                    _attachment_name(att, item.title)
-                    for att in (attachments or [])[:3]
-                    if isinstance(att, dict)
-                ]
-                logger.info(
-                    "[파일빠른추출][상세] 게시물=%s\n첨부파일=%s 추출상태=%s 첨부수=%s 후보=%s 큐등록=%s 중복스킵=%s 후보제외=%s 큐누락=%s 사유=%s 파일명=%s",
-                    item.url,
-                    "있음" if attachments else "없음",
-                    _ko_fast_extract_status(extract_status),
-                    attachment_count,
-                    enqueue_candidate_count,
-                    enqueued,
-                    duplicate_skipped,
-                    enqueue_candidate_skipped,
-                    enqueue_missing,
-                    enqueue_reason or "-",
-                    file_names or "-",
-                )
+                if attachments:
+                    file_names = [
+                        _attachment_name(att, item.title)
+                        for att in attachments[:3]
+                        if isinstance(att, dict)
+                    ]
+                    logger.info(
+                        "[파일빠른추출][상세] 게시물=%s\n첨부파일=있음 추출상태=%s 첨부수=%s 후보=%s 큐등록=%s 중복스킵=%s 후보제외=%s 큐누락=%s 사유=%s 파일명=%s",
+                        item.url,
+                        _ko_fast_extract_status(extract_status),
+                        attachment_count,
+                        enqueue_candidate_count,
+                        enqueued,
+                        duplicate_skipped,
+                        enqueue_candidate_skipped,
+                        enqueue_missing,
+                        enqueue_reason or "-",
+                        file_names or "-",
+                    )
                 counters["post_success_count"] += 1
                 counters["attachment_count"] += len(attachments)
                 counters["enqueued_count"] += enqueued
-                results.append(
-                    {
-                        "url": item.url,
-                        "reg_date": reg_date or "",
-                        "author": author or "",
-                        "department": department or "",
-                        "attachment_count": len(attachments),
-                        "enqueued_count": enqueued,
+                result = {
+                    "url": item.url,
+                    "reg_date": reg_date or "",
+                    "period_filter": period_reason,
+                    "author": author or "",
+                    "department": department or "",
+                    "attachment_count": len(attachments),
+                    "enqueued_count": enqueued,
+                }
+                if include_attachment_details:
+                    result["attachments"] = _attachment_details(attachments, item.title)
+                if include_breadcrumb_metadata:
+                    result["breadcrumb"] = {
+                        "source": str(breadcrumb_trace.get("source") or "").strip(),
+                        "selector_hits": [str(value) for value in (breadcrumb_trace.get("selector_hits") or [])],
+                        "menu_info_tokens": [str(value) for value in (breadcrumb_trace.get("menu_info_tokens") or [])],
+                        "tokens": [str(value) for value in (breadcrumb_trace.get("tokens") or breadcrumb_tokens or [])],
+                        "resolved_cate": str(breadcrumb_cate or "").strip(),
+                        "cate1": str(item.cate1 or "").strip(),
+                        "cate2": str(item.cate2 or "").strip(),
                     }
-                )
+                await _record_result(result)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1163,7 +1403,10 @@ async def run_fast_file_attachment_front(
                     exc,
                     exc_info=True,
                 )
-                results.append({"url": item.url, "error": str(exc)})
+                error_result = {"url": item.url, "error": str(exc)}
+                if include_attachment_details:
+                    error_result["attachments"] = []
+                await _record_result(error_result)
 
     async def worker(worker_no: int) -> None:
         while True:

@@ -19,6 +19,7 @@ from core.crawler.browser_launch import (
     get_default_timeout_ms,
 )
 from core.crawler.queues import JobQueues
+from core.crawler.file_download_topology import file_crawl_download_topology
 from core.crawler.workers.scan import scan_worker
 from core.crawler.workers.download import download_worker
 from core.crawler.workers.study import study_worker
@@ -265,41 +266,11 @@ class WorkerManager:
 
     async def _start_download_workers(self, cfg):
         """download worker 기동"""
-        # 다운로드 병렬성(워커 1개가 동시에 처리할 다운로드 개수)
-        # - 기본값은 5로 상향(이전 2)하여 저장(다운로드) 단계 병목 완화
-        # - 운영에서는 환경변수로 조절 가능
-        try:
-            # ✅ 워커 재배치(저장=학습):
-            # 저장(다운로드)이 학습보다 너무 빨라지면 save_count가 먼저 증가하고 study가 밀린다.
-            # 기본 동시 다운로드 수를 소폭 낮추고, 필요 시 환경변수로 올리도록 한다.
-            if is_no_limits_mode():
-                max_concurrent = 1_000_000
-            elif cfg.get("download_max_concurrent") is not None:
-                max_concurrent = int(cfg["download_max_concurrent"])
-            else:
-                # 기본 10: batch_size=1일 때 워커당 1건씩만 돌아가 저장이 선별보다 크게 밀리는 현상 완화
-                max_concurrent = int(
-                    os.getenv(
-                        "DOWNLOAD_MAX_CONCURRENT",
-                        str(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5)),
-                    )
-                )
-        except Exception:
-            max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5) or 5)
-        max_concurrent = max(1, max_concurrent)
-
-        total_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5))
-        requested_large_workers = max(
-            0,
-            int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 2) or 0),
-        )
-        large_workers = min(requested_large_workers, max(0, total_workers - 1))
-        requested_normal_workers = max(
-            1,
-            int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", total_workers) or total_workers),
-        )
-        normal_workers = min(requested_normal_workers, total_workers - large_workers)
-        normal_workers = max(1, normal_workers)
+        topology = file_crawl_download_topology()
+        total_workers = topology["total_workers"]
+        normal_workers = topology["normal_workers"]
+        large_workers = topology["large_workers"]
+        max_concurrent = topology["max_concurrent"]
 
         logger.info(
             "[WorkerManager][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
@@ -330,9 +301,7 @@ class WorkerManager:
                     browser_relauncher=self._relaunch_browser,
                     worker_id=i + 1,
                     worker_lane=worker_lane,
-                    large_download_queue=(
-                        self.job_queues.large_collection_batch_queue if large_workers else None
-                    ),
+                    large_download_queue=None,
                     shared_download_semaphore=shared_download_semaphore,
                 )
             )
@@ -374,7 +343,8 @@ class WorkerManager:
         max_elastic_workers: int = 2,
         lifetime_sec: float = 600.0,
     ) -> bool:
-        """Start one bounded normal-lane worker when large downloads block the base pool."""
+        """Keep the fixed three-worker download topology intact."""
+        max_elastic_workers = 0
         runtime = dict(getattr(self, "_download_runtime_config", {}) or {})
         normal_workers = int(runtime.get("normal_workers") or 0)
         if normal_workers < 1:
@@ -430,6 +400,7 @@ class WorkerManager:
                             else None
                         ),
                         shared_download_semaphore=semaphore,
+                        recover_taken_batch_on_cancel=True,
                     ),
                     timeout=lifetime_sec,
                 )

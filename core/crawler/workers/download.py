@@ -49,8 +49,15 @@ from utils.web_sync import sync_file_to_webserver
 from utils.db_name import resolve_db_name
 from utils.url import canonicalize_url_for_dedup, extract_download_url_from_js
 from utils.attachment_url_normalize import extract_attachment_key_candidates
+from utils.attachment_display_name import is_generated_attachment_storage_name
 from backend.shared.completed_url_ttl_cache import completed_url_cached
 from utils.download_integrity import is_partial_download_path, wait_for_file_ready
+from core.crawler.file_host_request_gate import (
+    acquire_file_crawl_host_slot,
+    record_file_crawl_host_transport_failure,
+    record_file_crawl_host_transport_success,
+    release_file_crawl_host_slot,
+)
 from core.crawler.workers.download_storage import (
     download_final_ready_timeout_sec as _download_final_ready_timeout_sec,
     download_temp_ready_timeout_sec as _download_temp_ready_timeout_sec,
@@ -71,6 +78,8 @@ from backend.shared.playwright_optimizations import (
 _ACTIVE_DOWNLOAD_ITEMS: Dict[str, Dict[str, Any]] = {}
 _DOWNLOAD_TIMEOUT_PROFILES: Dict[str, Dict[str, float]] = {}
 _DOWNLOAD_TIMEOUT_PROFILE_LOCK = threading.Lock()
+_DOWNLOAD_HOST_BACKPRESSURE: Dict[str, Dict[str, float]] = {}
+_DOWNLOAD_HOST_BACKPRESSURE_LOCK = threading.Lock()
 _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC = 600.0
 
 
@@ -114,8 +123,11 @@ def _download_timeout_profile_for_url(url: str) -> Dict[str, float]:
     connect_observed = float(observed.get("connect_sec") or 0.0)
     header_observed = float(observed.get("header_sec") or 0.0)
     gap_observed = float(observed.get("chunk_gap_sec") or 0.0)
-    connect_timeout = max(3.0, min(30.0, (connect_observed * 2.5) + 2.0 if connect_observed else 8.0))
-    header_timeout = max(5.0, min(75.0, (header_observed * 2.5) + 3.0 if header_observed else 20.0))
+    # Fast historical connections must not make a public-site retry fail at
+    # three seconds.  The per-request timeout below owns retryable connect and
+    # header failures; this profile only supplies a conservative budget.
+    connect_timeout = max(8.0, min(30.0, (connect_observed * 2.5) + 2.0 if connect_observed else 8.0))
+    header_timeout = max(10.0, min(75.0, (header_observed * 2.5) + 3.0 if header_observed else 20.0))
     stream_stall_timeout = max(10.0, min(120.0, (gap_observed * 6.0) + 5.0 if gap_observed else 30.0))
     return {
         "host": host or "-",
@@ -146,43 +158,92 @@ def _download_dynamic_timeout_reason(
     last_progress_at = float(file_meta.get("_download_last_progress_at") or phase_started_at)
     idle_sec = max(0.0, current - last_progress_at)
 
-    if elapsed_sec >= _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC:
+    absolute_timeout_sec = _download_absolute_item_timeout_sec(file_meta, profile=profile)
+    if elapsed_sec >= absolute_timeout_sec:
         return {
             "reason": "absolute_item_timeout",
             "phase": phase,
-            "budget_sec": _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC,
+            "budget_sec": absolute_timeout_sec,
             "elapsed_sec": elapsed_sec,
             "bytes_written": bytes_written,
             "idle_sec": idle_sec,
         }
-    if phase == "http_connect" and phase_elapsed_sec >= float(profile["connect_timeout_sec"]):
-        return {
-            "reason": "connect_timeout",
-            "phase": phase,
-            "budget_sec": float(profile["connect_timeout_sec"]),
-            "elapsed_sec": elapsed_sec,
-            "bytes_written": bytes_written,
-            "idle_sec": idle_sec,
-        }
-    if phase == "http_response_headers_wait" and phase_elapsed_sec >= float(profile["header_timeout_sec"]):
-        return {
-            "reason": "header_timeout",
-            "phase": phase,
-            "budget_sec": float(profile["header_timeout_sec"]),
-            "elapsed_sec": elapsed_sec,
-            "bytes_written": bytes_written,
-            "idle_sec": idle_sec,
-        }
-    if phase == "http_body_stream" and idle_sec >= float(profile["stream_stall_timeout_sec"]):
-        return {
-            "reason": "stream_stall_timeout",
-            "phase": phase,
-            "budget_sec": float(profile["stream_stall_timeout_sec"]),
-            "elapsed_sec": elapsed_sec,
-            "bytes_written": bytes_written,
-            "idle_sec": idle_sec,
-        }
+    # Do not cancel retryable connect/header/body I/O from the outer watchdog.
+    # aiohttp and the chunk reader enforce the same phase budgets inside the
+    # HTTP retry loop, which lets a transient timeout advance to attempt 2.
     return None
+
+
+def _download_no_file_diagnostics(file_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the final no-file result tied to the last observed HTTP response."""
+    return {
+        "phase": str(file_meta.get("_download_transport_phase") or "unknown"),
+        "http_status": file_meta.get("_download_http_status", "-"),
+        "content_type": str(file_meta.get("_download_response_content_type") or "-"),
+        "content_length": file_meta.get("_download_response_content_length", "-"),
+        "bytes_written": max(0, int(file_meta.get("_download_bytes_written") or 0)),
+        "host_backpressure": bool(file_meta.get("_download_host_backpressure")),
+    }
+
+
+def _stage_lab_download_diagnostics(
+    file_meta: Dict[str, Any],
+    *,
+    timeout_detail: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a compact transport snapshot for the download validation lab."""
+    now = time.monotonic()
+    profile = file_meta.get("_download_timeout_profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    phase_started_at = float(file_meta.get("_download_trace_phase_started_at") or now)
+    last_progress_at = float(file_meta.get("_download_last_progress_at") or phase_started_at)
+    headers_received_at = float(file_meta.get("_download_headers_received_at") or 0.0)
+    first_body_byte_at = float(file_meta.get("_download_first_body_byte_at") or 0.0)
+    details = timeout_detail if isinstance(timeout_detail, dict) else {}
+    timeout_reason = str(details.get("reason") or file_meta.get("_download_timeout_reason") or "")
+    phase = str(details.get("phase") or file_meta.get("_download_trace_phase") or "unknown")
+    timeout_budget = details.get("budget_sec")
+    if timeout_budget is None:
+        phase_budget_key = {
+            "http_connect": "connect_timeout_sec",
+            "http_response_headers_wait": "header_timeout_sec",
+            "http_body_stream": "stream_stall_timeout_sec",
+        }.get(phase)
+        timeout_budget = profile.get(phase_budget_key) if phase_budget_key else None
+    return {
+        "phase": phase,
+        "phase_elapsed_sec": round(max(0.0, now - phase_started_at), 3),
+        "timeout_reason": timeout_reason,
+        "timeout_budget_sec": timeout_budget,
+        "idle_sec": round(max(0.0, now - last_progress_at), 3),
+        "http_status": file_meta.get("_download_http_status"),
+        "content_type": str(file_meta.get("_download_response_content_type") or ""),
+        "content_length": file_meta.get("_download_response_content_length"),
+        "bytes_written": max(0, int(file_meta.get("_download_bytes_written") or 0)),
+        "http_attempts": int(file_meta.get("_download_http_attempt") or 0),
+        "playwright_attempts": int(file_meta.get("_download_playwright_attempt") or 0),
+        "header_received_sec": round(max(0.0, headers_received_at - phase_started_at), 3) if headers_received_at else None,
+        "first_body_byte_sec": round(max(0.0, first_body_byte_at - phase_started_at), 3) if first_body_byte_at else None,
+        "connect_timeout_sec": profile.get("connect_timeout_sec"),
+        "header_timeout_sec": profile.get("header_timeout_sec"),
+        "stream_stall_timeout_sec": profile.get("stream_stall_timeout_sec"),
+        "host_slot_limit": file_meta.get("_download_host_slot_limit"),
+        "host_slot_wait_sec": file_meta.get("_download_host_slot_wait_sec"),
+        "host_backpressure": bool(file_meta.get("_download_host_backpressure")),
+        "last_error": str(file_meta.get("_download_last_error") or ""),
+    }
+
+
+def _download_no_file_reason(file_meta: Dict[str, Any], *, playwright_attempts: int) -> str:
+    """Avoid hiding an unfinished HTTP path behind the generic http_no_file label."""
+    diagnostics = _download_no_file_diagnostics(file_meta)
+    prefix = "http_no_file" if playwright_attempts <= 0 else "http_and_playwright_no_file"
+    return (
+        f"{prefix}:phase={diagnostics['phase']}:status={diagnostics['http_status']}:"
+        f"content_type={diagnostics['content_type']}:content_length={diagnostics['content_length']}:"
+        f"bytes={diagnostics['bytes_written']}"
+    )
 
 
 async def _await_download_item_with_dynamic_timeout(
@@ -546,12 +607,51 @@ def _download_stream_stall_timeout_sec() -> float:
     return max(5.0, min(_env_float("DOWNLOAD_STREAM_STALL_TIMEOUT_SEC", 30.0), 180.0))
 
 
+def _download_absolute_item_timeout_sec(
+    file_meta: Dict[str, Any],
+    *,
+    profile: Dict[str, float],
+) -> float:
+    """Derive a large-file total deadline without relaxing normal download guards."""
+    declared_size = _declared_file_size_bytes(file_meta)
+    try:
+        response_size = int(file_meta.get("_download_response_content_length") or 0)
+    except (TypeError, ValueError):
+        response_size = 0
+    expected_size = max(declared_size, response_size)
+    is_large = bool(
+        str(file_meta.get("download_lane") or "").lower() == "large"
+        or expected_size >= _large_file_threshold_bytes()
+    )
+    if not is_large:
+        return _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC
+
+    try:
+        current_bps = float(file_meta.get("_download_current_bps") or 0.0)
+    except (TypeError, ValueError):
+        current_bps = 0.0
+    observed_bps = float(profile.get("observed_throughput_bps") or 0.0)
+    # Use a conservative floor when the host has no completed-download history.
+    throughput_bps = max(current_bps, observed_bps, 256 * 1024)
+    estimated_transfer_sec = float(expected_size) / throughput_bps if expected_size > 0 else 0.0
+    timeout_sec = 60.0 + (estimated_transfer_sec * 2.5)
+    return round(max(120.0, min(_DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC, timeout_sec)), 3)
+
+
 class _DownloadStreamFailure(Exception):
     def __init__(self, cause: BaseException, *, bytes_written: int, last_progress_at: float) -> None:
         super().__init__(str(cause or ""))
         self.cause = cause
         self.bytes_written = max(0, int(bytes_written or 0))
         self.last_progress_at = float(last_progress_at or time.monotonic())
+
+
+class _DownloadLargeLanePromotion(Exception):
+    """Stop a normal-lane stream after it proves to be a large file."""
+
+    def __init__(self, *, bytes_written: int) -> None:
+        self.bytes_written = max(0, int(bytes_written or 0))
+        super().__init__(f"streamed_size_large:{self.bytes_written}")
 
 
 def _should_defer_response_to_large_lane(
@@ -566,6 +666,22 @@ def _should_defer_response_to_large_lane(
         and large_queue_available
         and not file_meta.get("_large_lane_requeued")
         and int(content_length or 0) >= _large_file_threshold_bytes()
+    )
+
+
+def _should_promote_streamed_file_to_large_lane(
+    file_meta: Dict[str, Any],
+    bytes_written: int,
+    *,
+    worker_lane: str,
+    large_queue_available: bool,
+) -> bool:
+    """Promote an unknown-size normal download once it crosses the large threshold."""
+    return bool(
+        worker_lane == "normal"
+        and large_queue_available
+        and not file_meta.get("_large_lane_requeued")
+        and int(bytes_written or 0) >= _large_file_threshold_bytes()
     )
 
 
@@ -607,6 +723,46 @@ async def _take_download_batch(
 
     return selected_task.result(), selected_queue, selected_name
 
+
+async def _recover_taken_download_batch(
+    in_queue: BatchQueue,
+    batch_items: List[Any],
+    *,
+    worker_id: int,
+    worker_lane: str,
+    reason: str,
+) -> bool:
+    """Put an interrupted batch back before acknowledging its original queue item."""
+    recovered_batch = list(batch_items or [])
+    raw_queue = getattr(in_queue, "queue", None)
+    if not recovered_batch or raw_queue is None:
+        return False
+
+    try:
+        await raw_queue.put(recovered_batch)
+        in_queue.task_done()
+    except Exception as exc:
+        logger.error(
+            "[FileCrawlTrace][download_batch_recovery_failed] worker=%s lane=%s reason=%s batch_size=%s err_type=%s err=%s",
+            worker_id,
+            worker_lane,
+            reason,
+            len(recovered_batch),
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+    logger.warning(
+        "[FileCrawlTrace][download_batch_recovered] worker=%s lane=%s reason=%s batch_size=%s job_ids=%s",
+        worker_id,
+        worker_lane,
+        reason,
+        len(recovered_batch),
+        sorted({str(item.get("job_id") or "") for item in recovered_batch if isinstance(item, dict)}),
+    )
+    return True
+
 def _download_http_request_timeout(
     file_meta: Dict[str, Any],
     base_timeout_sec: float,
@@ -636,6 +792,7 @@ async def _stream_http_response_to_file(
     sniff_bytes: int = 2048,
     stream_stall_timeout_sec: Optional[float] = None,
     on_progress: Optional[Callable[[int, int, float], None]] = None,
+    should_promote_to_large_lane: Optional[Callable[[int], bool]] = None,
 ) -> tuple[int, bytes]:
     total = 0
     head = bytearray()
@@ -662,7 +819,11 @@ async def _stream_http_response_to_file(
                 last_progress_at = now
                 if on_progress is not None:
                     on_progress(total, len(chunk), chunk_gap_sec)
+                if should_promote_to_large_lane is not None and should_promote_to_large_lane(total):
+                    raise _DownloadLargeLanePromotion(bytes_written=total)
     except asyncio.CancelledError:
+        raise
+    except _DownloadLargeLanePromotion:
         raise
     except Exception as exc:
         raise _DownloadStreamFailure(
@@ -829,6 +990,7 @@ def _is_portal_direct_file_url(u: str) -> bool:
         return False
     return (
         "filedown.do" in lu
+        or "filedownnew.jsp" in lu
         or "/file/direct/download.do" in lu
         or "filedownaction" in lu
         or "atchfileid=" in lu
@@ -880,6 +1042,16 @@ def _requires_source_page_http_session(url: str, source_page: str) -> bool:
     if file_host == "pyeongtaek.go.kr":
         return file_path == "/emwp/jsp/ofr/filedownnew.jsp"
     return False
+
+
+def _same_download_source_host(url: str, source_page: str) -> bool:
+    """Only refresh a source-page session when it belongs to the attachment host."""
+    try:
+        file_host = (urlparse(str(url or "")).hostname or "").lower()
+        source_host = (urlparse(str(source_page or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return bool(file_host and source_host and file_host == source_host)
 
 
 def _should_prewarm_source_page_http_session(
@@ -985,9 +1157,6 @@ _PLAYWRIGHT_DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
 
-_DOWNLOAD_DOMAIN_SEMAPHORES: Dict[Tuple[int, str, str, int], asyncio.Semaphore] = {}
-
-
 def _host_env_key(host: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(host or "").strip().upper()).strip("_")
 
@@ -1026,29 +1195,66 @@ def _download_domain_concurrency_limit(host: str, strict_hosts: set[str], strict
     return _download_domain_default_concurrency()
 
 
+def _clear_download_host_backpressure_for_test() -> None:
+    with _DOWNLOAD_HOST_BACKPRESSURE_LOCK:
+        _DOWNLOAD_HOST_BACKPRESSURE.clear()
+
+
+def _record_download_host_transport_failure(
+    host: str,
+    reason: str,
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Temporarily serialize a host after repeated connection-level failures."""
+    host = str(host or "").strip().lower()
+    if not host or str(reason or "") not in {"connect_timeout", "body_timeout", "stream_stall_timeout"}:
+        return
+    observed_at = float(now if now is not None else time.monotonic())
+    with _DOWNLOAD_HOST_BACKPRESSURE_LOCK:
+        state = _DOWNLOAD_HOST_BACKPRESSURE.setdefault(host, {})
+        previous_at = float(state.get("last_failure_at") or 0.0)
+        failures = int(state.get("failures") or 0)
+        failures = failures + 1 if observed_at - previous_at <= 45.0 else 1
+        state.update({"failures": failures, "last_failure_at": observed_at})
+        if failures >= 2:
+            state["until"] = observed_at + 30.0
+
+
+def _record_download_host_transport_success(host: str) -> None:
+    host = str(host or "").strip().lower()
+    if not host:
+        return
+    with _DOWNLOAD_HOST_BACKPRESSURE_LOCK:
+        _DOWNLOAD_HOST_BACKPRESSURE.pop(host, None)
+
+
+def _download_host_backpressure_limit(host: str, default_limit: int, *, now: Optional[float] = None) -> int:
+    """Return a temporary safe host limit without affecting unrelated hosts."""
+    host = str(host or "").strip().lower()
+    current = float(now if now is not None else time.monotonic())
+    default_limit = max(1, int(default_limit or 1))
+    if not host:
+        return default_limit
+    with _DOWNLOAD_HOST_BACKPRESSURE_LOCK:
+        state = _DOWNLOAD_HOST_BACKPRESSURE.get(host)
+        if not state:
+            return default_limit
+        until = float(state.get("until") or 0.0)
+        if until > 0.0 and current >= until:
+            _DOWNLOAD_HOST_BACKPRESSURE.pop(host, None)
+            return default_limit
+        return 1 if until > current else default_limit
+
+
 def _download_domain_admission_wait_sec() -> float:
     """Bound worker-held time while a per-domain slot is unavailable."""
     try:
-        value = float(os.getenv("DOWNLOAD_DOMAIN_ADMISSION_WAIT_SEC", "0.15") or "0.15")
+        value = float(os.getenv("DOWNLOAD_DOMAIN_ADMISSION_WAIT_SEC", "2.0") or "2.0")
     except Exception:
-        value = 0.15
+        value = 2.0
     return max(0.01, min(value, 2.0))
 
-
-def _get_download_domain_semaphore(
-    host: str,
-    limit: int,
-    *,
-    job_id: str = "",
-) -> asyncio.Semaphore:
-    loop_id = id(asyncio.get_running_loop())
-    scope = str(job_id or "__global__").strip() or "__global__"
-    key = (loop_id, scope, str(host or "").strip().lower(), int(limit or 1))
-    sem = _DOWNLOAD_DOMAIN_SEMAPHORES.get(key)
-    if sem is None:
-        sem = asyncio.Semaphore(max(1, int(limit or 1)))
-        _DOWNLOAD_DOMAIN_SEMAPHORES[key] = sem
-    return sem
 
 def _eminwon_pre_goto_delay_sec() -> float:
     """Random delay before visiting e-minwon detail page to avoid timing-pattern failures."""
@@ -1714,6 +1920,30 @@ def _request_header_variants(
     return variants
 
 
+def _direct_http_request_headers_for_attempt(
+    base_headers: Dict[str, str],
+    *,
+    url: str,
+    source_page: str = "",
+    attempt: int = 1,
+) -> Dict[str, str]:
+    """Keep protected download cookies while avoiding a cross-origin preflight hint first."""
+    include_origin = not (
+        _is_portal_direct_file_url(url)
+        and max(1, int(attempt or 1)) == 1
+    )
+    req_headers = _build_request_headers(
+        base_headers,
+        source_page=source_page,
+        include_origin=include_origin,
+    )
+    if not include_origin:
+        for key in tuple(req_headers):
+            if str(key).lower() == "origin":
+                req_headers.pop(key, None)
+    return req_headers
+
+
 def _extract_html_followup_request(html_text: str, base_url: str) -> Optional[Dict[str, Any]]:
     text = str(html_text or "")
     if not text.strip():
@@ -1881,9 +2111,10 @@ async def _prime_source_page_http_session(
     headers: Dict[str, str],
     worker_id: int,
     primed_source_pages: set[str],
+    force: bool = False,
 ) -> None:
     source_page = str(source_page or "").strip()
-    if not source_page or source_page in primed_source_pages:
+    if not source_page or (source_page in primed_source_pages and not force):
         return
     timeout_profile = _download_timeout_profile_for_url(source_page)
     request_timeout = aiohttp.ClientTimeout(
@@ -2359,11 +2590,24 @@ def _best_download_filename(
     meta_candidates = _filename_candidates_from_meta(file_meta)
     url_candidates = _filename_candidates_from_url(url)
 
+    source_download_name = ""
+    if isinstance(file_meta, dict):
+        try:
+            source_download_name = _decode_filename_candidate(
+                file_meta.get("download_name")
+                or (file_meta.get("original_meta") or {}).get("download_name")
+            )
+        except Exception:
+            source_download_name = ""
+
     if not prefer_meta:
         prefer_meta = any(
             _is_opaque_download_route_filename(candidate, url)
             for candidate in decoded_candidates
-        ) or _is_server_side_direct_download_url(url) or _has_source_filename_download_url(url)
+        ) or any(
+            is_generated_attachment_storage_name(candidate)
+            for candidate in decoded_candidates
+        ) or bool(source_download_name) or _is_server_side_direct_download_url(url) or _has_source_filename_download_url(url)
 
     if prefer_meta:
         ordered.extend(meta_candidates)
@@ -4012,9 +4256,9 @@ async def _download_with_playwright(browser, file_meta: Dict, download_dir: str,
         _trace_filename_resolution(file_meta, worker_id=worker_id, url=url, stage="playwright_download", response_filename=response_suggested_path, selected_filename=suggested_path)
         suggested_path = _strip_partial_download_suffix(suggested_path)
         
-        # PHP ?듭씪: ?붿뒪?ъ뿉??md5(subject+time+uniqid).ext, DB subject?먮뒗 ?먮낯紐?
-        # Keep the page-extracted attachment title for DB/learning identity;
-        # the Playwright suggested filename remains the physical storage name.
+        # Keep one finalized name across display, local storage, WebSync, and
+        # the public LEARN_LIST content URL. Preserve the server filename only
+        # in original_meta when it is a generated storage-style name.
         original_subject = sanitize_filename(suggested_path) or suggested_path
         if is_blocked_non_document(original_subject, ""):
             logger.info("[Download] %s[Playwright] Skipped (non-doc) | url=%s filename=%s", wtag, url, original_subject)
@@ -4194,6 +4438,8 @@ async def download_worker(
     large_download_queue: Optional[BatchQueue] = None,
     fallback_in_queue: Optional[BatchQueue] = None,
     shared_download_semaphore: Optional[asyncio.Semaphore] = None,
+    item_taken_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    recover_taken_batch_on_cancel: bool = False,
 ):
     """
     Download Worker (real-time):
@@ -4434,7 +4680,6 @@ async def download_worker(
         """
         nonlocal browser  # ?몃? ?ㅼ퐫?꾩쓽 browser 蹂???낅뜲?댄듃瑜??꾪빐 ?꾩슂
         download_dir = None
-        domain_sem: Optional[asyncio.Semaphore] = None
         domain_lock_acquired = False
         host = ""
         last_err_msg = ""
@@ -4568,7 +4813,9 @@ async def download_worker(
             per_item_http_timeout = http_timeout
             if is_portal_direct_fast:
                 per_item_pw_attempts = min(per_item_pw_attempts, 1)
-                per_item_http_retries = 1
+                # First request omits Origin while retaining cookies/Referer. Retry once
+                # with the legacy Origin header before falling back to Playwright.
+                per_item_http_retries = 2
                 per_item_http_timeout = min(per_item_http_timeout, _portal_direct_http_timeout_sec())
             is_component_direct_fast = _is_component_direct_download_url(url)
             is_server_side_direct = _is_server_side_direct_download_url(url)
@@ -4683,11 +4930,19 @@ async def download_worker(
             try:
                 if host:
                     domain_limit = _download_domain_concurrency_limit(host, strict_hosts, strict_domain_limit)
-                    domain_sem = _get_download_domain_semaphore(
-                        host,
-                        domain_limit,
-                        job_id=str(file_meta.get("job_id") or ""),
-                    )
+                    configured_domain_limit = domain_limit
+                    domain_limit = _download_host_backpressure_limit(host, domain_limit)
+                    if domain_limit < configured_domain_limit:
+                        file_meta["_download_host_backpressure"] = True
+                        logger.warning(
+                            "[DownloadTrace][host_backpressure_active] job_id=%s worker=%s host=%s configured_limit=%s active_limit=%s url=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            host,
+                            configured_domain_limit,
+                            domain_limit,
+                            _short(url, 220),
+                        )
                     domain_lock_wait_started = time.monotonic()
                     _set_download_activity_phase(file_meta, "domain_slot_wait")
                     logger.info(
@@ -4709,9 +4964,10 @@ async def download_worker(
                     )
                     admission_wait_sec = _download_domain_admission_wait_sec()
                     try:
-                        await asyncio.wait_for(
-                            domain_sem.acquire(),
-                            timeout=admission_wait_sec,
+                        admission = await acquire_file_crawl_host_slot(
+                            host,
+                            requested_limit=domain_limit,
+                            timeout_sec=admission_wait_sec,
                         )
                     except asyncio.TimeoutError:
                         defer_attempt = int(file_meta.get("_domain_defer_attempt", 0) or 0) + 1
@@ -4740,6 +4996,8 @@ async def download_worker(
                             "domain_defer_attempt": defer_attempt,
                         }
                     domain_lock_acquired = True
+                    file_meta["_download_host_slot_limit"] = admission.get("limit", domain_limit)
+                    file_meta["_download_host_slot_wait_sec"] = admission.get("wait_sec", 0.0)
                     file_meta.pop("_domain_defer_attempt", None)
                     _set_download_activity_phase(file_meta, "download_path_prepare")
                     logger.info(
@@ -4747,20 +5005,19 @@ async def download_worker(
                         file_meta.get("job_id"),
                         worker_id,
                         host,
-                        domain_limit,
-                        max(0.0, time.monotonic() - domain_lock_wait_started),
+                        admission.get("limit", domain_limit),
+                        admission.get("wait_sec", max(0.0, time.monotonic() - domain_lock_wait_started)),
                         _short(url, 220),
                     )
                     logger.info(
                         "[Download][Worker %s] domain lock acquired | host=%s limit=%s wait_sec=%.3f url=%s",
                         worker_id,
                         host,
-                        domain_limit,
-                        max(0.0, time.monotonic() - domain_lock_wait_started),
+                        admission.get("limit", domain_limit),
+                        admission.get("wait_sec", max(0.0, time.monotonic() - domain_lock_wait_started)),
                         _short(url, 220),
                     )
             except Exception:
-                domain_sem = None
                 domain_lock_acquired = False
             try:
                 logger.info(
@@ -4794,7 +5051,12 @@ async def download_worker(
                         break
                     try:
                         file_meta["_download_http_attempt"] = attempt
-                        req_headers = _build_request_headers(headers, source_page=source_page)
+                        req_headers = _direct_http_request_headers_for_attempt(
+                            headers,
+                            url=url,
+                            source_page=source_page,
+                            attempt=attempt,
+                        )
                         cookie_header = _cookie_header_from_file_meta(file_meta)
                         manual_cookie_header = "; ".join(
                             f"{name}={value}" for name, value in _manual_download_cookies(url, source_page).items()
@@ -4805,8 +5067,16 @@ async def download_worker(
                         prewarm_enabled = str(os.getenv("DOWNLOAD_HTTP_PREWARM_SOURCE_PAGE", "1")).strip().lower() in ("1", "true", "yes", "on")
                         if is_portal_direct_fast:
                             prewarm_enabled = str(os.getenv("DOWNLOAD_PORTAL_DIRECT_HTTP_PREWARM_SOURCE_PAGE", "0")).strip().lower() in ("1", "true", "yes", "on")
+                        requires_source_page_session = _requires_source_page_http_session(
+                            url,
+                            source_page,
+                        )
                         if _is_suwon_culture_direct_download_url(url):
                             prewarm_enabled = False
+                        elif requires_source_page_session:
+                            # Protected attachment routes need the detail-page session even
+                            # when generic direct-download prewarming is disabled.
+                            prewarm_enabled = True
                         elif prewarm_enabled:
                             prewarm_enabled = _should_prewarm_source_page_http_session(
                                 url,
@@ -4814,7 +5084,7 @@ async def download_worker(
                                 is_http_only_direct=is_http_only_direct,
                                 is_portal_direct_fast=is_portal_direct_fast,
                             )
-                        if _requires_source_page_http_session(url, source_page):
+                        if requires_source_page_session:
                             logger.info(
                                 "[DownloadTrace][source_session_policy] job_id=%s worker=%s host=%s "
                                 "prewarm_enabled=%s url=%s post_url=%s",
@@ -4932,6 +5202,14 @@ async def download_worker(
                         )
                         async with response:
                             _set_download_activity_phase(file_meta, "http_response_headers_received")
+                            file_meta["_download_http_status"] = int(response.status)
+                            file_meta["_download_headers_received_at"] = time.monotonic()
+                            file_meta["_download_response_content_type"] = (
+                                response.headers.get("content-type", "")
+                            )
+                            file_meta["_download_response_content_length"] = (
+                                response.headers.get("content-length", "")
+                            )
                             await _append_download_url_trace(
                                 {
                                     "event": "target_response",
@@ -4953,6 +5231,7 @@ async def download_worker(
                             response_header_elapsed_sec = max(0.0, time.monotonic() - header_wait_started_at)
                             _record_download_host_timing(url, "header_sec", response_header_elapsed_sec)
                             _set_download_activity_phase(file_meta, "http_response_metadata")
+                            file_meta["_download_transport_phase"] = "http_response_metadata"
                             if response_header_elapsed_sec >= _download_transport_slow_log_sec():
                                 logger.info(
                                     "[DownloadTrace][transport_headers_slow] job_id=%s worker=%s host=%s elapsed_sec=%.3f "
@@ -4969,6 +5248,59 @@ async def download_worker(
                                 )
                             if response.status != 200:
                                 file_meta["_download_empty_reason"] = f"http_status_{response.status}"
+                                if response.status in {401, 403}:
+                                    file_meta["_download_access_denied_http"] = True
+                                    logger.info(
+                                        "[DownloadTrace][http_access_denied] job_id=%s worker=%s "
+                                        "status=%s attempt=%s/%s source_prewarm=%s url=%s post_url=%s",
+                                        file_meta.get("job_id"),
+                                        worker_id,
+                                        response.status,
+                                        attempt,
+                                        per_item_http_retries,
+                                        bool(source_page and prewarm_enabled),
+                                        _short(url, 220),
+                                        _short(source_page, 220),
+                                    )
+                                    can_refresh_source_session = bool(
+                                        source_page
+                                        and _same_download_source_host(url, source_page)
+                                        and not file_meta.get("_download_access_denied_session_refresh_attempted")
+                                        and attempt < per_item_http_retries
+                                    )
+                                    if can_refresh_source_session:
+                                        file_meta["_download_access_denied_session_refresh_attempted"] = True
+                                        await _prime_source_page_http_session(
+                                            session,
+                                            source_page=source_page,
+                                            headers=req_headers,
+                                            worker_id=worker_id,
+                                            primed_source_pages=primed_source_pages,
+                                            force=True,
+                                        )
+                                        refreshed_cookie_header = _cookie_header_from_aiohttp_session(
+                                            session,
+                                            url,
+                                            source_page,
+                                        )
+                                        if refreshed_cookie_header:
+                                            _merge_request_cookies_into_file_meta(
+                                                file_meta,
+                                                _cookies_from_header(refreshed_cookie_header),
+                                            )
+                                        logger.info(
+                                            "[DownloadTrace][http_access_denied_session_refresh] "
+                                            "job_id=%s worker=%s status=%s url=%s post_url=%s",
+                                            file_meta.get("job_id"),
+                                            worker_id,
+                                            response.status,
+                                            _short(url, 220),
+                                            _short(source_page, 220),
+                                        )
+                                        continue
+                                    # A refreshed source-page session did not authorize the
+                                    # attachment. Use the single guarded browser attempt below.
+                                    break
                                 logger.debug(
                                     "[Download][Worker %s] HTTP non-200 | attempt=%s status=%s url=%s encoded=%s",
                                     worker_id,
@@ -4988,9 +5320,12 @@ async def download_worker(
                             match = re.search(r'filename=(?:["\']?([^"\'\n;]+)["\']?|([^"\';\n]+))', cd, re.IGNORECASE)
                             
                             # 湲곕뒫蹂?1以?二쇱꽍?ㅻ챸: ?몄뀡 ?곌껐???좎??섎뒗 ?숈븞 蹂몃Ц???쎈룄濡?議곌굔臾?釉붾줉 ?꾩껜瑜??덉쑝濡??ㅼ뿬?곌린?⑸땲??
-                            if match:
+                            # A static document may not send Content-Disposition. The
+                            # common MIME, filename fallback, and body stream path must
+                            # still run in that case.
+                            if True:
                                 # 洹몃９ 1(?곗샂???덉쓬) ?먮뒗 洹몃９ 2(?곗샂???놁쓬)?먯꽌 媛?媛?몄삤湲?
-                                raw_filename = match.group(1) or match.group(2)
+                                raw_filename = (match.group(1) or match.group(2)) if match else ""
                                 raw_filename = raw_filename.strip()
 
                                 # %-?몄퐫??URL ?몄퐫?? ?좎쿂由?(local import to avoid top-level dependency)
@@ -5183,6 +5518,27 @@ async def download_worker(
                                 subject_with_ext = final_filename if (final_filename and '.' in final_filename) else (sanitize_filename(original_subject) or 'file.bin')
                                 storage_filename = make_safe_storage_filename(subject_with_ext)
                                 expected_size = _expected_content_length(response.headers)
+                                if int(expected_size or 0) > 0:
+                                    file_meta["declared_file_size_bytes"] = max(
+                                        _declared_file_size_bytes(file_meta),
+                                        int(expected_size),
+                                    )
+                                    dynamic_total_timeout_sec = _download_absolute_item_timeout_sec(
+                                        file_meta,
+                                        profile=timeout_profile,
+                                    )
+                                    if int(expected_size) >= _large_file_threshold_bytes():
+                                        logger.info(
+                                            "[DownloadTrace][large_timeout_budget] job_id=%s worker=%s lane=%s "
+                                            "declared_size_bytes=%s total_timeout_sec=%.3f observed_bps=%.1f url=%s",
+                                            file_meta.get("job_id"),
+                                            worker_id,
+                                            worker_lane,
+                                            int(expected_size),
+                                            dynamic_total_timeout_sec,
+                                            float(timeout_profile.get("observed_throughput_bps") or 0.0),
+                                            _short(url, 220),
+                                        )
                                 if _should_defer_response_to_large_lane(
                                     file_meta,
                                     int(expected_size or 0),
@@ -5233,6 +5589,7 @@ async def download_worker(
                                             "deferred_to_large_lane": True,
                                             "url": url,
                                             "declared_file_size_bytes": int(expected_size or 0),
+                                            "defer_reason": "response_content_length_large",
                                         }
 
                                 # 1) 臾몄꽌瑜섎쭔 ?덉슜 (?뚯씪紐??뺤옣??湲곕컲 2李?李⑤떒)
@@ -5281,6 +5638,8 @@ async def download_worker(
                                     chunk_gap_sec: float,
                                 ) -> None:
                                     now = time.monotonic()
+                                    if total_bytes > 0 and not file_meta.get("_download_first_body_byte_at"):
+                                        file_meta["_download_first_body_byte_at"] = now
                                     file_meta["_download_bytes_written"] = int(total_bytes)
                                     file_meta["_download_last_progress_at"] = now
                                     file_meta["_download_current_bps"] = float(total_bytes) / max(
@@ -5289,13 +5648,82 @@ async def download_worker(
                                     )
                                     _record_download_host_timing(url, "chunk_gap_sec", chunk_gap_sec)
 
+                                def _should_promote_stream(total_bytes: int) -> bool:
+                                    return _should_promote_streamed_file_to_large_lane(
+                                        file_meta,
+                                        total_bytes,
+                                        worker_lane=worker_lane,
+                                        large_queue_available=large_download_queue is not None,
+                                    )
+
                                 try:
                                     file_size, head = await _stream_http_response_to_file(
                                         response,
                                         tmp_filepath,
                                         stream_stall_timeout_sec=timeout_profile["stream_stall_timeout_sec"],
                                         on_progress=_on_stream_progress,
+                                        should_promote_to_large_lane=_should_promote_stream,
                                     )
+                                except _DownloadLargeLanePromotion as promotion:
+                                    bytes_written = int(promotion.bytes_written or 0)
+                                    await _cleanup_active_download_temp_file(
+                                        file_meta,
+                                        reason="streamed_size_large",
+                                        worker_id=worker_id,
+                                    )
+                                    file_meta["declared_file_size_bytes"] = bytes_written
+                                    file_meta["download_lane"] = "large"
+                                    file_meta["_large_lane_requeued"] = True
+                                    try:
+                                        _set_download_activity_phase(file_meta, "large_lane_enqueue_wait")
+                                        await large_download_queue.put(file_meta)
+                                        await large_download_queue.flush()
+                                    except Exception as defer_exc:
+                                        file_meta.pop("_large_lane_requeued", None)
+                                        file_meta["download_lane"] = "normal"
+                                        file_meta["_download_empty_reason"] = "streamed_large_lane_enqueue_failed"
+                                        logger.warning(
+                                            "[DownloadTrace][large_lane_stream_promote_failed] job_id=%s worker=%s "
+                                            "bytes_written=%s url=%s post_url=%s err=%s",
+                                            file_meta.get("job_id"),
+                                            worker_id,
+                                            bytes_written,
+                                            _short(url, 220),
+                                            _short(source_page, 220),
+                                            _short(defer_exc, 240),
+                                        )
+                                        if attempt < per_item_http_retries:
+                                            await asyncio.sleep(0.5)
+                                            continue
+                                        break
+                                    logger.info(
+                                        "[DownloadTrace][large_lane_promoted_stream] job_id=%s worker=%s "
+                                        "bytes_written=%s threshold_bytes=%s url=%s post_url=%s",
+                                        file_meta.get("job_id"),
+                                        worker_id,
+                                        bytes_written,
+                                        _large_file_threshold_bytes(),
+                                        _short(url, 220),
+                                        _short(source_page, 220),
+                                    )
+                                    await progress_queue.put(
+                                        {
+                                            "type": "download_deferred",
+                                            "url": url,
+                                            "reason": "streamed_size_large",
+                                            "declared_file_size_bytes": bytes_written,
+                                            "source_page": source_page,
+                                            "name": file_meta.get("name") or file_meta.get("subject"),
+                                            "worker_id": worker_id,
+                                            "job_id": file_meta.get("job_id"),
+                                        }
+                                    )
+                                    return {
+                                        "deferred_to_large_lane": True,
+                                        "url": url,
+                                        "declared_file_size_bytes": bytes_written,
+                                        "defer_reason": "streamed_size_large",
+                                    }
                                 except Exception as stream_exc:
                                     bytes_written = int(getattr(stream_exc, "bytes_written", 0) or 0)
                                     last_progress_at = float(
@@ -5599,6 +6027,8 @@ async def download_worker(
                                     file_size,
                                 )
                                 
+                                _record_download_host_transport_success(host)
+                                await record_file_crawl_host_transport_success(host)
                                 return {
                                     'file_path': filepath, 
                                     'url': url,
@@ -5639,6 +6069,10 @@ async def download_worker(
                             phase=transport_phase,
                             bytes_written=int(getattr(http_exc, "bytes_written", 0) or 0),
                         )
+                        if failure_reason in {"connect_timeout", "header_timeout", "body_timeout", "stream_stall_timeout"}:
+                            file_meta["_download_timeout_reason"] = failure_reason
+                        _record_download_host_transport_failure(host, failure_reason)
+                        await record_file_crawl_host_transport_failure(host, failure_reason)
                         if _is_timeout_download_error(http_exc):
                             timeout_profile = file_meta.get("_download_timeout_profile") or _download_timeout_profile_for_url(url)
                             if transport_phase == "http_connect":
@@ -5730,6 +6164,18 @@ async def download_worker(
 
                 # 2. Playwright Fallback
                 if (browser or browser_relauncher) and per_item_pw_attempts > 0:
+                    if file_meta.get("_download_access_denied_http"):
+                        per_item_pw_attempts = min(per_item_pw_attempts, 1)
+                        logger.info(
+                            "[DownloadTrace][auth_required_playwright_guard] job_id=%s worker=%s "
+                            "http_status=%s playwright_attempts=%s url=%s post_url=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            file_meta.get("_download_http_status"),
+                            per_item_pw_attempts,
+                            _short(url, 220),
+                            _short(source_page, 220),
+                        )
                     logger.debug(
                         "[Download][Worker %s] HTTP direct attempt did not produce a file; trying Playwright fallback | reason=%s last_error=%s url=%s",
                         worker_id,
@@ -5867,6 +6313,8 @@ async def download_worker(
                                     playwright_fallback_sem.release()
                                 except Exception:
                                     pass
+                                _record_download_host_transport_success(host)
+                                await record_file_crawl_host_transport_success(host)
                                 return {
                                     'file_path': file_info['file_path'], 
                                     'url': url,
@@ -6002,9 +6450,17 @@ async def download_worker(
                         playwright_fallback_sem.release()
                     except Exception:
                         pass
+                no_file_diagnostics = _download_no_file_diagnostics(file_meta)
+                if file_meta.get("_download_access_denied_http"):
+                    recent_access_denied_urls[url] = time.monotonic() + access_denied_cache_ttl_sec
+                unresolved_reason = _download_no_file_reason(
+                    file_meta,
+                    playwright_attempts=per_item_pw_attempts,
+                )
                 logger.warning(
                     "[DownloadTrace][file_saved_not_emitted] job_id=%s worker=%s url=%s "
-                    "post_url=%s name=%s reason=%s last_error=%s http_attempts=%s playwright_attempts=%s",
+                    "post_url=%s name=%s reason=%s last_error=%s http_attempts=%s playwright_attempts=%s "
+                    "http_status=%s content_type=%s content_length=%s bytes_written=%s phase=%s",
                     file_meta.get("job_id"),
                     worker_id,
                     _short(url, 220),
@@ -6012,12 +6468,17 @@ async def download_worker(
                     _short(file_meta.get("name") or file_meta.get("subject"), 160),
                     _short(
                         file_meta.get("_download_empty_reason")
-                        or ("http_no_file" if per_item_pw_attempts <= 0 else "http_and_playwright_no_file"),
+                        or unresolved_reason,
                         180,
                     ),
                     _short(last_err_msg or file_meta.get("_download_last_error") or "-", 240),
                     per_item_http_retries,
                     per_item_pw_attempts,
+                    no_file_diagnostics["http_status"],
+                    _short(no_file_diagnostics["content_type"], 120),
+                    no_file_diagnostics["content_length"],
+                    no_file_diagnostics["bytes_written"],
+                    no_file_diagnostics["phase"],
                 )
                 # 엄격 도메인 공통 실패 시 즉시 재시도 루프를 막기 위한 쿨다운.
                 if host and any(host == h or host.endswith("." + h) for h in strict_hosts) and cooldown_max_sec > 0:
@@ -6054,7 +6515,7 @@ async def download_worker(
                     empty_reason = (
                         file_meta.get("_download_empty_reason")
                         or (f"last_error:{_short(last_err_msg, 160)}" if last_err_msg else "")
-                        or ("http_no_file" if per_item_pw_attempts <= 0 else "http_and_playwright_no_file")
+                        or unresolved_reason
                     )
                     file_meta["_download_empty_reason"] = empty_reason
                     skip_reason = "websync_failed" if str(empty_reason or "").startswith("websync_failed") else "download_failed"
@@ -6070,6 +6531,8 @@ async def download_worker(
                         "worker_id": worker_id,
                         "job_id": file_meta.get("job_id"),
                     }
+                    if bool(file_meta.get("file_crawl_stage_lab")):
+                        skip_payload["lab_download_diagnostics"] = _stage_lab_download_diagnostics(file_meta)
                     if skip_reason == "websync_failed":
                         skip_payload.update(
                             {
@@ -6095,9 +6558,9 @@ async def download_worker(
 
                 return None
             finally:
-                if domain_lock_acquired and domain_sem is not None:
+                if domain_lock_acquired and host:
                     try:
-                        domain_sem.release()
+                        await release_file_crawl_host_slot(host)
                     except Exception:
                         pass
                 progress_queue.put_nowait({'type': 'in_flight', 'stage': 'download', 'delta': -1})
@@ -6215,6 +6678,29 @@ async def download_worker(
                     except Exception:
                         pass
 
+                    if item_taken_callback is not None:
+                        for _item in batch_items or []:
+                            _item_data = _item if isinstance(_item, dict) else {}
+                            try:
+                                await item_taken_callback(
+                                    {
+                                        "job_id": _item_data.get("job_id"),
+                                        "url": _item_data.get("url") or _item_data.get("_raw_url"),
+                                        "name": _item_data.get("name") or _item_data.get("subject"),
+                                        "source_page": _item_data.get("source_page"),
+                                        "worker_id": worker_id,
+                                        "lane": worker_lane,
+                                        "queue_source": queue_source,
+                                    }
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[DownloadTrace][item_taken_callback_failed] worker=%s lane=%s",
+                                    worker_id,
+                                    worker_lane,
+                                    exc_info=True,
+                                )
+
                     async def _download_item_with_activity(item: Any) -> Any:
                         item_meta = item if isinstance(item, dict) else {}
                         activity_token = _register_download_activity(worker_id, item, worker_lane)
@@ -6226,6 +6712,11 @@ async def download_worker(
                             str(item_meta.get("url") or item_meta.get("_raw_url") or "")
                         )
                         item_meta["_download_timeout_profile"] = timeout_profile
+                        item_meta["_download_worker_lane"] = worker_lane
+                        total_timeout_sec = _download_absolute_item_timeout_sec(
+                            item_meta,
+                            profile=timeout_profile,
+                        )
                         logger.info(
                             "[DownloadTrace][item_enter] job_id=%s worker=%s lane=%s absolute_timeout_sec=%.1f "
                             "connect_timeout_sec=%.3f header_timeout_sec=%.3f stream_stall_timeout_sec=%.3f "
@@ -6233,7 +6724,7 @@ async def download_worker(
                             item_meta.get("job_id"),
                             worker_id,
                             worker_lane,
-                            _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC,
+                            total_timeout_sec,
                             timeout_profile["connect_timeout_sec"],
                             timeout_profile["header_timeout_sec"],
                             timeout_profile["stream_stall_timeout_sec"],
@@ -6262,6 +6753,25 @@ async def download_worker(
                                 item_meta["_url_trace_path"] = result.get("file_path") or result.get("local_path")
                             else:
                                 item_meta["_url_trace_outcome"] = "skipped"
+                            if (
+                                result
+                                and result.get("deferred_to_domain_queue")
+                                and bool(item_meta.get("file_crawl_stage_lab"))
+                            ):
+                                await progress_queue.put(
+                                    {
+                                        "type": "download_deferred",
+                                        "url": item_meta.get("url") or item_meta.get("_raw_url"),
+                                        "source_page": item_meta.get("source_page") or item_meta.get("source_url"),
+                                        "name": item_meta.get("name") or item_meta.get("subject"),
+                                        "reason": "host_slot_unavailable",
+                                        "worker_id": worker_id,
+                                        "lane": worker_lane,
+                                        "domain_host": result.get("domain_host"),
+                                        "domain_limit": result.get("domain_limit"),
+                                        "defer_attempt": result.get("domain_defer_attempt"),
+                                    }
+                                )
                             return result
                         except (asyncio.TimeoutError, _DownloadDynamicTimeout) as timeout_exc:
                             if download_task is not None and not download_task.done():
@@ -6285,7 +6795,11 @@ async def download_worker(
                                 or "unknown"
                             )
                             timeout_budget_sec = float(
-                                timeout_detail.get("budget_sec") or _DOWNLOAD_ABSOLUTE_ITEM_TIMEOUT_SEC
+                                timeout_detail.get("budget_sec")
+                                or _download_absolute_item_timeout_sec(
+                                    item_meta,
+                                    profile=timeout_profile,
+                                )
                             )
                             if isinstance(item, dict):
                                 item["_download_empty_reason"] = reason
@@ -6334,6 +6848,16 @@ async def download_worker(
                                     "name": item_meta.get("name") or item_meta.get("subject"),
                                     "worker_id": worker_id,
                                     "job_id": item_meta.get("job_id"),
+                                    **(
+                                        {
+                                            "lab_download_diagnostics": _stage_lab_download_diagnostics(
+                                                item_meta,
+                                                timeout_detail=timeout_detail,
+                                            )
+                                        }
+                                        if bool(item_meta.get("file_crawl_stage_lab"))
+                                        else {}
+                                    ),
                                 }
                             )
                             return None
@@ -6447,7 +6971,9 @@ async def download_worker(
                                     terminal_level = logging.ERROR
                                 elif result and result.get("deferred_to_large_lane"):
                                     terminal_outcome = "deferred"
-                                    terminal_reason = "response_content_length_large"
+                                    terminal_reason = str(
+                                        result.get("defer_reason") or "response_content_length_large"
+                                    )
                                     terminal_level = logging.INFO
                                 elif result and result.get("deferred_to_domain_queue"):
                                     terminal_outcome = "domain_deferred"
@@ -6618,6 +7144,16 @@ async def download_worker(
                         unfinished_after_done,
                     )
                 except asyncio.CancelledError:
+                    if batch_taken and recover_taken_batch_on_cancel:
+                        recovered = await _recover_taken_download_batch(
+                            active_in_queue,
+                            batch_items,
+                            worker_id=worker_id,
+                            worker_lane=worker_lane,
+                            reason="worker_cancelled",
+                        )
+                        if recovered:
+                            batch_taken = False
                     cancelled = True
                     break
                 except Exception as e:

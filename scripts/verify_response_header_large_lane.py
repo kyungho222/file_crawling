@@ -10,8 +10,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.crawler.workers.download import (
-    _download_item_hard_timeout_sec,
     _download_http_request_timeout,
+    _should_promote_streamed_file_to_large_lane,
     _should_defer_response_to_large_lane,
 )
 
@@ -38,9 +38,29 @@ def main() -> None:
         large_queue_available=True,
     )
 
-    declared = {"declared_file_size_bytes": header_size}
-    assert _download_item_hard_timeout_sec(declared) > 90.0
-    timeout = _download_http_request_timeout(declared, 30.0)
+    # Chunked or incorrect content-length responses start in the normal lane.
+    # Once their received bytes cross the threshold, restart them in the
+    # isolated large lane exactly once.
+    assert _should_promote_streamed_file_to_large_lane(
+        meta,
+        header_size,
+        worker_lane="normal",
+        large_queue_available=True,
+    )
+    assert not _should_promote_streamed_file_to_large_lane(
+        {**meta, "_large_lane_requeued": True},
+        header_size,
+        worker_lane="normal",
+        large_queue_available=True,
+    )
+    assert not _should_promote_streamed_file_to_large_lane(
+        meta,
+        header_size,
+        worker_lane="large",
+        large_queue_available=True,
+    )
+
+    timeout = _download_http_request_timeout({}, 30.0)
     assert getattr(timeout, "total", None) is None
     assert getattr(timeout, "sock_read", 0) > 0
     print("OK: response-header deferral and declared-size timeouts")

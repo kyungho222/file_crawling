@@ -22,7 +22,7 @@
   <main>
     <header>
       <div><h1>파일 크롤링 대시보드</h1><p class="muted">실제 파일 큐, 다운로드, 저장, 학습 요청 및 콜백 상태</p></div>
-      <div class="toolbar"><span id="updated" class="muted"></span><button id="refresh" class="subtle">새로고침</button></div>
+      <div class="toolbar"><span id="updated" class="muted"></span><button id="sync-log" class="subtle">DB 동기화</button><button id="refresh" class="subtle">새로고침</button></div>
     </header>
     <div class="top-grid">
       <section class="panel controls">
@@ -76,12 +76,13 @@
       field('stop')?.addEventListener('click', stopSelected);
     }
     async function stopSelected() { if (!selectedJobId || !confirm('이 작업의 신규 큐 적재와 진행 중 다운로드를 중단 요청할까요?')) return; try { await post(`/jobs/${encodeURIComponent(selectedJobId)}/stop`); await refresh(); } catch (error) { alert(`중단 요청 실패: ${error.message}`); } }
+    async function syncSelectedLog() { if (!selectedJobId) return; try { await post(`/jobs/${encodeURIComponent(selectedJobId)}/sync-crawl-log`, {}); await refresh(); } catch (error) { alert(`DB 동기화 실패: ${error.message}`); } }
     function setMode(mode) { selectedMode = mode; document.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('selected', button.dataset.mode === mode)); }
     async function start() { const dbName = field('db-name').value.trim(), chatBotId = field('chatbot-id').value.trim(), urls = field('start-urls').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean); if (!dbName || !chatBotId || !urls.length) { field('run-message').textContent = 'DB 이름, Chatbot ID, URL을 입력하세요.'; return; }
       const mode = selectedMode; const payload = {job_id:crypto.randomUUID(), db_name:dbName, chat_bot_id:chatBotId, colle:'file', content_type:'file', contents:urls, contents_url:urls[0], dashboard_run_mode:mode, enable_db_save:mode !== 'discover', enable_learning:mode === 'full', file_pipeline_skip_learning:mode !== 'full'};
       field('start').disabled = true; field('run-message').textContent = '시작 요청 중'; try { const result = await post('/start', payload); selectedJobId = result.job_id || payload.job_id; field('filter-db').value = dbName; field('filter-chatbot').value = chatBotId; field('run-message').textContent = `작업 시작됨: ${selectedJobId}`; await refresh(); } catch (error) { field('run-message').textContent = `시작 실패: ${error.message}`; } finally { field('start').disabled = false; } }
     async function refresh() { try { const jobs = await get(`/jobs?${query().toString()}`); renderJobs(jobs); if (selectedJobId) renderDetail(await get(`/jobs/${encodeURIComponent(selectedJobId)}`)); field('updated').textContent = new Date().toLocaleTimeString('ko-KR'); } catch (error) { field('detail').innerHTML = `<div class="error">상태 조회 실패: ${esc(error.message)}</div>`; } }
-    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode))); field('start').addEventListener('click', start); field('refresh').addEventListener('click', refresh); field('filter-db').addEventListener('change', refresh); field('filter-chatbot').addEventListener('change', refresh); refresh(); poller = setInterval(refresh, 3000); window.addEventListener('beforeunload', () => clearInterval(poller));
+    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode))); field('start').addEventListener('click', start); field('sync-log').addEventListener('click', syncSelectedLog); field('refresh').addEventListener('click', refresh); field('filter-db').addEventListener('change', refresh); field('filter-chatbot').addEventListener('change', refresh); refresh(); poller = setInterval(refresh, 3000); window.addEventListener('beforeunload', () => clearInterval(poller));
   </script>
 </body>
 </html>

@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.simhash_matcher.public_simhash import (
+    _clean,
     format_simhash,
     make_simhash,
     make_simhash_from_text,
@@ -31,6 +32,7 @@ from utils.db_name import resolve_db_name
 logger = logging.getLogger("backend.simhash_matcher.router")
 
 router = APIRouter(prefix="/backend/public-simhash", tags=["public-simhash"])
+file_simhash_router = APIRouter(prefix="/simhash", tags=["file-simhash"])
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -68,6 +70,19 @@ class SimhashUrlRequest(BaseModel):
     url: str = Field(min_length=1, max_length=4_096)
 
 
+class FileSimhashGenerateRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=256)
+    job_id: str = Field(min_length=1, max_length=256)
+    id: int = Field(gt=0)
+    db_name: str = Field(min_length=1, max_length=64)
+    chat_bot_id: str = Field(min_length=1, max_length=128)
+    content_type: str = Field(default="file", max_length=32)
+    file_url: str = Field(default="", max_length=4_096)
+    source_url: str = Field(default="", max_length=4_096)
+    title: str = Field(default="", max_length=100_000)
+    content: str = Field(default="")
+
+
 def _hash_from_payload(payload: SimhashTextRequest) -> int:
     text = str(payload.text or "").strip()
     if text:
@@ -84,6 +99,50 @@ def _hash_from_payload(payload: SimhashTextRequest) -> int:
     if value is None:
         raise HTTPException(status_code=422, detail="unable to create simhash from empty text")
     return value
+
+
+@file_simhash_router.post("/generate")
+async def generate_file_simhash(payload: FileSimhashGenerateRequest) -> dict[str, Any]:
+    """Generate only the agreed decimal file SimHash; never read a database."""
+    if str(payload.content_type or "").strip().lower() != "file":
+        return {
+            "schema": "simhash.generate.v1",
+            "ok": False,
+            "status": "failed",
+            "request_id": payload.request_id,
+            "hash": None,
+            "normalized_length": 0,
+        }
+    content = str(payload.content or "").strip()
+    title = str(payload.title or "").strip()
+    normalized_length = len(_clean(content))
+    if not content or not title:
+        return {
+            "schema": "simhash.generate.v1",
+            "ok": False,
+            "status": "failed",
+            "request_id": payload.request_id,
+            "hash": None,
+            "normalized_length": normalized_length,
+        }
+    value = make_simhash(title, content)
+    if value is None:
+        return {
+            "schema": "simhash.generate.v1",
+            "ok": False,
+            "status": "failed",
+            "request_id": payload.request_id,
+            "hash": None,
+            "normalized_length": normalized_length,
+        }
+    return {
+        "schema": "simhash.generate.v1",
+        "ok": True,
+        "status": "completed",
+        "request_id": payload.request_id,
+        "hash": str(value),
+        "normalized_length": normalized_length,
+    }
 
 
 async def _validate_public_http_url(raw_url: str) -> str:
