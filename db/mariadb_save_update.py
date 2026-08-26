@@ -2438,7 +2438,7 @@ async def _fallback_original_board_category_mapping(
         fallback_c2 if _looks_like_category_code(fallback_c2) else "",
     )
 
-async def _ensure_file_learning_category_mapping(
+async def _ensure_file_learning_category_mapping_uncached(
     *,
     chat_bot_id: str,
     db_name: str,
@@ -2619,6 +2619,65 @@ async def _ensure_file_learning_category_mapping(
         mapped_cate2=mapped,
     )
     return (target_cate1_code, mapped)
+
+
+async def resolve_file_category_mapping_with_job_cache(
+    *,
+    cache_key: Tuple[str, ...],
+    resolver: Any,
+) -> Tuple[str, str]:
+    """Coalesce equal file category mappings inside one crawl job."""
+    job_cache = _current_crawl_db_cache()
+    if job_cache is None:
+        return await resolver()
+    mapping_cache = job_cache.setdefault("file_category_mappings", {})
+    cached = mapping_cache.get(cache_key)
+    if cached is not None:
+        return tuple(cached)
+    locks = job_cache.setdefault("file_category_mapping_locks", {})
+    lock = locks.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[cache_key] = lock
+    async with lock:
+        cached = mapping_cache.get(cache_key)
+        if cached is not None:
+            return tuple(cached)
+        resolved = await resolver()
+        mapping_cache[cache_key] = tuple(resolved or ("", ""))
+        return tuple(mapping_cache[cache_key])
+
+
+async def _ensure_file_learning_category_mapping(
+    *,
+    chat_bot_id: str,
+    db_name: str,
+    source_cate1: str,
+    source_cate2: str,
+    access_url: Optional[str] = None,
+    request_cookies: Optional[Dict[str, str]] = None,
+    create_missing: bool = False,
+) -> Tuple[str, str]:
+    category_table = get_category_table_name(chat_bot_id)
+    cache_key = (
+        str(db_name or "").strip(),
+        str(category_table or "").strip(),
+        str(source_cate1 or "").strip(),
+        str(source_cate2 or "").strip(),
+        str(bool(create_missing)),
+    )
+    return await resolve_file_category_mapping_with_job_cache(
+        cache_key=cache_key,
+        resolver=lambda: _ensure_file_learning_category_mapping_uncached(
+            chat_bot_id=chat_bot_id,
+            db_name=db_name,
+            source_cate1=source_cate1,
+            source_cate2=source_cate2,
+            access_url=access_url,
+            request_cookies=request_cookies,
+            create_missing=create_missing,
+        ),
+    )
 
 
 async def _resolve_category_names_for_file_meta(
@@ -3780,6 +3839,7 @@ async def insert_into_learn_list(
     file_info: dict,
     *,
     existing_row_id: Optional[int] = None,
+    diagnostic_callback: Any = None,
 ) -> Optional[int]:
     """???占쏙옙 ?類ｋ궖??DB????占쎌뿯??占쏙옙???占쎄쉐??ID??獄쏆꼹??(URL ?類ㅻ뻼 ??占쎌젟占?."""
     if not chat_bot_id or not db_name or not file_info.get('url'): return None
@@ -3809,11 +3869,22 @@ async def insert_into_learn_list(
         )
         # debug checkpoints
         cp_times = {"t0": started}
+
+        def _record_diagnostic(stage: str, stage_started: float) -> None:
+            if not callable(diagnostic_callback):
+                return
+            try:
+                diagnostic_callback(stage, max(0.0, time.perf_counter() - stage_started))
+            except Exception:
+                pass
+
         mapped_c1, mapped_c2 = "", ""
+        config_started = time.perf_counter()
         try:
             file_sub_cate_mode = await get_sub_cate_mode_from_config(chat_bot_id, dbname=db_name)
         except Exception:
             file_sub_cate_mode = "emp"
+        _record_diagnostic("config_lookup", config_started)
         try:
             file_info["_sub_cate_mode"] = file_sub_cate_mode
         except Exception:
@@ -3822,6 +3893,7 @@ async def insert_into_learn_list(
             ref_c1, ref_c2 = coalesce_learn_list_cates(file_info)
         except Exception:
             ref_c1, ref_c2 = ("", "")
+        category_mapping_started = time.perf_counter()
         try:
             if ref_c1 or ref_c2:
                 try:
@@ -3898,12 +3970,15 @@ async def insert_into_learn_list(
                 ref_c2,
                 exc,
             )
+        _record_diagnostic("category_mapping", category_mapping_started)
         file_info["cate1"], file_info["cate2"] = sanitize_file_learning_category_codes(
             mapped_c1,
             mapped_c2,
         )
         # 1. ???占쏙옙???類ｋ궖 占???占쏙옙???類ｋ궖
+        account_lookup_started = time.perf_counter()
         account_id = await get_account_identifier_from_chatbot_setup(chat_bot_id, db_name)
+        _record_diagnostic("account_lookup", account_lookup_started)
         cp_times["t1"] = time.perf_counter()
         table_name = get_learn_list_table_name(account_id)
         try:
@@ -3919,11 +3994,16 @@ async def insert_into_learn_list(
         )
         cp_times["t2"] = time.perf_counter()
         url = file_info.get('url')
+        backpressure_started = time.perf_counter()
         await _maybe_apply_file_insert_backpressure(url)
+        _record_diagnostic("backpressure_wait", backpressure_started)
         canon_url = canonicalize_attachment_url_for_learn_list(url) or canonicalize_url_for_dedup(url)
         cp_times["t3"] = time.perf_counter()
 
-        if not await _learn_list_table_exists(db_name, table_name):
+        table_lookup_started = time.perf_counter()
+        table_exists = await _learn_list_table_exists(db_name, table_name)
+        _record_diagnostic("table_lookup", table_lookup_started)
+        if not table_exists:
             logger.warning(
                 "[LearnList] insert skipped: LEARN_LIST table not found "
                 "(chat_bot_id mismatch or unprovisioned table) | db=%s table=%s chat_bot_id=%s job_id=%s url=%s",
@@ -3938,6 +4018,7 @@ async def insert_into_learn_list(
         cp_before_cols = time.perf_counter()
         cols = await ensure_learn_list_standard_columns(db_name, table_name)
         cp_after_cols = time.perf_counter()
+        _record_diagnostic("schema_lookup", cp_before_cols)
         _log_file_learn_list_cate_debug(
             stage="table_columns_loaded",
             db_name=db_name,
@@ -4241,18 +4322,21 @@ async def insert_into_learn_list(
                         + (parsed_existing_row_id,),
                         dbname=db_name,
                     )
+                    _record_diagnostic("write_query", update_started)
                     # MySQL reports rowcount=0 both when the row is missing
                     # and when every value was already identical.  Confirm the
                     # row still exists before returning its id to the caller;
                     # otherwise the crawler could increment its save counter
                     # for a stale cached id that was never persisted.
                     if int(update_rowcount or 0) <= 0:
+                        duplicate_lookup_started = time.perf_counter()
                         existing_rows = await mysql_execute_query(
                             f"SELECT `id` FROM `{table_name}` WHERE `id` = %s LIMIT 1",
                             (parsed_existing_row_id,),
                             fetch=True,
                             dbname=db_name,
                         )
+                        _record_diagnostic("duplicate_lookup", duplicate_lookup_started)
                         if not existing_rows:
                             logger.warning(
                                 "[FilePersist][existing_row_missing_after_update] job_id=%s db=%s table=%s row_id=%s file_url=%s",
@@ -4280,7 +4364,9 @@ async def insert_into_learn_list(
         content_dup_key_ok = False
         use_content_unique_upsert = bool(canon_url and cols and "content" in cols and data.get("content"))
         if use_content_unique_upsert:
+            unique_index_started = time.perf_counter()
             content_dup_key_ok = await _ensure_learn_list_content_unique_index(db_name, table_name)
+            _record_diagnostic("unique_index_check", unique_index_started)
             cp_after_unique = time.perf_counter()
             if content_dup_key_ok:
                 # File crawl hot path: do not pre-read existing LEARN_LIST rows.
@@ -4312,6 +4398,7 @@ async def insert_into_learn_list(
                             dbname=db_name,
                         )
                         t_after_upsert = time.perf_counter()
+                        _record_diagnostic("write_query", t_before_upsert)
                         was_dup = rc >= 2
                         try:
                             file_info["learn_list_duplicate"] = bool(was_dup)
@@ -4515,7 +4602,9 @@ async def insert_into_learn_list(
                     _debug_insert_value(data.get("content")),
                     _debug_insert_value(data.get("subject")),
                 )
+                write_started = time.perf_counter()
                 new_id = await _safe_maria_insert_data(table_name, data, db_name, warning_context={"source_url": source_url, "detail_url": source_url, "file_url": url, "job_id": file_info.get("job_id")})
+                _record_diagnostic("write_query", write_started)
                 try:
                     remember_learn_list_url_row(
                         db_name=db_name,
@@ -4565,12 +4654,14 @@ async def insert_into_learn_list(
                             if parsed_col in cols:
                                 sel_parts.append(f"`{parsed_col}`")
                     sel_sql = ", ".join(sel_parts)
+                    duplicate_lookup_started = time.perf_counter()
                     rows = await mysql_execute_query(
                         f"SELECT {sel_sql} FROM `{table_name}` WHERE `{lookup_col or 'content'}` = %s LIMIT 1",
                         (lookup_value or data.get("content"),),
                         fetch=True,
                         dbname=db_name,
                     )
+                    _record_diagnostic("duplicate_lookup", duplicate_lookup_started)
                     learn_list_insert_debug_log(
                         "file_duplicate_reselect result db=%s table=%s lookup_col=%s rows=%s lookup_value=%s",
                         db_name,

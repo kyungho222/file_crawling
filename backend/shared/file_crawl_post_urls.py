@@ -154,6 +154,12 @@ def build_file_crawl_start_url_summary(
 
 def _log_file_crawl_start_url_summary(summary: Dict[str, Any]) -> None:
     job_id = str(summary.get("job_id") or "").strip()
+    try:
+        from backend.shared.file_crawl_db_diagnostics import record_file_crawl_start_url_summary
+
+        record_file_crawl_start_url_summary(summary)
+    except Exception:
+        pass
     if not job_id:
         return
     logger.info(

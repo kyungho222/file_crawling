@@ -18,6 +18,7 @@ from core.crawler.browser_launch import (
     get_default_navigation_timeout_ms,
     get_default_timeout_ms,
 )
+from core.crawler.download_browser_pool import DownloadBrowserPool
 from core.crawler.queues import JobQueues
 from core.crawler.file_download_topology import file_crawl_download_topology
 from core.crawler.workers.scan import scan_worker
@@ -82,6 +83,7 @@ class WorkerManager:
         self._download_runtime_config: Dict[str, Any] = {}
         self._elastic_download_tasks: set[asyncio.Task] = set()
         self._elastic_download_sequence = 0
+        self._download_browser_pool: Optional[DownloadBrowserPool] = None
 
     async def start(self):
         """워커 풀 시작 및 Playwright 초기화"""
@@ -269,13 +271,15 @@ class WorkerManager:
         topology = file_crawl_download_topology()
         total_workers = topology["total_workers"]
         normal_workers = topology["normal_workers"]
+        playwright_workers = topology["playwright_workers"]
         large_workers = topology["large_workers"]
         max_concurrent = topology["max_concurrent"]
 
         logger.info(
-            "[WorkerManager][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
+            "[WorkerManager][download_lanes] total=%s normal=%s playwright=%s large=%s max_concurrent=%s",
             total_workers,
             normal_workers,
+            playwright_workers,
             large_workers,
             max_concurrent,
         )
@@ -284,6 +288,7 @@ class WorkerManager:
         self._download_runtime_config = {
             "max_concurrent": max_concurrent,
             "normal_workers": normal_workers,
+            "playwright_workers": playwright_workers,
             "large_workers": large_workers,
         }
         for i in range(normal_workers):
@@ -298,10 +303,13 @@ class WorkerManager:
                     browser=self.browser,
                     browser_getter=self.acquire_browser,
                     browser_releaser=self.release_browser,
+                    download_browser_getter=self.acquire_download_browser,
+                    download_browser_releaser=self.release_download_browser,
                     browser_relauncher=self._relaunch_browser,
                     worker_id=i + 1,
                     worker_lane=worker_lane,
                     large_download_queue=None,
+                    playwright_fallback_queue=self.job_queues.large_collection_batch_queue,
                     shared_download_semaphore=shared_download_semaphore,
                 )
             )
@@ -309,9 +317,9 @@ class WorkerManager:
             self.tasks.append(t)
             self._log_download_task_lifecycle(t, worker_id=i + 1, lane=worker_lane)
 
-        if large_workers:
-            large_download_semaphore = asyncio.Semaphore(large_workers)
-            for i in range(large_workers):
+        if playwright_workers:
+            playwright_download_semaphore = asyncio.Semaphore(playwright_workers)
+            for i in range(playwright_workers):
                 t = asyncio.create_task(
                     download_worker(
                         self.job_queues.large_collection_batch_queue,
@@ -321,11 +329,13 @@ class WorkerManager:
                         browser=self.browser,
                         browser_getter=self.acquire_browser,
                         browser_releaser=self.release_browser,
+                        download_browser_getter=self.acquire_download_browser,
+                        download_browser_releaser=self.release_download_browser,
                         browser_relauncher=self._relaunch_browser,
                         worker_id=normal_workers + i + 1,
-                        worker_lane="large",
-                        fallback_in_queue=self.job_queues.collection_batch_queue,
-                        shared_download_semaphore=large_download_semaphore,
+                        worker_lane="playwright",
+                        direct_http_enabled=False,
+                        shared_download_semaphore=playwright_download_semaphore,
                     )
                 )
                 self.download_tasks.append(t)
@@ -333,7 +343,7 @@ class WorkerManager:
                 self._log_download_task_lifecycle(
                     t,
                     worker_id=normal_workers + i + 1,
-                    lane="large",
+                    lane="playwright",
                 )
 
     async def ensure_elastic_normal_download_worker(
@@ -343,7 +353,7 @@ class WorkerManager:
         max_elastic_workers: int = 2,
         lifetime_sec: float = 600.0,
     ) -> bool:
-        """Keep the fixed three-worker download topology intact."""
+        """Keep the fixed HTTP/PW download topology intact."""
         max_elastic_workers = 0
         runtime = dict(getattr(self, "_download_runtime_config", {}) or {})
         normal_workers = int(runtime.get("normal_workers") or 0)
@@ -370,6 +380,7 @@ class WorkerManager:
         self._elastic_download_sequence += 1
         worker_id = (
             normal_workers
+            + int(runtime.get("playwright_workers") or 0)
             + int(runtime.get("large_workers") or 0)
             + self._elastic_download_sequence
         )
@@ -391,14 +402,12 @@ class WorkerManager:
                         browser=self.browser,
                         browser_getter=self.acquire_browser,
                         browser_releaser=self.release_browser,
+                        download_browser_getter=self.acquire_download_browser,
+                        download_browser_releaser=self.release_download_browser,
                         browser_relauncher=self._relaunch_browser,
                         worker_id=worker_id,
                         worker_lane="normal",
-                        large_download_queue=(
-                            self.job_queues.large_collection_batch_queue
-                            if int(runtime.get("large_workers") or 0) > 0
-                            else None
-                        ),
+                        playwright_fallback_queue=self.job_queues.large_collection_batch_queue,
                         shared_download_semaphore=semaphore,
                         recover_taken_batch_on_cancel=True,
                     ),
@@ -527,6 +536,35 @@ class WorkerManager:
             headless=settings.HEADLESS, 
             args=launch_args
         )
+
+    async def _launch_download_browser(self) -> Browser:
+        """Launch a browser owned by the download fallback pool only."""
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+        launch_args = filter_launch_args(get_default_launch_args())
+        for arg in ("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"):
+            if arg not in launch_args:
+                launch_args.append(arg)
+        return await self.playwright.chromium.launch(headless=settings.HEADLESS, args=launch_args)
+
+    async def acquire_download_browser(self) -> Optional[Browser]:
+        if self._download_browser_pool is None:
+            self._download_browser_pool = DownloadBrowserPool(
+                self._launch_download_browser,
+                label=f"local:{self.db_name or '-'}",
+            )
+        return await self._download_browser_pool.acquire()
+
+    async def release_download_browser(self, browser: Optional[Browser]) -> None:
+        if self._download_browser_pool is not None:
+            await self._download_browser_pool.release(browser)
+
+    async def _close_download_browser_pool(self) -> None:
+        if self._download_browser_pool is None:
+            return
+        pool = self._download_browser_pool
+        self._download_browser_pool = None
+        await pool.close()
 
     def get_browser(self) -> Optional[Browser]:
         return self.browser
@@ -778,6 +816,9 @@ class WorkerManager:
         # Wait for selected tasks to finish
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        if stop_download:
+            await self._close_download_browser_pool()
 
         # Close Playwright / resources (optional for partial stop)
         if reset_deduplicator and self.collection_deduplicator:

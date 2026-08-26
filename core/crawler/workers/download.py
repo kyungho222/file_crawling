@@ -26,6 +26,7 @@ import time
 import socket
 import random
 import threading
+import inspect
 from datetime import datetime, timezone
 
 from html import unescape
@@ -58,6 +59,8 @@ from core.crawler.file_host_request_gate import (
     record_file_crawl_host_transport_success,
     release_file_crawl_host_slot,
 )
+from core.crawler.http_header_deadline import await_http_response_headers
+from core.crawler.download_recovery_policy import download_failed_retry_delay_sec
 from core.crawler.workers.download_storage import (
     download_final_ready_timeout_sec as _download_final_ready_timeout_sec,
     download_temp_ready_timeout_sec as _download_temp_ready_timeout_sec,
@@ -69,6 +72,7 @@ from backend.board.anseong_file import (
     resolve_anseong_yhlib_download_url,
 )
 from backend.shared.file_name_debug import emit_file_name_debug
+from backend.file.site_config import load_file_site_config
 from backend.shared.playwright_optimizations import (
     apply_stealth_if_needed,
     configure_context_for_crawl,
@@ -354,6 +358,26 @@ def _set_download_activity_phase(file_meta: Any, phase: str) -> None:
         _ACTIVE_DOWNLOAD_ITEMS[token]["phase_started_at"] = now
 
 
+def _set_download_activity_transport(
+    file_meta: Any,
+    transport: str,
+    *,
+    playwright_attempt: int = 0,
+) -> None:
+    """Expose direct HTTP versus PW fallback in live worker occupancy."""
+    if not isinstance(file_meta, dict):
+        return
+    file_meta["_download_activity_transport"] = str(transport or "unknown")
+    if playwright_attempt > 0:
+        file_meta["_download_activity_playwright_attempt"] = int(playwright_attempt)
+    token = str(file_meta.get("_download_activity_token") or "")
+    if token and token in _ACTIVE_DOWNLOAD_ITEMS:
+        _ACTIVE_DOWNLOAD_ITEMS[token]["transport"] = file_meta["_download_activity_transport"]
+        _ACTIVE_DOWNLOAD_ITEMS[token]["playwright_attempt"] = int(
+            file_meta.get("_download_activity_playwright_attempt") or 0
+        )
+
+
 def get_download_worker_activity_snapshot(*, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
     expected_job_id = str(job_id or "").strip()
     now = time.monotonic()
@@ -372,6 +396,8 @@ def get_download_worker_activity_snapshot(*, job_id: Optional[str] = None) -> Li
                 "name": state.get("name"),
                 "phase": state.get("phase") or "unknown",
                 "phase_elapsed_sec": round(max(0.0, now - float(state.get("phase_started_at") or state.get("started_at") or now)), 1),
+                "transport": state.get("transport") or "http",
+                "playwright_attempt": int(state.get("playwright_attempt") or 0),
             }
         )
     return sorted(active, key=lambda item: float(item.get("elapsed_sec") or 0.0), reverse=True)
@@ -1035,12 +1061,12 @@ def _requires_source_page_http_session(url: str, source_page: str) -> bool:
         source_host = (urlparse(str(source_page or "")).hostname or "").lower()
     except Exception:
         return False
+    if _is_eminwon_filedown_url(url):
+        return _same_eminwon_site(file_host, source_host)
     if file_host != source_host:
         return False
     if file_host == "www.k-cohesion.go.kr":
         return file_path.startswith("/afile/fileopen/") or file_path.startswith("/afile/filedownload/")
-    if file_host == "pyeongtaek.go.kr":
-        return file_path == "/emwp/jsp/ofr/filedownnew.jsp"
     return False
 
 
@@ -1134,14 +1160,26 @@ def _repair_suwon_component_file_download_url(u: str) -> tuple[str, bool]:
 
 
 def _is_eminwon_filedown_url(u: str) -> bool:
-    """Seoul e-minwon file download JSP; request GET is often enough after source-page cookies exist."""
+    """e-minwon FileDownNew route; it needs the detail-page browser/session context."""
     try:
-        lu = (u or "").lower()
+        parsed = urlparse(str(u or ""))
+        path = (parsed.path or "").lower()
     except Exception:
         return False
-    if "eminwon.seoul.kr" not in lu:
+    return path.endswith("/emwp/jsp/ofr/filedownnew.jsp")
+
+
+def _same_eminwon_site(file_host: str, source_host: str) -> bool:
+    """Allow e-minwon subdomains to share their parent public-site session."""
+    file_labels = [label for label in str(file_host or "").lower().split(".") if label]
+    source_labels = [label for label in str(source_host or "").lower().split(".") if label]
+    if not file_labels or not source_labels:
         return False
-    return "filedownnew.jsp" in lu or "/emwp/jsp/" in lu
+    if file_labels == source_labels:
+        return True
+    if len(file_labels) < 3 or len(source_labels) < 3:
+        return False
+    return file_labels[-3:] == source_labels[-3:]
 
 
 def _is_identity_kisa_url(u: str) -> bool:
@@ -1383,6 +1421,59 @@ def _resolve_source_page_from_file_meta(file_meta: Optional[Dict[str, Any]]) -> 
         if text and text.lower().startswith(("http://", "https://")):
             return text
     return ""
+
+
+def _download_site_policy(url: str, source_page: str = "") -> Dict[str, Any]:
+    """Read optional, domain-scoped transport requirements for protected files."""
+    config = load_file_site_config(url)
+    raw = config.get("download") if isinstance(config, dict) else None
+    # Attachment CDNs often differ from the board hostname.  When the file URL
+    # has no transport contract, inherit the detail-page domain policy.
+    if not isinstance(raw, dict) and source_page:
+        config = load_file_site_config(source_page)
+        raw = config.get("download") if isinstance(config, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    policy: Dict[str, Any] = {}
+    for key in (
+        "force_https",
+        "prewarm_source_page",
+        "playwright_fallback",
+        "download_browser_pool",
+    ):
+        if isinstance(raw.get(key), bool):
+            policy[key] = raw[key]
+    if isinstance(raw.get("include_origin"), bool):
+        policy["include_origin"] = raw["include_origin"]
+    try:
+        retries = int(raw.get("http_retries") or 0)
+    except (TypeError, ValueError):
+        retries = 0
+    if retries > 0:
+        policy["http_retries"] = max(1, min(retries, 3))
+    try:
+        before_browser = int(raw.get("http_retries_before_playwright") or 0)
+    except (TypeError, ValueError):
+        before_browser = 0
+    if before_browser > 0:
+        policy["http_retries_before_playwright"] = max(1, min(before_browser, 3))
+    try:
+        header_deadline = float(raw.get("http_header_hard_timeout_sec") or 0.0)
+    except (TypeError, ValueError):
+        header_deadline = 0.0
+    if header_deadline > 0.0:
+        policy["http_header_hard_timeout_sec"] = max(1.0, min(header_deadline, 120.0))
+    return policy
+
+
+def _upgrade_download_url_to_https(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return str(url or "").strip()
+    if parsed.scheme.lower() != "http" or not parsed.netloc:
+        return str(url or "").strip()
+    return urlunparse(("https", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def _menu_no_from_file_context(file_meta: Optional[Dict[str, Any]], source_page: str = "") -> str:
@@ -1926,12 +2017,14 @@ def _direct_http_request_headers_for_attempt(
     url: str,
     source_page: str = "",
     attempt: int = 1,
+    include_origin: Optional[bool] = None,
 ) -> Dict[str, str]:
     """Keep protected download cookies while avoiding a cross-origin preflight hint first."""
-    include_origin = not (
-        _is_portal_direct_file_url(url)
-        and max(1, int(attempt or 1)) == 1
-    )
+    if include_origin is None:
+        include_origin = not (
+            _is_portal_direct_file_url(url)
+            and max(1, int(attempt or 1)) == 1
+        )
     req_headers = _build_request_headers(
         base_headers,
         source_page=source_page,
@@ -4433,11 +4526,15 @@ async def download_worker(
     browser_relauncher: Optional[Callable[[], Awaitable[Browser]]] = None,
     browser_getter: Optional[Callable[[], Optional[Browser]]] = None,
     browser_releaser: Optional[Callable[[Optional[Browser]], None]] = None,
+    download_browser_getter: Optional[Callable[[], Awaitable[Optional[Browser]]]] = None,
+    download_browser_releaser: Optional[Callable[[Optional[Browser]], Awaitable[None]]] = None,
     worker_id: int = 0,
     worker_lane: str = 'normal',
     large_download_queue: Optional[BatchQueue] = None,
+    playwright_fallback_queue: Optional[BatchQueue] = None,
     fallback_in_queue: Optional[BatchQueue] = None,
     shared_download_semaphore: Optional[asyncio.Semaphore] = None,
+    direct_http_enabled: bool = True,
     item_taken_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     recover_taken_batch_on_cancel: bool = False,
 ):
@@ -4449,12 +4546,13 @@ async def download_worker(
     - Reports progress through progress_queue.
     """
     logger.info(
-        "[DownloadWorker][started] worker=%s lane=%s queue_max=%s max_concurrent=%s has_large_queue=%s has_fallback_queue=%s",
+        "[DownloadWorker][started] worker=%s lane=%s queue_max=%s max_concurrent=%s has_large_queue=%s has_playwright_queue=%s has_fallback_queue=%s",
         worker_id,
         worker_lane,
         getattr(getattr(in_queue, "queue", None), "maxsize", None),
         max_concurrent,
         large_download_queue is not None,
+        playwright_fallback_queue is not None,
         fallback_in_queue is not None,
     )
     # 湲곕낯 ?ㅼ슫濡쒕뱶 ?붾젆?좊━ (fallback??
@@ -4546,6 +4644,11 @@ async def download_worker(
         retry_delay_sec = 30.0
     retry_delay_sec = max(1.0, min(retry_delay_sec, 1800.0))
     try:
+        retry_jitter_ratio = float(os.getenv("DOWNLOAD_FAILED_RETRY_JITTER_RATIO", "0.15") or "0.15")
+    except Exception:
+        retry_jitter_ratio = 0.15
+    retry_jitter_ratio = max(0.0, min(retry_jitter_ratio, 0.5))
+    try:
         retry_max_attempts = int(os.getenv("DOWNLOAD_FAILED_RETRY_MAX_ATTEMPTS", "1") or "1")
     except Exception:
         retry_max_attempts = 1
@@ -4568,7 +4671,10 @@ async def download_worker(
         text = f"{reason} {detail}".lower()
         if any(token in text for token in ("non_doc", "access", "unauthorized", "forbidden", "401", "403", "404")):
             return False
-        return True
+        return any(token in text for token in (
+            "timeout", "connection reset", "connection aborted", "server disconnected",
+            "clientoserror", "errno 104",
+        ))
 
     def _schedule_failed_retry(file_meta: Dict[str, Any], *, reason: str, detail: str = "") -> None:
         if not retry_enabled or retry_max_attempts <= 0:
@@ -4582,6 +4688,12 @@ async def download_worker(
         item["_ram_retry_attempt"] = attempt + 1
         item["_ram_retry_reason"] = reason
         item["_ram_retry_detail"] = str(detail or "")[:300]
+        delay_sec = download_failed_retry_delay_sec(
+            retry_delay_sec,
+            attempt + 1,
+            jitter_ratio=retry_jitter_ratio,
+        )
+        item["_ram_retry_delay_sec"] = delay_sec
         key = _retry_key(item)
         if not key or key in retry_seen:
             return
@@ -4592,7 +4704,7 @@ async def download_worker(
                 "[DownloadRetry] scheduled | attempt=%s/%s delay=%.1fs queue=%s url=%s reason=%s detail=%s",
                 attempt + 1,
                 retry_max_attempts,
-                retry_delay_sec,
+                delay_sec,
                 retry_queue.qsize(),
                 _short(key, 220),
                 reason,
@@ -4611,7 +4723,7 @@ async def download_worker(
             item = await retry_queue.get()
             key = _retry_key(item)
             try:
-                await asyncio.sleep(retry_delay_sec)
+                await asyncio.sleep(float(item.get("_ram_retry_delay_sec") or retry_delay_sec))
                 try:
                     if key:
                         retry_seen.discard(key)
@@ -4645,9 +4757,19 @@ async def download_worker(
             finally:
                 retry_queue.task_done()
 
-    def _acquire_playwright_browser() -> Optional[Browser]:
+    async def _acquire_playwright_browser(*, download_pool: bool = False) -> Optional[Browser]:
         nonlocal browser
         current_browser: Optional[Browser] = None
+        if download_pool and download_browser_getter:
+            try:
+                current_browser = await download_browser_getter()
+            except Exception as exc:
+                logger.warning(
+                    "[DownloadBrowserPool][acquire_failed] worker=%s err=%s",
+                    worker_id,
+                    exc,
+                )
+            return current_browser
         if browser_getter:
             try:
                 current_browser = browser_getter()
@@ -4662,11 +4784,27 @@ async def download_worker(
             return current_browser
         return browser
 
-    def _release_playwright_browser(current_browser: Optional[Browser]) -> None:
+    async def _release_playwright_browser(
+        current_browser: Optional[Browser],
+        *,
+        download_pool: bool = False,
+    ) -> None:
+        if download_pool and download_browser_releaser:
+            try:
+                await download_browser_releaser(current_browser)
+            except Exception as exc:
+                logger.debug(
+                    "[DownloadBrowserPool][release_failed] worker=%s err=%s",
+                    worker_id,
+                    exc,
+                )
+            return
         if not browser_releaser or current_browser is None:
             return
         try:
-            browser_releaser(current_browser)
+            result = browser_releaser(current_browser)
+            if inspect.isawaitable(result):
+                await result
         except Exception as exc:
             logger.debug(
                 "[Download][Worker %s] browser_releaser failed (ignored) | err=%s",
@@ -4695,6 +4833,19 @@ async def download_worker(
             url = _resolve_download_url(file_meta.get('url'), source_page)
             url, missing_portal_menu_context = _repair_portal_file_down_url_context(url, source_page, file_meta)
             url, repaired_suwon_download_url = _repair_suwon_component_file_download_url(url)
+            site_download_policy = _download_site_policy(url, source_page)
+            if site_download_policy.get("force_https"):
+                secured_url = _upgrade_download_url_to_https(url)
+                if secured_url != url:
+                    logger.info(
+                        "[Download][SitePolicy] HTTPS upgrade | worker=%s host=%s from=%s to=%s post_url=%s",
+                        worker_id,
+                        (urlparse(secured_url).hostname or "-").lower(),
+                        _short(url, 220),
+                        _short(secured_url, 220),
+                        _short(source_page, 220),
+                    )
+                    url = secured_url
             if repaired_suwon_download_url:
                 logger.warning(
                     "[Download][Worker %s] repaired malformed Suwon attachment URL | raw_url=%s repaired_url=%s post_url=%s",
@@ -4808,6 +4959,7 @@ async def download_worker(
                 recent_access_denied_urls.pop(url, None)
             per_item_pw_attempts = pw_attempts
             is_portal_direct = _is_portal_direct_file_url(url)
+            is_eminwon_filedown = _is_eminwon_filedown_url(url)
             is_portal_direct_fast = is_portal_direct and _portal_direct_fail_fast_enabled()
             per_item_http_retries = http_retries
             per_item_http_timeout = http_timeout
@@ -4854,7 +5006,10 @@ async def download_worker(
                         _short(url, 220),
                     )
             elif is_portal_direct or is_server_side_direct or is_static_direct_document:
-                per_item_pw_attempts = 0
+                # FileDownNew routes often send an HTML access page until a
+                # detail-page session is available. Keep one bounded browser
+                # retry for the shared e-minwon pattern.
+                per_item_pw_attempts = min(per_item_pw_attempts, 1) if is_eminwon_filedown else 0
                 per_item_http_retries = max(
                     1,
                     min(int(_env_float("DOWNLOAD_STATIC_DIRECT_HTTP_RETRIES", 2.0)), 3),
@@ -4864,10 +5019,11 @@ async def download_worker(
                     min(_env_float("DOWNLOAD_STATIC_DIRECT_HTTP_TIMEOUT_SEC", 30.0), 30.0),
                 )
                 logger.info(
-                    "[Download][Worker %s] direct attachment HTTP-only policy | http_timeout=%.1fs retries=%s url=%s",
+                    "[Download][Worker %s] direct attachment policy | http_timeout=%.1fs retries=%s playwright_attempts=%s url=%s",
                     worker_id,
                     per_item_http_timeout,
                     per_item_http_retries,
+                    per_item_pw_attempts,
                     _short(url, 220),
                 )
             if (
@@ -4926,6 +5082,36 @@ async def download_worker(
                     per_item_http_timeout,
                     per_item_pw_attempts,
                     _short(url, 180),
+                )
+            configured_http_retries = int(site_download_policy.get("http_retries") or 0)
+            if configured_http_retries:
+                per_item_http_retries = max(per_item_http_retries, configured_http_retries)
+            retries_before_playwright = int(
+                site_download_policy.get("http_retries_before_playwright") or 0
+            )
+            if retries_before_playwright:
+                # This is deliberately an override, unlike the legacy minimum
+                # retry setting above. Protected sites should not hold a worker
+                # through several known-slow HTTP header waits before browser use.
+                per_item_http_retries = retries_before_playwright
+            if site_download_policy.get("playwright_fallback"):
+                per_item_pw_attempts = max(per_item_pw_attempts, 1)
+            use_download_browser_pool = bool(
+                site_download_policy.get("download_browser_pool")
+                and download_browser_getter
+            )
+            if site_download_policy:
+                logger.info(
+                    "[Download][SitePolicy] applied | job_id=%s worker=%s host=%s https=%s prewarm=%s origin=%s retries=%s playwright=%s download_browser_pool=%s",
+                    file_meta.get("job_id"),
+                    worker_id,
+                    host or "-",
+                    bool(site_download_policy.get("force_https")),
+                    bool(site_download_policy.get("prewarm_source_page")),
+                    site_download_policy.get("include_origin", "default"),
+                    per_item_http_retries,
+                    per_item_pw_attempts,
+                    use_download_browser_pool,
                 )
             try:
                 if host:
@@ -5035,7 +5221,7 @@ async def download_worker(
                     download_dir = default_download_dir
 
                 # 1. HTTP ?ㅼ슫濡쒕뱶 ?쒕룄
-                can_try_direct_http = _is_valid_http_url(url)
+                can_try_direct_http = bool(direct_http_enabled) and _is_valid_http_url(url)
                 if not can_try_direct_http:
                     logger.info(
                         "[Download][Worker %s] Skip direct HTTP; Playwright required | url=%s source=%s",
@@ -5056,6 +5242,7 @@ async def download_worker(
                             url=url,
                             source_page=source_page,
                             attempt=attempt,
+                            include_origin=site_download_policy.get("include_origin"),
                         )
                         cookie_header = _cookie_header_from_file_meta(file_meta)
                         manual_cookie_header = "; ".join(
@@ -5084,6 +5271,8 @@ async def download_worker(
                                 is_http_only_direct=is_http_only_direct,
                                 is_portal_direct_fast=is_portal_direct_fast,
                             )
+                        if site_download_policy.get("prewarm_source_page") and source_page:
+                            prewarm_enabled = True
                         if requires_source_page_session:
                             logger.info(
                                 "[DownloadTrace][source_session_policy] job_id=%s worker=%s host=%s "
@@ -5187,19 +5376,39 @@ async def download_worker(
                             }
                         )
                         _set_download_activity_phase(file_meta, "http_connect")
+                        _set_download_activity_transport(file_meta, "http")
                         file_meta["_download_transport_phase"] = "http_connect"
                         file_meta["_download_connect_started_at"] = time.monotonic()
                         request_started_at = time.monotonic()
-                        response = await asyncio.wait_for(
-                            session.get(
-                                safe_url,
-                                timeout=request_timeout,
-                                allow_redirects=True,
-                                headers=req_headers,
-                                trace_request_ctx={"file_meta": file_meta},
-                            ),
-                            timeout=timeout_profile["header_timeout_sec"],
+                        request = session.get(
+                            safe_url,
+                            timeout=request_timeout,
+                            allow_redirects=True,
+                            headers=req_headers,
+                            trace_request_ctx={"file_meta": file_meta},
                         )
+                        hard_header_timeout_sec = float(
+                            site_download_policy.get("http_header_hard_timeout_sec") or 0.0
+                        )
+                        if hard_header_timeout_sec > 0.0:
+                            logger.info(
+                                "[DownloadTrace][hard_header_deadline] job_id=%s worker=%s host=%s "
+                                "timeout_sec=%.1f url=%s",
+                                file_meta.get("job_id"),
+                                worker_id,
+                                host or "-",
+                                hard_header_timeout_sec,
+                                _short(url, 220),
+                            )
+                            response = await await_http_response_headers(
+                                request,
+                                timeout_sec=hard_header_timeout_sec,
+                            )
+                        else:
+                            response = await asyncio.wait_for(
+                                request,
+                                timeout=timeout_profile["header_timeout_sec"],
+                            )
                         async with response:
                             _set_download_activity_phase(file_meta, "http_response_headers_received")
                             file_meta["_download_http_status"] = int(response.status)
@@ -6162,8 +6371,52 @@ async def download_worker(
                             await asyncio.sleep(1)
                         continue
 
+                # HTTP workers only perform the direct attempt.  Hand failed
+                # items to the dedicated Playwright queue so a slow browser
+                # download never occupies an HTTP worker.
+                if (
+                    direct_http_enabled
+                    and playwright_fallback_queue is not None
+                    and (browser or browser_relauncher or download_browser_getter)
+                    and per_item_pw_attempts > 0
+                ):
+                    file_meta["download_lane"] = "playwright"
+                    file_meta["_playwright_fallback_queued"] = True
+                    _set_download_activity_transport(file_meta, "playwright")
+                    _set_download_activity_phase(file_meta, "playwright_queue_enqueue")
+                    try:
+                        await playwright_fallback_queue.put(file_meta)
+                        await playwright_fallback_queue.flush()
+                    except Exception as queue_exc:
+                        file_meta.pop("_playwright_fallback_queued", None)
+                        file_meta["download_lane"] = worker_lane
+                        logger.warning(
+                            "[DownloadTrace][playwright_queue_enqueue_failed] job_id=%s worker=%s url=%s post_url=%s err=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            _short(url, 220),
+                            _short(source_page, 220),
+                            _short(queue_exc, 240),
+                        )
+                    else:
+                        logger.info(
+                            "[DownloadTrace][playwright_fallback_enqueued] job_id=%s worker=%s reason=%s url=%s post_url=%s",
+                            file_meta.get("job_id"),
+                            worker_id,
+                            _short(file_meta.get("_download_empty_reason") or file_meta.get("_download_last_error") or "http_no_file", 180),
+                            _short(url, 220),
+                            _short(source_page, 220),
+                        )
+                        return {
+                            "deferred_to_playwright_queue": True,
+                            "url": url,
+                            "defer_reason": "http_fallback_to_playwright",
+                        }
+
                 # 2. Playwright Fallback
-                if (browser or browser_relauncher) and per_item_pw_attempts > 0:
+                if (browser or browser_relauncher or download_browser_getter) and per_item_pw_attempts > 0:
+                    _set_download_activity_transport(file_meta, "playwright")
+                    _set_download_activity_phase(file_meta, "playwright_fallback_wait")
                     if file_meta.get("_download_access_denied_http"):
                         per_item_pw_attempts = min(per_item_pw_attempts, 1)
                         logger.info(
@@ -6194,17 +6447,35 @@ async def download_worker(
                     for p_attempt in range(1, per_item_pw_attempts + 1):
                         current_browser: Optional[Browser] = None
                         try:
-                            current_browser = _acquire_playwright_browser()
+                            _set_download_activity_transport(
+                                file_meta,
+                                "playwright",
+                                playwright_attempt=p_attempt,
+                            )
+                            _set_download_activity_phase(file_meta, "playwright_browser_pool_wait")
+                            current_browser = await _acquire_playwright_browser(
+                                download_pool=use_download_browser_pool,
+                            )
                             # 釉뚮씪?곗? ?곌껐 ?곹깭 ?뺤씤 諛??꾩슂 ???ъ떎??
                             if (current_browser is None) or (not current_browser.is_connected()):
                                 logger.warning(f"[Download][Worker {worker_id}] Browser missing or disconnected, relaunching...")
-                                _release_playwright_browser(current_browser)
+                                await _release_playwright_browser(
+                                    current_browser,
+                                    download_pool=use_download_browser_pool,
+                                )
                                 current_browser = None
+                                if use_download_browser_pool:
+                                    logger.warning(
+                                        "[DownloadBrowserPool][unavailable] worker=%s url=%s",
+                                        worker_id,
+                                        _short(url, 220),
+                                    )
+                                    break
                                 if browser_relauncher:
                                     # 釉뚮씪?곗? 醫낅즺 吏곹썑 吏㏐쾶 ?⑥쓣 怨좊Ⅸ ???ъ떎??
                                     await asyncio.sleep(0.5)
                                     browser = await browser_relauncher()
-                                    current_browser = _acquire_playwright_browser()
+                                    current_browser = await _acquire_playwright_browser()
                                     logger.debug(f"[Download][Worker {worker_id}] Browser relaunched successfully")
                                 else:
                                     logger.error(f"[Download][Worker {worker_id}] No relauncher; stopping Playwright fallback")
@@ -6212,7 +6483,7 @@ async def download_worker(
                             elif not current_browser and browser_relauncher:
                                 logger.warning(f"[Download][Worker {worker_id}] Browser not available, launching via relauncher...")
                                 browser = await browser_relauncher()
-                                current_browser = _acquire_playwright_browser()
+                                current_browser = await _acquire_playwright_browser()
                             elif not current_browser and not browser_relauncher:
                                 # 諛⑹뼱: ??議곌굔臾몄쑝濡??ㅼ뼱?ㅺ릿 ?대졄吏留? ?덉쟾?섍쾶 泥섎━
                                 logger.debug(
@@ -6222,12 +6493,13 @@ async def download_worker(
                                 )
                                 break
 
+                            _set_download_activity_phase(file_meta, "playwright_download")
                             file_info = await _download_with_playwright(
                                 current_browser,
                                 file_meta,
                                 download_dir,
                                 default_download_dir,
-                                browser_relauncher=browser_relauncher,
+                                browser_relauncher=(None if use_download_browser_pool else browser_relauncher),
                                 worker_id=worker_id,
                             )
                             if file_info:
@@ -6445,7 +6717,10 @@ async def download_worker(
                                 logger.error(f"[Download][Worker {worker_id}] Playwright fallback failed: {e}", exc_info=True)
                             break
                         finally:
-                            _release_playwright_browser(current_browser)
+                            await _release_playwright_browser(
+                                current_browser,
+                                download_pool=use_download_browser_pool,
+                            )
                     try:
                         playwright_fallback_sem.release()
                     except Exception:
@@ -6744,7 +7019,9 @@ async def download_worker(
                                 started_at=started_at,
                                 profile=timeout_profile,
                             )
-                            if result and result.get("deferred_to_large_lane"):
+                            if result and result.get("deferred_to_playwright_queue"):
+                                item_meta["_url_trace_outcome"] = "playwright_deferred"
+                            elif result and result.get("deferred_to_large_lane"):
                                 item_meta["_url_trace_outcome"] = "deferred"
                             elif result and result.get("deferred_to_domain_queue"):
                                 item_meta["_url_trace_outcome"] = "domain_deferred"
@@ -6969,6 +7246,12 @@ async def download_worker(
                                     terminal_outcome = "exception"
                                     terminal_reason = _short(result, 240)
                                     terminal_level = logging.ERROR
+                                elif result and result.get("deferred_to_playwright_queue"):
+                                    terminal_outcome = "playwright_deferred"
+                                    terminal_reason = str(
+                                        result.get("defer_reason") or "http_fallback_to_playwright"
+                                    )
+                                    terminal_level = logging.INFO
                                 elif result and result.get("deferred_to_large_lane"):
                                     terminal_outcome = "deferred"
                                     terminal_reason = str(
@@ -7010,7 +7293,7 @@ async def download_worker(
                                     )
                                     continue
                                 results.append(result)
-                                if result and out_queue and not result.get("defer_save_batch_until_learn_list") and not result.get("deferred_to_large_lane") and not result.get("deferred_to_domain_queue"):
+                                if result and out_queue and not result.get("defer_save_batch_until_learn_list") and not result.get("deferred_to_large_lane") and not result.get("deferred_to_playwright_queue") and not result.get("deferred_to_domain_queue"):
                                     await out_queue.put(result)
                     except BaseException:
                         for task in pending_tasks:
@@ -7027,6 +7310,7 @@ async def download_worker(
                             for result in results
                             if isinstance(result, dict) and (
                                 result.get("deferred_to_large_lane")
+                                or result.get("deferred_to_playwright_queue")
                                 or result.get("deferred_to_domain_queue")
                             )
                         )
@@ -7037,6 +7321,7 @@ async def download_worker(
                                 isinstance(result, dict)
                                 and (
                                     result.get("deferred_to_large_lane")
+                                    or result.get("deferred_to_playwright_queue")
                                     or result.get("deferred_to_domain_queue")
                                 )
                             )
@@ -7116,8 +7401,13 @@ async def download_worker(
                         for result in raw_results
                         if isinstance(result, dict) and result.get("deferred_to_large_lane")
                     )
+                    playwright_deferred_count = sum(
+                        1
+                        for result in raw_results
+                        if isinstance(result, dict) and result.get("deferred_to_playwright_queue")
+                    )
                     logger.info(
-                        "[FileCrawlTrace][queue_batch_done] worker=%s lane=%s job_ids=%s batch_size=%s downloaded=%s domain_deferred=%s large_deferred=%s skipped=%s exceptions=%s "
+                        "[FileCrawlTrace][queue_batch_done] worker=%s lane=%s job_ids=%s batch_size=%s downloaded=%s domain_deferred=%s large_deferred=%s playwright_deferred=%s skipped=%s exceptions=%s "
                         "queued_after_done=%s unfinished_after_done=%s",
                         worker_id,
                         worker_lane,
@@ -7138,6 +7428,7 @@ async def download_worker(
                         ),
                         domain_deferred_count,
                         large_deferred_count,
+                        playwright_deferred_count,
                         sum(1 for result in raw_results if result is None),
                         sum(1 for result in raw_results if isinstance(result, Exception)),
                         queued_after_done,

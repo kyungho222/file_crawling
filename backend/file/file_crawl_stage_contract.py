@@ -23,6 +23,7 @@ class FileCrawlStage(str, Enum):
     FILE_PAYLOAD_BUILD = "file_payload_build"
     DOWNLOAD_SAVE = "download_save"
     SAVE_EVENT_HANDLE = "save_event_handle"
+    FILE_SIMHASH_DUPLICATE_GATE = "file_simhash_duplicate_gate"
     LEARN_LIST_ROW_ENSURE = "learn_list_row_ensure"
     LEARN_LIST_PERSIST = "learn_list_persist"
 
@@ -130,6 +131,22 @@ FILE_CRAWL_STAGE_BOUNDARIES: Tuple[FileCrawlStageBoundary, ...] = (
         inputs=("file_saved event",),
         outputs=("learn_list file_info",),
         preserved_fields=("original_meta", "attachment_name", "cate1", "cate2"),
+    ),
+    FileCrawlStageBoundary(
+        stage=FileCrawlStage.FILE_SIMHASH_DUPLICATE_GATE,
+        owner="backend.board.file_content_workflow.BoardContentFilePipelineMixin",
+        function_refs=(
+            "_prepare_file_simhash_before_persist",
+            "_find_file_maria_simhash_duplicate",
+        ),
+        inputs=("parsed file text", "masked file text", "actual file size"),
+        outputs=("SimHash duplicate decision", "masked text", "SimHash metadata"),
+        preserved_fields=(
+            "simhash_decimal",
+            "simhash_normalized_length",
+            "original_meta.simhash_decimal",
+            "original_meta.simhash_normalized_length",
+        ),
     ),
     FileCrawlStageBoundary(
         stage=FileCrawlStage.LEARN_LIST_ROW_ENSURE,

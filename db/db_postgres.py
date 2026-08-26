@@ -81,7 +81,7 @@ def get_async_engine(db_name: Optional[str] = None, host: Optional[str] = None):
     pool_size = min(getattr(Config, 'DB_POOL_MIN', 5), 10)  # 湲곕낯 ? ?ш린: 理쒕? 10?쇰줈 ?쒗븳
     max_overflow = min(getattr(Config, 'DB_POOL_MAX', 35), 20)  # 理쒕? ?ㅻ쾭?뚮줈?? 理쒕? 20?쇰줈 ?쒗븳
     
-    logger.info(f"[PostgreSQL Engine] ?붿쭊 ?앹꽦 | Host={target_host} | DB={target_db} | pool_size={pool_size} | max_overflow={max_overflow}")
+    logger.info(f"[PostgreSQL Engine] 엔진 생성 | Host={target_host} | DB={target_db} | pool_size={pool_size} | max_overflow={max_overflow}")
     
     pg_connect_timeout = float(getattr(Config, "POSTGRES_CONNECT_TIMEOUT_SEC", 5.0) or 5.0)
     pg_pool_timeout = float(getattr(Config, "POSTGRES_POOL_TIMEOUT_SEC", 5.0) or 5.0)

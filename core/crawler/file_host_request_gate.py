@@ -39,7 +39,7 @@ def _configured_limit(host: str, requested_limit: Optional[int]) -> int:
     )
     configured = host_override or _env_int(
         "FILE_CRAWL_SHARED_HOST_MAX_CONCURRENT",
-        3,
+        2,
         minimum=1,
         maximum=16,
     )

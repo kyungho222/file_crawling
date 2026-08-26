@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -14,6 +16,13 @@ logger = logging.getLogger("backend.shared.file_simhash_generation")
 FILE_SIMHASH_GENERATE_URL = "http://110.45.147.63:3030/simhash/generate"
 _MAX_SIMHASH_VALUE = (1 << 128) - 1
 _DECIMAL_SIMHASH_PATTERN = re.compile(r"^\d{1,39}$")
+
+
+@dataclass(frozen=True)
+class FileSimhashGenerationResult:
+    value: str
+    normalized_length: int
+    updated: bool = False
 
 
 def normalize_decimal_simhash(value: Any) -> Optional[str]:
@@ -42,7 +51,7 @@ def _pure_file_body(content: str) -> str:
 def build_file_simhash_payload(
     *,
     job_id: str,
-    learn_list_row_id: int,
+    learn_list_row_id: Optional[int],
     db_name: str,
     chat_bot_id: str,
     file_url: str,
@@ -51,15 +60,19 @@ def build_file_simhash_payload(
     content: str,
 ) -> Dict[str, str]:
     """Build the row-addressable contract for the external file SimHash service."""
-    row_id = int(learn_list_row_id or 0)
-    if row_id <= 0:
-        raise ValueError("LEARN_LIST.id is required for a file SimHash request")
+    try:
+        row_id = int(learn_list_row_id or 0)
+    except (TypeError, ValueError):
+        row_id = 0
     normalized_job_id = str(job_id or "").strip()
     body = _pure_file_body(content)
-    return {
-        "request_id": f"{normalized_job_id}:{row_id}",
+    payload = {
+        "request_id": (
+            f"{normalized_job_id}:{row_id}"
+            if row_id > 0
+            else f"{normalized_job_id}:pre:{sha256(str(file_url or '').encode('utf-8')).hexdigest()[:16]}"
+        ),
         "job_id": normalized_job_id,
-        "id": str(row_id),
         "db_name": str(db_name or "").strip(),
         "chat_bot_id": str(chat_bot_id or "").strip(),
         "content_type": "file",
@@ -68,6 +81,9 @@ def build_file_simhash_payload(
         "title": str(title or "").strip(),
         "content": body,
     }
+    if row_id > 0:
+        payload["id"] = str(row_id)
+    return payload
 
 
 def _response_error_message(response_body: Any, default: str = "-") -> str:
@@ -77,10 +93,23 @@ def _response_error_message(response_body: Any, default: str = "-") -> str:
     return value[:500] or default
 
 
+def _record_failure(
+    failure_context: Optional[Dict[str, str]],
+    *,
+    reason: str,
+    error: str,
+) -> None:
+    """Expose a request failure to maintenance callers without changing the API result."""
+    if failure_context is None:
+        return
+    failure_context["reason"] = str(reason or "hash_api_request_failed")[:120]
+    failure_context["error"] = str(error or "-")[:500]
+
+
 async def generate_file_simhash(
     *,
     job_id: str,
-    learn_list_row_id: int,
+    learn_list_row_id: Optional[int],
     db_name: str,
     chat_bot_id: str,
     file_url: str,
@@ -90,6 +119,34 @@ async def generate_file_simhash(
     consume_result: bool = True,
 ) -> Optional[str]:
     """Request a decimal SimHash without performing duplicate checks."""
+    result = await generate_file_simhash_result(
+        job_id=job_id,
+        learn_list_row_id=learn_list_row_id,
+        db_name=db_name,
+        chat_bot_id=chat_bot_id,
+        file_url=file_url,
+        source_url=source_url,
+        title=title,
+        content=content,
+        consume_result=consume_result,
+    )
+    return result.value if result else None
+
+
+async def generate_file_simhash_result(
+    *,
+    job_id: str,
+    learn_list_row_id: Optional[int],
+    db_name: str,
+    chat_bot_id: str,
+    file_url: str,
+    source_url: str,
+    title: str,
+    content: str,
+    consume_result: bool = True,
+    failure_context: Optional[Dict[str, str]] = None,
+) -> Optional[FileSimhashGenerationResult]:
+    """Request a decimal SimHash and preserve its normalized body length."""
     payload = build_file_simhash_payload(
         job_id=job_id,
         learn_list_row_id=learn_list_row_id,
@@ -102,6 +159,7 @@ async def generate_file_simhash(
     )
     body = payload["content"]
     if not body:
+        _record_failure(failure_context, reason="empty_body", error="해시 생성 본문이 비어 있습니다.")
         logger.info(
             "[FileSimHash][request_skipped] request_id=%s source_url=%s reason=empty_body",
             payload["request_id"],
@@ -124,7 +182,7 @@ async def generate_file_simhash(
         "[FileSimHash][request_start] request_id=%s job_id=%s id=%s db=%s chat_bot_id=%s file_url=%s source_url=%s title=%s content_chars=%s",
         payload["request_id"],
         payload["job_id"],
-        payload["id"],
+        payload.get("id") or "-",
         payload["db_name"],
         payload["chat_bot_id"],
         payload["file_url"][:220],
@@ -138,6 +196,11 @@ async def generate_file_simhash(
             async with session.post(FILE_SIMHASH_GENERATE_URL, json=payload) as response:
                 if not consume_result:
                     if response.status != 200:
+                        _record_failure(
+                            failure_context,
+                            reason=f"http_status_{response.status}",
+                            error="hash_api_result_discarded",
+                        )
                         logger.warning(
                             "[FileSimHash][request_failed] request_id=%s status=%s source_url=%s error_message=result_discarded",
                             payload["request_id"],
@@ -147,6 +210,11 @@ async def generate_file_simhash(
                     return None
                 response_body = await response.json(content_type=None)
                 if response.status != 200 or not isinstance(response_body, dict):
+                    _record_failure(
+                        failure_context,
+                        reason=f"http_status_{response.status}",
+                        error=_response_error_message(response_body, "invalid_response"),
+                    )
                     logger.warning(
                         "[FileSimHash][request_failed] request_id=%s status=%s source_url=%s error_message=%s",
                         payload["request_id"],
@@ -156,6 +224,11 @@ async def generate_file_simhash(
                     )
                     return None
     except (aiohttp.ClientError, TimeoutError) as exc:
+        _record_failure(
+            failure_context,
+            reason="client_request_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         logger.warning(
             "[FileSimHash][request_failed] request_id=%s source_url=%s err_type=%s error_message=%s",
             payload["request_id"],
@@ -171,6 +244,11 @@ async def generate_file_simhash(
         or response_body.get("status") != "completed"
         or str(response_body.get("request_id") or "") != payload["request_id"]
     ):
+        _record_failure(
+            failure_context,
+            reason="response_not_completed",
+            error=_response_error_message(response_body, "hash_api_response_not_completed"),
+        )
         logger.warning(
             "[FileSimHash][response_not_completed] request_id=%s source_url=%s status=%s error_message=%s",
             payload["request_id"],
@@ -181,6 +259,11 @@ async def generate_file_simhash(
         return None
     value = normalize_decimal_simhash(response_body.get("hash"))
     if value is None:
+        _record_failure(
+            failure_context,
+            reason="invalid_hash",
+            error=_response_error_message(response_body, "invalid_decimal_hash"),
+        )
         logger.warning(
             "[FileSimHash][invalid_hash] request_id=%s source_url=%s error_message=%s",
             payload["request_id"],
@@ -195,4 +278,26 @@ async def generate_file_simhash(
             response_body.get("normalized_length"),
             len(value),
         )
-    return value
+    if value is None:
+        return None
+    try:
+        normalized_length = int(response_body.get("normalized_length") or 0)
+    except (TypeError, ValueError):
+        normalized_length = 0
+    if normalized_length <= 0:
+        _record_failure(
+            failure_context,
+            reason="invalid_normalized_length",
+            error="hash_api_normalized_length_missing_or_zero",
+        )
+        logger.warning(
+            "[FileSimHash][invalid_normalized_length] request_id=%s source_url=%s",
+            payload["request_id"],
+            payload["source_url"][:220],
+        )
+        return None
+    return FileSimhashGenerationResult(
+        value=value,
+        normalized_length=normalized_length,
+        updated=bool(response_body.get("updated")),
+    )

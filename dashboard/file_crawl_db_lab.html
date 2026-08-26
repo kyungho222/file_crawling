@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>파일 크롤링 DB 진단</title>
+  <style>
+    :root { font-family: Arial, sans-serif; color: #1d2939; background: #f5f8fc; }
+    body { margin: 0; } main { max-width: 1440px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 18px; font-size: 22px; } .controls { display:flex; gap:8px; margin-bottom:16px; }
+    input { width: 430px; max-width: 70vw; padding:10px; border:1px solid #98a2b3; border-radius:4px; }
+    button { padding:10px 14px; border:0; border-radius:4px; background:#1570ef; color:#fff; cursor:pointer; }
+    #status { min-height:22px; color:#475467; font-size:14px; } .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:16px; }
+    section { background:#fff; border:1px solid #d0d5dd; border-radius:6px; min-height:190px; overflow:hidden; }
+    section.warning { border-color:#fdb022; background:#fffaeb; } section.danger { border-color:#f04438; background:#fef3f2; }
+    h2 { margin:0; padding:12px; background:#f8fafc; font-size:15px; border-bottom:1px solid #eaecf0; }
+    section.warning h2 { background:#fef0c7; } section.danger h2 { background:#fee4e2; }
+    .badge { float:right; padding:2px 7px; border-radius:10px; font-size:11px; color:#fff; background:#12b76a; } .badge.warning { background:#f79009; } .badge.danger { background:#d92d20; }
+    .copy { float:right; margin:0 8px 0 0; padding:2px 7px; border:1px solid #98a2b3; border-radius:3px; background:#fff; color:#344054; font-size:11px; }
+    pre { margin:0; padding:12px; height:155px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.5; }
+    .wide { grid-column:span 3; } @media (max-width:850px) { .grid{grid-template-columns:1fr}.wide{grid-column:span 1} }
+  </style>
+</head>
+<body><main>
+  <h1>파일 크롤링 DB 진단</h1>
+  <div class="controls"><input id="jobId" placeholder="진행 중인 파일 크롤링 job_id"><button id="start">조회 시작</button><button id="stop">조회 중지</button></div>
+  <div id="status">job_id를 입력하면 이 프로세스 메모리의 DB 진단을 표시합니다.</div>
+  <div class="grid" id="panels"></div>
+</main><script>
+const panels=document.getElementById('panels'), status=document.getElementById('status'), jobId=document.getElementById('jobId'); let source;
+const heldStates={}; const severityRank={normal:0,warning:1,danger:2};
+const labels=['연결·쿼리 시간','DB Write Queue','Timeout·장기 점유','설정 조회·캐시','Exploration·Start URL','중복·상태 UPDATE'];
+function opSeverity(value){ const groups=[value?.operations||{},value?.workflow_operations||{}]; let warn=false; for(const group of groups) for(const op of Object.values(group)){if((op.max_ms||0)>=3000)return 'danger';if((op.avg_ms||0)>=1000||(op.max_ms||0)>=1000)warn=true;} return warn?'warning':'normal'; }
+function queueSeverity(value, strict){ const queue=value?.queue||{}; const pending=queue.default_pending??queue.pending??0; const active=queue.active_jobs||[]; const longest=Math.max(0,...active.map(v=>Number(v.started_ago_sec||0))); if(pending>=500||longest>=120)return 'danger'; if(pending>=100||longest>=(strict?30:60))return 'warning'; return 'normal'; }
+function prepareSeverity(data){ const events=data?.diagnostics?.events||[]; const prepared=events.filter(v=>v.event==='workflow_db_prepare_started').at(-1); const loaded=events.filter(v=>v.event==='exploration_start_urls_ready').at(-1); if(!prepared||loaded)return 'normal'; const age=(Date.now()-Date.parse(prepared.at))/1000; return age>=60?'danger':age>=15?'warning':'normal'; }
+function explorationSeverity(value){ const event=(value?.events||[]).at(-1); if(!event)return 'normal'; const d=event.detail||{}; return d.sql_rows>0&&d.final_start_urls===0?'warning':'normal'; }
+function severity(index,value,data){ if(index===0||index===5)return opSeverity(value); if(index===1)return queueSeverity(value,false); if(index===2)return queueSeverity(value,true); if(index===3)return prepareSeverity(data); if(index===4)return explorationSeverity(value); return 'normal'; }
+function pipelineSeverity(value){ const q=value?.queues||{}, w=value?.workers||{}; const collection=Math.max(Number(q.collection_batch_queue||0),Number(q.collection_batch_queue_unfinished||0)); const downloads=w.download_inflight||[]; const saves=w.save_inflight||[]; const downloadAge=Math.max(0,...downloads.map(v=>Number(v.phase_elapsed_sec||v.elapsed_sec||0))); const saveAge=Math.max(0,...saves.map(v=>Number(v.elapsed_sec||0))); if(collection>=250||downloadAge>=30||saveAge>=120)return 'danger'; if(collection>=100||downloadAge>=15||saveAge>=30)return 'warning'; return 'normal'; }
+function heldSeverity(index,current){ const now=Date.now(); const previous=heldStates[index]; if(current!=='normal'){const hold=current==='danger'?120000:60000; heldStates[index]={state:current,until:now+hold}; return current;} if(previous&&previous.until>now)return previous.state; delete heldStates[index]; return 'normal'; }
+function stateText(state){return state==='danger'?'위험':state==='warning'?'주의':'정상';}
+function render(data){ const cats=data.categories||{}; const values=[cats['1'],cats['2'],cats['3'],cats['4'],cats['5'],cats['6']]; const numbered=values.map((v,i)=>{const state=heldSeverity(i,severity(i,v,data));return `<section class="${state}"><h2>${i+1}. ${labels[i]}<span class="badge ${state}">${stateText(state)}</span><button class="copy" type="button">복사</button></h2><pre>${escape(JSON.stringify(v,null,2))}</pre></section>`}).join(''); const pipeState=heldSeverity('pipeline',pipelineSeverity(data.pipeline)); const pipeline=`<section class="wide ${pipeState}"><h2>파일 파이프라인 상태<span class="badge ${pipeState}">${stateText(pipeState)}</span><button class="copy" type="button">복사</button></h2><pre>${escape(JSON.stringify(data.pipeline||{},null,2))}</pre></section>`; const recent=`<section class="wide"><h2>최근 진단 이벤트</h2><pre>${escape(JSON.stringify((data.diagnostics||{}).events||[],null,2))}</pre></section>`; panels.innerHTML=numbered+pipeline+recent; status.textContent=`${data.active?'진행 중':'workflow 메모리 미확인'} | DB: ${data.workflow?.db_name||'-'} | 상태: ${data.workflow?.final_status||'running'} | 이벤트: ${data.diagnostics?.sequence||0}`; }
+function escape(v){return String(v).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+async function copyText(text){ if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(text);return;} const area=document.createElement('textarea');area.value=text;document.body.appendChild(area);area.select();document.execCommand('copy');area.remove(); }
+panels.addEventListener('click',async event=>{const button=event.target.closest('.copy');if(!button)return;const text=button.closest('section')?.querySelector('pre')?.textContent||'';try{await copyText(text);button.textContent='복사됨';setTimeout(()=>button.textContent='복사',1000);}catch{button.textContent='실패';setTimeout(()=>button.textContent='복사',1000);}});
+function start(){ const id=jobId.value.trim(); if(!id)return; if(source)source.close(); source=new EventSource(`/file-crawl-db-lab/events/${encodeURIComponent(id)}`); source.onmessage=e=>render(JSON.parse(e.data)); source.onerror=()=>{status.textContent='SSE 연결 재시도 중';}; }
+document.getElementById('start').onclick=start; document.getElementById('stop').onclick=()=>{if(source)source.close(); source=null; status.textContent='조회 중지';};
+</script></body></html>

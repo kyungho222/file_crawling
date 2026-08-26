@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from backend.shared.crawl_monitor import monitor_auto_stop
 from backend.shared.crawler_state import crawler_state
 from backend.shared.job_result_report import schedule_job_result_report
+from backend.shared.job_completion_summary import build_job_completion_summary
 from backend.shared.pre_explored_url import save_crawled_urls_report
 from backend.shared.crawl_shared import (
     COMPLETE_SSE_STATUSES,
@@ -1456,6 +1457,19 @@ async def run_workflow_task(
     workflow.db_name = db_name
     workflow.job_id = job_id
     workflow.chat_bot_id = chat_bot_id
+    try:
+        if _is_file_mode_workflow(workflow):
+            from backend.shared.file_crawl_db_diagnostics import record_file_crawl_db_event
+
+            record_file_crawl_db_event(
+                job_id=job_id,
+                db_name=db_name,
+                category=4,
+                event="workflow_db_prepare_started",
+                detail={"start_url_count": len(start_urls or [])},
+            )
+    except Exception:
+        pass
     workflow_slot_acquired = False
     workflow_slot_waited = False
     distributed_lock_key = ""
@@ -2824,6 +2838,11 @@ async def run_workflow_task(
                 "enable_db_save": final_stats.get("enable_db_save", True),
                 "file_pipeline_skip_learning": final_stats.get("file_pipeline_skip_learning", False),
                 "duplicate_runtime_excluded_count": final_stats.get("duplicate_runtime_excluded_count", 0),
+                "simhash_duplicate_skip_count": final_stats.get("simhash_duplicate_skip_count", 0),
+                "simhash_backfill_count": final_stats.get("simhash_backfill_count", 0),
+                "collection_failed_count": final_stats.get("collection_failed_count", 0),
+                "parse_success_count": final_stats.get("parse_success_count", 0),
+                "parse_failed_count": final_stats.get("parse_failed_count", 0),
                 "allow_counter_decrease": bool(final_stats.get("allow_counter_decrease", False)),
                 "allow_scan_count_decrease": bool(final_stats.get("allow_scan_count_decrease", False)),
                 "last_counter_decrease_reason": final_stats.get("last_counter_decrease_reason", ""),
@@ -3346,6 +3365,12 @@ async def run_workflow_task(
                         "collection_count": final_stats.get("collection_count", 0),
                         "save_count": final_stats.get("save_count", 0),
                         "study_count": finally_study_count,
+                        "duplicate_runtime_excluded_count": final_stats.get("duplicate_runtime_excluded_count", 0),
+                        "simhash_duplicate_skip_count": final_stats.get("simhash_duplicate_skip_count", 0),
+                        "simhash_backfill_count": final_stats.get("simhash_backfill_count", 0),
+                        "collection_failed_count": final_stats.get("collection_failed_count", 0),
+                        "parse_success_count": final_stats.get("parse_success_count", 0),
+                        "parse_failed_count": final_stats.get("parse_failed_count", 0),
                         "timestamp": datetime.now().isoformat(),
                         "event": "workflow_completed",
                         "job_id": job_id,
@@ -3389,6 +3414,26 @@ async def run_workflow_task(
                         final_message["event"] = "workflow_completed"
                 except Exception:
                     pass
+
+                completion_summary = build_job_completion_summary(
+                    final_message,
+                    job_id=str(job_id or "-"),
+                    workflow_name="파일" if _is_file_mode_workflow(workflow) else "게시물",
+                    status=str(final_message.get("status") or terminal_status or ""),
+                    processing_count=_safe_count_value(final_message.get("save_count")) or 0,
+                    pg_saved_count=_safe_count_value(final_message.get("pg_saved_count")),
+                    pg_total_count=_safe_count_value(final_message.get("pg_total_count")),
+                    original_learn_list_id=(
+                        getattr(workflow, "original_learn_list_id", None)
+                        or getattr(workflow, "learn_list_id", None)
+                    ),
+                    followup_pending=bool(
+                        final_message.get("background_followup_pending")
+                        or final_message.get("background_drain_pending")
+                    ),
+                )
+                final_message["completion_summary"] = completion_summary
+                logger.info("[RunWorkflowTask][completion] %s", completion_summary["text"])
 
                 try:
                     await update_state_only(

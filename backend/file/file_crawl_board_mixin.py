@@ -5,8 +5,8 @@
   종료 시 lock_file_exploration_scan_total() 로 scan_count 를 고정(이후 변경 없음).
 - Phase 2 (Consumer / 소비): 다운로드·NAS·DB·학습은 큐 drain 이후 _finalize_stats 에서 대기.
 - 학습 실패/성공 집계는 file_study_* (게시판 study_*와 분리)
-- scan_count(잠금 전): 고유 상세(시작 시점 start_urls 기준 1회 카운트) + 고유 첨부 URL 수
-  (= Post base + File 증분, 상세·첨부 이중 합산 없음)
+- scan_count(잠금 전): 고유 상세(시작 시점 start_urls 기준 1회 카운트) + 상세별 첨부 추가분
+  (= Post base + max(첨부 수 - 1, 0), 상세·첨부 이중 합산 없음)
 - collection_count: MariaDB LEARN_LIST 신규 row INSERT가 성공한 문서 수
 - save_count: MariaDB LEARN_LIST 신규 row INSERT 성공 시에만 증가
 - study_count: 외부 임베딩 콜백에서 LEARN_LIST status=Y 반영이 성공한 수
@@ -73,6 +73,7 @@ class FileCrawlBoardMixin:
         self._file_exploration_scan_locked = False
         self._file_exploration_scan_total_at_lock = 0
         self._file_scan_count_base_details = 0
+        self._file_scan_attachment_extras_by_post = {}
         try:
             st = getattr(self, "stats", None)
             if isinstance(st, dict):
@@ -86,7 +87,7 @@ class FileCrawlBoardMixin:
     def init_file_scan_count_base_from_start_urls(self, start_urls: _StartUrls) -> None:
         """
         크롤 시작 시점: scan_count = 고유 상세(Post) 개수만 반영.
-        이후 상세에서 발견한 고유 첨부(File)만 _sync_file_mode_scan_count 에서 가산.
+        이후 상세에서 발견한 첨부의 추가분만 _sync_file_mode_scan_count 에서 가산.
         """
         base = unique_detail_url_count_from_start_urls(start_urls)
         self.set_file_scan_count_base_from_count(base)
@@ -102,8 +103,45 @@ class FileCrawlBoardMixin:
         self.stats["scan_detail_leg"] = base
         self.stats["scan_attachment_leg"] = 0
 
+    def record_file_scan_attachment_page(self, post_url: str, attachment_count: int) -> None:
+        """Record max(attachment_count - 1, 0) once for one detail page."""
+        if getattr(self, "_file_exploration_scan_locked", False):
+            return
+        try:
+            from utils.url import canonicalize_url_for_dedup
+
+            post_key = canonicalize_url_for_dedup(str(post_url or "").strip())
+        except Exception:
+            post_key = str(post_url or "").strip().split("#", 1)[0]
+        if not post_key:
+            return
+        try:
+            extra = max(0, int(attachment_count or 0) - 1)
+        except (TypeError, ValueError):
+            extra = 0
+        extras_by_post = getattr(self, "_file_scan_attachment_extras_by_post", None)
+        if not isinstance(extras_by_post, dict):
+            extras_by_post = {}
+            self._file_scan_attachment_extras_by_post = extras_by_post
+        # A retry may discover more attachments; never reduce a previously
+        # observed page contribution during the same crawl.
+        extras_by_post[post_key] = max(int(extras_by_post.get(post_key, 0) or 0), extra)
+        self._sync_file_mode_scan_count()
+
+    def _file_scan_attachment_extra_count(self) -> int:
+        extras_by_post = getattr(self, "_file_scan_attachment_extras_by_post", None)
+        if not isinstance(extras_by_post, dict):
+            return 0
+        total = 0
+        for value in extras_by_post.values():
+            try:
+                total += max(0, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+        return total
+
     def _sync_file_mode_scan_count(self) -> None:
-        """scan_count = 고유 상세(base, 시작 시점) + 고유 첨부(f). 탐색 잠금 후에는 고정값만 유지."""
+        """scan_count = detail base + sum(max(attachments per detail - 1, 0))."""
         if getattr(self, "_file_exploration_scan_locked", False):
             try:
                 self.stats["scan_count"] = int(
@@ -116,12 +154,12 @@ class FileCrawlBoardMixin:
             base = int(getattr(self, "_file_scan_count_base_details", 0) or 0)
         except Exception:
             base = 0
-        f = len(getattr(self, "_seen_file_urls", None) or set())
-        total = base + f
+        attachment_extra = self._file_scan_attachment_extra_count()
+        total = base + attachment_extra
         self.stats["scan_count"] = total
         try:
             self.stats["scan_detail_leg"] = base
-            self.stats["scan_attachment_leg"] = f
+            self.stats["scan_attachment_leg"] = attachment_extra
         except Exception:
             pass
 
@@ -131,8 +169,8 @@ class FileCrawlBoardMixin:
             base = int(getattr(self, "_file_scan_count_base_details", 0) or 0)
         except Exception:
             base = 0
-        f = len(getattr(self, "_seen_file_urls", None) or set())
-        total = base + f
+        attachment_extra = self._file_scan_attachment_extra_count()
+        total = base + attachment_extra
         self._file_exploration_scan_total_at_lock = total
         self._file_exploration_scan_locked = True
         self.stats["scan_count"] = total
@@ -140,13 +178,13 @@ class FileCrawlBoardMixin:
         self.stats["file_exploration_complete"] = True
         self.stats["scan_count_locked"] = True
         self.stats["scan_detail_leg"] = base
-        self.stats["scan_attachment_leg"] = f
+        self.stats["scan_attachment_leg"] = attachment_extra
         logger.info(
-            "[Phase][file] 탐색 완료·scan_count 잠금 | job_id=%s total=%s (Post base=%s + 고유 File=%s)",
+            "[Phase][file] 탐색 완료·scan_count 잠금 | job_id=%s total=%s (Post base=%s + 첨부 추가분=%s)",
             getattr(self, "job_id", ""),
             total,
             base,
-            f,
+            attachment_extra,
         )
         return total
 

@@ -41,7 +41,7 @@ def truncate_filename_to_max_bytes(filename: str, max_bytes: int | None = None, 
             out = raw[:limit]
             while out and (out[-1] & 0xC0) == 0x80:
                 out = out[:-1]
-            return out.decode(encoding, errors="replace")
+            return out.decode(encoding, errors="ignore")
         budget = limit - len(ext_b)
         stem_b = stem.encode(encoding, errors="surrogatepass")
         if len(stem_b) <= budget:
@@ -49,11 +49,11 @@ def truncate_filename_to_max_bytes(filename: str, max_bytes: int | None = None, 
         truncated = stem_b[:budget]
         while truncated and (truncated[-1] & 0xC0) == 0x80:
             truncated = truncated[:-1]
-        return truncated.decode(encoding, errors="replace") + ext
+        return truncated.decode(encoding, errors="ignore") + ext
     out = raw[:limit]
     while out and (out[-1] & 0xC0) == 0x80:
         out = out[:-1]
-    return out.decode(encoding, errors="replace")
+    return out.decode(encoding, errors="ignore")
 
 
 def file_identity_dedupe_key(

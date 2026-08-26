@@ -183,6 +183,24 @@ except Exception as exc:
     logger.warning("[FileCrawlStageLab] router include skipped: %s", exc)
 
 try:
+    from backend.file.file_crawl_maintenance_lab_router import router as file_crawl_maintenance_lab_router
+
+    app.include_router(file_crawl_maintenance_lab_router)
+    app.include_router(file_crawl_maintenance_lab_router, prefix="/Ai_Pro_filecrawler")
+    logger.info("[FileCrawlMaintenanceLab] routes included")
+except Exception as exc:
+    logger.warning("[FileCrawlMaintenanceLab] router include skipped: %s", exc)
+
+try:
+    from backend.file.file_crawl_db_lab_router import router as file_crawl_db_lab_router
+
+    app.include_router(file_crawl_db_lab_router)
+    app.include_router(file_crawl_db_lab_router, prefix="/Ai_Pro_filecrawler")
+    logger.info("[FileCrawlDbLab] routes included")
+except Exception as exc:
+    logger.warning("[FileCrawlDbLab] router include skipped: %s", exc)
+
+try:
     from backend.filecrawler_batch_endpoints import router as filecrawler_batch_router
 
     app.include_router(filecrawler_batch_router)
@@ -191,18 +209,6 @@ try:
     app.include_router(filecrawler_batch_router, prefix="/api-aipro/f1_dev/api/Ai_Pro_filecrawler")
 except Exception as exc:
     logger.warning("[FilecrawlerBatch] router include skipped: %s", exc)
-
-try:
-    from backend.simhash_matcher.router import (
-        file_simhash_router,
-        router as simhash_matcher_router,
-    )
-
-    # Public SimHash API. It is independent from the crawler workflow routes.
-    app.include_router(file_simhash_router)
-    app.include_router(simhash_matcher_router, prefix="/api-aipro/f1/Ai_Pro_filecrawler")
-except Exception as exc:
-    logger.warning("[SimHashMatcher] router include skipped: %s", exc)
 
 def _log_callback_routes() -> None:
     try:

@@ -259,11 +259,20 @@ def _name_from_url(url: str) -> str:
         return ""
 
 
-def _is_download_url(url: str) -> bool:
+def _is_download_url(url: str, *, additional_hints: Optional[List[str]] = None) -> bool:
     low = str(url or "").lower()
     if not low or any(h in low for h in PREVIEW_HINTS):
         return False
-    return any(h in low for h in DOWNLOAD_HINTS) or bool(infer_attachment_extension(low))
+    configured_hints = tuple(
+        str(hint or "").strip().lower()
+        for hint in (additional_hints or [])
+        if str(hint or "").strip()
+    )
+    return (
+        any(hint in low for hint in DOWNLOAD_HINTS)
+        or any(hint in low for hint in configured_hints)
+        or bool(infer_attachment_extension(low))
+    )
 
 
 def _is_noise_attachment_asset(href: Any, name: Any = "") -> bool:
@@ -415,6 +424,7 @@ def _resolve_url(
     base_url: str,
     *,
     page_script: str = "",
+    download_url_hints: Optional[List[str]] = None,
 ) -> tuple[str, bool, str]:
     raw = normalize_attachment_href(raw or "")
     onclick = str(onclick or "").strip()
@@ -429,7 +439,7 @@ def _resolve_url(
             or extract_download_url_from_js(value, base_url, page_script=page_script)
             or resolve_anseong_yhlib_download_url(value, base_url)
         )
-        if resolved and _is_download_url(resolved):
+        if resolved and _is_download_url(resolved, additional_hints=download_url_hints):
             return resolved, True, reason
     if not raw or raw.startswith("#") or raw.lower().startswith(("javascript:", "mailto:", "tel:")):
         return "", False, ""
@@ -437,7 +447,11 @@ def _resolve_url(
         full = urljoin(base_url, raw)
     except Exception:
         full = raw
-    return (full, False, "href") if _is_download_url(full) else ("", False, "")
+    return (
+        (full, False, "href")
+        if _is_download_url(full, additional_hints=download_url_hints)
+        else ("", False, "")
+    )
 
 
 def _candidate_name(
@@ -726,6 +740,7 @@ def extract_fast_attachments(
     except Exception:
         return []
     name_attributes = _config_string_list(resolved_site_config, "attachment_name_attributes")
+    attachment_url_hints = _config_string_list(resolved_site_config, "attachment_url_hints")
     out: List[FastAttachment] = []
     seen: set[str] = set()
     script_blob = _script_text_blob(soup)
@@ -740,6 +755,7 @@ def extract_fast_attachments(
             str(onclick or ""),
             base_url,
             page_script=script_blob,
+            download_url_hints=attachment_url_hints,
         )
         if not href:
             scripted_href = _resolve_scripted_file_download(node, base_url, soup, script_blob)
@@ -756,7 +772,10 @@ def extract_fast_attachments(
             download_name = ""
         if _is_noise_attachment_asset(href, name):
             continue
-        if not (_is_download_url(href) or infer_attachment_extension(name)):
+        if not (
+            _is_download_url(href, additional_hints=attachment_url_hints)
+            or infer_attachment_extension(name)
+        ):
             continue
         key = _dedup_key(href)
         if not key or key in seen:
@@ -786,6 +805,7 @@ def extract_fast_attachments(
                 "",
                 base_url,
                 page_script=script_blob,
+                download_url_hints=attachment_url_hints,
             )
             if not href:
                 continue
@@ -793,7 +813,10 @@ def extract_fast_attachments(
             name = _clean_name(body) or _name_from_url(href)
             if _is_noise_attachment_asset(href, name):
                 continue
-            if not (_is_download_url(href) or infer_attachment_extension(name)):
+            if not (
+                _is_download_url(href, additional_hints=attachment_url_hints)
+                or infer_attachment_extension(name)
+            ):
                 continue
             key = _dedup_key(href)
             if not key or key in seen:

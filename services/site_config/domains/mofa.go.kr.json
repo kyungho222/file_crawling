@@ -1,0 +1,18 @@
+{
+  "attachment_selectors": [
+    ".file a[download][href]"
+  ],
+  "attachment_url_hints": [
+    "/down.do"
+  ],
+  "download": {
+    "force_https": true,
+    "prewarm_source_page": true,
+    "include_origin": true,
+    "http_retries": 3,
+    "http_retries_before_playwright": 1,
+    "http_header_hard_timeout_sec": 10,
+    "playwright_fallback": true,
+    "download_browser_pool": true
+  }
+}

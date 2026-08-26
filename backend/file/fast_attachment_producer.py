@@ -1356,6 +1356,22 @@ async def run_fast_file_attachment_front(
                         enqueue_reason or "-",
                         file_names or "-",
                     )
+                try:
+                    stats_lock = getattr(workflow, "_stats_lock", None)
+                    record_scan_page = getattr(workflow, "record_file_scan_attachment_page", None)
+                    if callable(record_scan_page):
+                        if stats_lock is not None:
+                            async with stats_lock:
+                                record_scan_page(item.url, attachment_count)
+                        else:
+                            record_scan_page(item.url, attachment_count)
+                except Exception:
+                    logger.debug(
+                        "[file-fast][scan_count_record_failed] job_id=%s post_url=%s",
+                        getattr(workflow, "job_id", ""),
+                        item.url,
+                        exc_info=True,
+                    )
                 counters["post_success_count"] += 1
                 counters["attachment_count"] += len(attachments)
                 counters["enqueued_count"] += enqueued

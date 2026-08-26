@@ -13,6 +13,7 @@ import os
 import time
 import unicodedata
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -41,6 +42,10 @@ from backend.board.anseong_file import (
 from backend.shared.completed_url_ttl_cache import completed_url_cached, remember_completed_url
 from backend.shared.file_name_debug import emit_file_name_debug
 from backend.file.file_pg_duplicate import build_file_pg_duplicate_fingerprint
+from backend.file.file_simhash_duplicate import (
+    build_file_simhash_claim_key,
+    build_file_simhash_duplicate_key,
+)
 from backend.file.file_learn_list_persistence import run_learn_list_ensure
 
 from urllib.parse import unquote, urlencode, urlparse
@@ -813,6 +818,8 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         "scan_workers": 1,
         "collection_workers": collection_workers,
         "download_workers": download_topology["total_workers"],
+        "http_download_workers": download_topology["normal_workers"],
+        "playwright_download_workers": download_topology["playwright_workers"],
         "download_max_concurrent": download_topology["max_concurrent"],
         "study_workers": study_workers,
     }
@@ -1007,6 +1014,44 @@ def _board_project_root() -> str:
 class BoardContentFilePipelineMixin:
     """File crawling pipeline mixin for BoardContentWorkflow."""
 
+    def _record_file_simhash_gate_result(
+        self,
+        *,
+        decision: str,
+        reason: str,
+        simhash: str = "",
+        file_name: str = "",
+        file_url: str = "",
+        source_url: str = "",
+        matched_learn_list_id: Any = None,
+        matched_status: Any = None,
+    ) -> None:
+        """Keep a bounded, runtime-only trace for the file SimHash gate."""
+        try:
+            records = getattr(self, "_file_simhash_gate_results", None)
+            if not isinstance(records, dict):
+                records = {}
+                self._file_simhash_gate_results = records
+            file_key = self._build_stats_counter_key(url=file_url) or str(file_url or "").strip()
+            if not file_key:
+                return
+            records.pop(file_key, None)
+            records[file_key] = {
+                "decision": str(decision or "").strip(),
+                "reason": str(reason or "").strip(),
+                "simhash": str(simhash or "").strip(),
+                "file_name": str(file_name or "").strip(),
+                "file_url": str(file_url or "").strip(),
+                "source_url": str(source_url or "").strip(),
+                "matched_learn_list_id": matched_learn_list_id,
+                "matched_status": str(matched_status or "").strip(),
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            while len(records) > 100:
+                records.pop(next(iter(records)), None)
+        except Exception:
+            logger.debug("[FileSimHash][gate_result_record_failed]", exc_info=True)
+
     job_id: str
     chat_bot_id: str
     db_name: str
@@ -1049,7 +1094,7 @@ class BoardContentFilePipelineMixin:
 
     def _file_progress_worker_count(self) -> int:
         try:
-            workers = int(os.getenv("FILE_CRAWL_SAVE_WORKERS", "4") or "4")
+            workers = int(os.getenv("FILE_CRAWL_SAVE_WORKERS", "3") or "3")
         except Exception:
             workers = 2
         return max(1, min(workers, 4))
@@ -1801,10 +1846,12 @@ class BoardContentFilePipelineMixin:
                 self._file_worker_manager_cleanup_pending = None
                 worker_config = _file_pipeline_worker_config()
                 logger.info(
-                    "[FileCrawlTrace][worker_config] job_id=%s download_workers=%s download_max_concurrent=%s save_workers=%s study_workers=%s",
-                    self.job_id,
-                    worker_config.get("download_workers"),
-                    worker_config.get("download_max_concurrent"),
+                "[FileCrawlTrace][worker_config] job_id=%s download_workers=%s http_download_workers=%s playwright_download_workers=%s download_max_concurrent=%s save_workers=%s study_workers=%s",
+                self.job_id,
+                worker_config.get("download_workers"),
+                worker_config.get("http_download_workers"),
+                worker_config.get("playwright_download_workers"),
+                worker_config.get("download_max_concurrent"),
                     self._file_progress_worker_count(),
                     worker_config.get("study_workers"),
                 )
@@ -3417,6 +3464,172 @@ class BoardContentFilePipelineMixin:
         if not fingerprint:
             return False
         return fingerprint in (getattr(self, "_file_pg_duplicate_fingerprints", set()) or set())
+
+    async def _find_file_maria_simhash_duplicate(
+        self,
+        *,
+        simhash_decimal: str,
+        normalized_length: int,
+        file_size: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a file LEARN_LIST row with the same decimal SimHash."""
+        identity = build_file_simhash_duplicate_key(
+            simhash_decimal=simhash_decimal,
+            normalized_length=normalized_length,
+            file_size=file_size,
+        )
+        if not identity:
+            return None
+        try:
+            from db.mysql_db_config import mysql_execute_query
+
+            lookup_bundle = getattr(self, "_file_simhash_maria_lookup_bundle", None)
+            if not isinstance(lookup_bundle, dict):
+                from db.mariadb_save_update import (
+                    ensure_learn_list_standard_columns,
+                    get_account_identifier_from_chatbot_setup,
+                    get_learn_list_table_name,
+                )
+
+                account_identifier = await get_account_identifier_from_chatbot_setup(
+                    str(getattr(self, "chat_bot_id", "") or ""),
+                    str(getattr(self, "db_name", "") or ""),
+                )
+                learn_table = get_learn_list_table_name(account_identifier)
+                columns = await ensure_learn_list_standard_columns(
+                    str(getattr(self, "db_name", "") or ""),
+                    learn_table,
+                )
+                lookup_bundle = {
+                    "learn_table": learn_table,
+                    "has_hash": "hash" in columns,
+                }
+                self._file_simhash_maria_lookup_bundle = lookup_bundle
+
+            learn_table = str(lookup_bundle.get("learn_table") or "")
+            if not learn_table or not bool(lookup_bundle.get("has_hash")):
+                if not bool(lookup_bundle.get("missing_hash_logged")):
+                    logger.warning(
+                        "[FileSimHash][maria_lookup_skipped] job_id=%s db=%s table=%s reason=hash_column_missing",
+                        getattr(self, "job_id", None),
+                        getattr(self, "db_name", None),
+                        learn_table,
+                    )
+                    lookup_bundle["missing_hash_logged"] = True
+                return None
+
+            rows = await mysql_execute_query(
+                f"""
+                SELECT `id`, `status`
+                FROM `{learn_table}`
+                WHERE `content_type` = 'file'
+                  AND `hash` = %s
+                LIMIT 1
+                """,
+                (identity[0],),
+                fetch=True,
+                dbname=str(getattr(self, "db_name", "") or ""),
+                op_name=f"file_simhash_duplicate_lookup:job={getattr(self, 'job_id', None) or '-'}",
+            )
+            if rows:
+                matched_row = dict(rows[0] or {})
+                logger.info(
+                    "[FileSimHash][maria_lookup_result] job_id=%s db=%s table=%s result=matched simhash=%s matched_learn_list_id=%s matched_status=%s",
+                    getattr(self, "job_id", None),
+                    getattr(self, "db_name", None),
+                    learn_table,
+                    identity[0],
+                    matched_row.get("id"),
+                    matched_row.get("status"),
+                )
+                return matched_row
+            logger.info(
+                "[FileSimHash][maria_lookup_result] job_id=%s db=%s table=%s result=not_matched simhash=%s",
+                getattr(self, "job_id", None),
+                getattr(self, "db_name", None),
+                learn_table,
+                identity[0],
+            )
+        except Exception as exc:
+            logger.warning(
+                "[FileSimHash][maria_lookup_failed] job_id=%s db=%s hash_length=%s normalized_length=%s file_size=%s err_type=%s",
+                getattr(self, "job_id", None),
+                getattr(self, "db_name", None),
+                len(identity[0]),
+                identity[1],
+                identity[2],
+                type(exc).__name__,
+            )
+        return None
+
+    async def _prepare_file_simhash_before_persist(
+        self,
+        *,
+        info: Dict[str, Any],
+        file_name: str,
+        file_size: int,
+        file_url: str,
+        extracted_text: str,
+    ) -> Tuple[str, Optional[Tuple[str, int, int]]]:
+        """Mask a parsed file and wait for the hash used by the PG duplicate gate."""
+        text = str(extracted_text or "").strip()
+        if not text:
+            return text, None
+        if learning_blocked_by_rrn_pattern(text):
+            if str(os.getenv("FILE_CRAWL_RRN_MASK_INSTEAD_OF_BLOCK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}:
+                text = mask_rrn_like_patterns(text)
+            else:
+                logger.info(
+                    "[FileSimHash][pre_persist_skipped] job_id=%s file_url=%s reason=rrn_blocked",
+                    getattr(self, "job_id", None),
+                    (file_url or "")[:220],
+                )
+                return text, None
+        from backend.file.file_learning_text_mask import mask_file_learning_text
+        from backend.shared.file_simhash_generation import generate_file_simhash_result
+
+        text, fixed_mask_count = mask_file_learning_text(text)
+        if fixed_mask_count:
+            logger.info(
+                "[FileSimHash][pre_persist_masked] job_id=%s file_url=%s replacements=%s",
+                getattr(self, "job_id", None),
+                (file_url or "")[:220],
+                fixed_mask_count,
+            )
+        generated = await generate_file_simhash_result(
+            job_id=str(getattr(self, "job_id", "") or ""),
+            learn_list_row_id=None,
+            db_name=str(getattr(self, "db_name", "") or ""),
+            chat_bot_id=str(getattr(self, "chat_bot_id", "") or ""),
+            file_url=file_url,
+            source_url=_resolve_file_detail_source_url(info),
+            title=str(file_name or "").strip(),
+            content=text,
+        )
+        if generated is None:
+            return text, None
+        identity = build_file_simhash_duplicate_key(
+            simhash_decimal=generated.value,
+            normalized_length=generated.normalized_length,
+            file_size=file_size,
+        )
+        if not identity:
+            return text, None
+        info["simhash_decimal"] = identity[0]
+        info["simhash_normalized_length"] = identity[1]
+        original_meta = dict(info.get("original_meta") or {})
+        original_meta["simhash_decimal"] = identity[0]
+        original_meta["simhash_normalized_length"] = identity[1]
+        info["original_meta"] = original_meta
+        logger.info(
+            "[FileSimHash][pre_persist_completed] job_id=%s file_url=%s hash_length=%s normalized_length=%s file_size=%s",
+            getattr(self, "job_id", None),
+            (file_url or "")[:220],
+            len(identity[0]),
+            identity[1],
+            identity[2],
+        )
+        return text, identity
 
     async def _backfill_file_pg_duplicate_source_url_if_missing(
         self,
@@ -5306,77 +5519,6 @@ class BoardContentFilePipelineMixin:
                             (file_name or os.path.basename(path or ""))[:160],
                         )
 
-    def _dispatch_file_simhash_request(
-        self,
-        *,
-        info: Dict[str, Any],
-        file_name: str,
-        extracted_text: str,
-        db_name: str,
-        chat_bot_id: str,
-        file_url: str,
-        learn_list_row_id: int,
-    ) -> None:
-        """Issue the external SimHash request without blocking persistence."""
-        if not str(extracted_text or "").strip():
-            return
-        job_id = str(getattr(self, "job_id", "") or "")
-        request_id = f"{job_id}:{int(learn_list_row_id)}"
-        source_url = _resolve_file_detail_source_url(info)
-
-        async def _request() -> None:
-            try:
-                from backend.shared.file_simhash_generation import generate_file_simhash
-
-                # The API response is intentionally discarded.  Hash backfill
-                # is a separate follow-up concern and must not delay this job.
-                await generate_file_simhash(
-                    job_id=job_id,
-                    learn_list_row_id=learn_list_row_id,
-                    db_name=db_name,
-                    chat_bot_id=chat_bot_id,
-                    file_url=file_url,
-                    source_url=source_url,
-                    title=str(file_name or "").strip(),
-                    content=extracted_text,
-                    consume_result=False,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "[FileSimHash][request_task_failed] job_id=%s post_url=%s file=%s err_type=%s",
-                    request_id,
-                    (source_url or "")[:220],
-                    (file_name or "")[:160],
-                    type(exc).__name__,
-                )
-
-        task = asyncio.create_task(
-            _request(),
-            name=f"file-simhash-request:{request_id or 'unknown'}",
-        )
-        tasks = getattr(self, "_file_simhash_request_tasks", None)
-        if not isinstance(tasks, set):
-            tasks = set()
-            self._file_simhash_request_tasks = tasks
-        tasks.add(task)
-
-        def _consume_result(done_task: asyncio.Task) -> None:
-            tasks.discard(done_task)
-            try:
-                done_task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception(
-                    "[FileSimHash][request_task_unhandled] job_id=%s file=%s",
-                    request_id,
-                    (file_name or "")[:160],
-                )
-
-        task.add_done_callback(_consume_result)
-
     @log_calls
     async def _skip_file_selection_for_rrn_pattern(
         self,
@@ -5874,36 +6016,20 @@ class BoardContentFilePipelineMixin:
             except Exception:
                 return -1
 
-        # PG source_url duplicate lookup is intentionally disabled on the file hot path.
-        # It can be slow on large training tables; LEARN_LIST subject+size below is the
-        # active duplicate guard before inserting a file row.
-
-        try:
-            size_for_duplicate = int(file_info.get("size") or file_size or 0)
-        except Exception:
-            size_for_duplicate = 0
-
-        duplicate_cache_key: Optional[Tuple[str, int]] = None
-        if file_name and size_for_duplicate > 0:
-            duplicate_cache_key = (
-                str(file_name).strip().casefold(),
-                size_for_duplicate,
-            )
-
-        duplicate_cache = getattr(self, "_file_duplicate_subject_size_cache", None)
-        if not isinstance(duplicate_cache, dict):
-            duplicate_cache = {}
-            self._file_duplicate_subject_size_cache = duplicate_cache
-        duplicate_locks = getattr(self, "_file_duplicate_subject_size_locks", None)
-        if not isinstance(duplicate_locks, dict):
-            duplicate_locks = {}
-            self._file_duplicate_subject_size_locks = duplicate_locks
-
         async def _insert_file_row(*, existing_row_id: Optional[int] = None) -> Any:
             sem = _get_file_learn_list_insert_semaphore()
             gate_started = time.perf_counter()
             async with sem:
                 gate_wait_ms = int((time.perf_counter() - gate_started) * 1000)
+                operation_prefix = (
+                    "file_learn_list_update"
+                    if existing_row_id is not None
+                    else "file_learn_list_insert"
+                )
+                self._record_file_db_operation(
+                    operation=f"{operation_prefix}_queue_wait",
+                    elapsed_sec=gate_wait_ms / 1000.0,
+                )
                 if gate_wait_ms >= 1000:
                     logger.debug(
                         "[Bottleneck][learn_list_insert_gate] waited=%sms concurrency=%s job_id=%s url=%s",
@@ -5914,6 +6040,13 @@ class BoardContentFilePipelineMixin:
                     )
                 operation_timeout_sec = _file_learn_list_db_operation_timeout_sec()
                 insert_started = time.perf_counter()
+
+                def _record_insert_stage(stage: str, elapsed_sec: float) -> None:
+                    self._record_file_db_operation(
+                        operation=f"{operation_prefix}_{stage}",
+                        elapsed_sec=elapsed_sec,
+                    )
+
                 try:
                     row_id = await asyncio.wait_for(
                         insert_into_learn_list(
@@ -5921,6 +6054,7 @@ class BoardContentFilePipelineMixin:
                             db_name=str(dbn),
                             file_info=file_info,
                             existing_row_id=existing_row_id,
+                            diagnostic_callback=_record_insert_stage,
                         ),
                         timeout=operation_timeout_sec,
                     )
@@ -5950,175 +6084,7 @@ class BoardContentFilePipelineMixin:
                         getattr(self, "job_id", None), str(dbn), elapsed_sec, str(file_name or "")[:160],
                     )
                 return row_id
-        async def _lookup_or_insert_file_row() -> Tuple[Any, bool, str]:
-            if duplicate_cache_key in duplicate_cache:
-                cached = duplicate_cache.get(duplicate_cache_key)
-                if isinstance(cached, tuple) and len(cached) >= 2:
-                    cached_id = cached[0]
-                    try:
-                        parsed_cached_id = int(cached_id or 0)
-                    except (TypeError, ValueError):
-                        parsed_cached_id = 0
-                    if parsed_cached_id > 0:
-                        if str(cached[1] or "").strip().upper() == "Y":
-                            # The first matching learned duplicate performed
-                            # its category-only backfill.  Subsequent matches
-                            # in the same job must remain a no-progress skip.
-                            return parsed_cached_id, True, str(cached[1] or "")
-                        updated_row_id = await _insert_file_row(
-                            existing_row_id=parsed_cached_id,
-                        )
-                        return updated_row_id, True, str(cached[1] or "")
-                    return cached_id, True, str(cached[1] or "")
-            elif duplicate_cache_key is not None:
-                operation_timeout_sec = _file_learn_list_db_operation_timeout_sec()
-                lookup_started = time.perf_counter()
-                try:
-                    account_identifier = await asyncio.wait_for(
-                        get_account_identifier_from_chatbot_setup(str(cid), str(dbn)),
-                        timeout=operation_timeout_sec,
-                    )
-                    learn_table = get_learn_list_table_name(account_identifier)
-                    info["_learn_list_table_name"] = learn_table
-                    duplicate_select_columns = ["`id`", "`status`"]
-                    duplicate_columns = await ensure_learn_list_standard_columns(
-                        str(dbn), learn_table
-                    )
-                    if "cate1" in duplicate_columns:
-                        duplicate_select_columns.append("`cate1`")
-                    if "cate2" in duplicate_columns:
-                        duplicate_select_columns.append("`cate2`")
-                    duplicate_rows = await asyncio.wait_for(
-                        mysql_execute_query(
-                            f"""
-                            SELECT {', '.join(duplicate_select_columns)}
-                            FROM `{learn_table}`
-                            WHERE `subject` = %s
-                              AND `size` = %s
-                              AND `content_type` = 'file'
-                            LIMIT 1
-                            """,
-                            (file_name, size_for_duplicate),
-                            fetch=True,
-                            dbname=str(dbn),
-                            op_name=(
-                                "file_duplicate_subject_size_lookup:job="
-                                f"{getattr(self, 'job_id', None) or '-'}"
-                            ),
-                        ),
-                        timeout=operation_timeout_sec,
-                    )
-                    self._record_file_db_operation(
-                        operation="file_duplicate_subject_size_lookup",
-                        elapsed_sec=time.perf_counter() - lookup_started,
-                    )
-                    lookup_elapsed_sec = time.perf_counter() - lookup_started
-                    if lookup_elapsed_sec >= 1.0:
-                        logger.warning(
-                            "[FilePersist][duplicate_lookup_slow] job_id=%s db=%s elapsed_sec=%.3f file=%s size=%s",
-                            getattr(self, "job_id", None), str(dbn), lookup_elapsed_sec, str(file_name or "")[:160], size_for_duplicate,
-                        )
-                    if duplicate_rows:
-                        duplicate_row = duplicate_rows[0]
-                        duplicate_id = (
-                            duplicate_row.get("id")
-                            if isinstance(duplicate_row, dict)
-                            else None
-                        )
-                        duplicate_status = (
-                            duplicate_row.get("status")
-                            if isinstance(duplicate_row, dict)
-                            else ""
-                        )
-                        duplicate_cache[duplicate_cache_key] = (
-                            duplicate_id,
-                            str(duplicate_status or "").strip().upper(),
-                        )
-                        try:
-                            parsed_duplicate_id = int(duplicate_id or 0)
-                        except (TypeError, ValueError):
-                            parsed_duplicate_id = 0
-                        if parsed_duplicate_id > 0:
-                            if str(duplicate_status or "").strip().upper() == "Y":
-                                # A learned duplicate must not be treated as a
-                                # newly saved/learned item.  Only fill missing
-                                # category metadata on the matched row and do
-                                # not emit Redis/SSE progress for this path.
-                                await self._resolve_file_learn_list_duplicate_row(
-                                    row=duplicate_row if isinstance(duplicate_row, dict) else {},
-                                    learn_table=learn_table,
-                                    post_url=str(file_info.get("source_url") or info.get("source_page") or info.get("source_url") or ""),
-                                    effective_job_id=str(getattr(self, "job_id", "") or ""),
-                                    new_cate1=str(file_info.get("cate1") or ""),
-                                    new_cate2=str(file_info.get("cate2") or ""),
-                                    author_meta=file_info,
-                                    emit_progress=False,
-                                    notify_scan=False,
-                                )
-                                logger.info(
-                                    "[FileCateBackfill][learned_duplicate_skip] job_id=%s row_id=%s file=%s size=%s file_url=%s",
-                                    getattr(self, "job_id", None),
-                                    parsed_duplicate_id,
-                                    str(file_name or "")[:160],
-                                    size_for_duplicate,
-                                    str(url or "")[:220],
-                                )
-                                return parsed_duplicate_id, True, str(duplicate_status or "")
-                            updated_row_id = await _insert_file_row(
-                                existing_row_id=parsed_duplicate_id,
-                            )
-                            return updated_row_id, True, str(duplicate_status or "")
-                        return duplicate_id, True, str(duplicate_status or "")
-                    duplicate_cache[duplicate_cache_key] = None
-                except asyncio.TimeoutError:
-                    info["_learn_list_ensure_failure_reason"] = "duplicate_lookup_timeout"
-                    logger.error(
-                        "[FilePersist][duplicate_lookup_timeout] job_id=%s db=%s timeout_sec=%.1f post_url=%s file_url=%s file=%s size=%s",
-                        getattr(self, "job_id", None), str(dbn), operation_timeout_sec,
-                        str(file_info.get("source_url") or "")[:220], str(url or "")[:220], str(file_name or "")[:160], size_for_duplicate,
-                    )
-                    return None, False, ""
-                except Exception as dup_exc:
-                    logger.debug(
-                        "[Duplicate][file] LEARN_LIST subject+size lookup failed open | job_id=%s file=%s size=%s source=%s err=%s",
-                        getattr(self, "job_id", None),
-                        str(file_name or "")[:120],
-                        size_for_duplicate,
-                        str(file_info.get("source_url") or info.get("source_page") or info.get("source_url") or "")[:180],
-                        dup_exc,
-                    )
-            inserted_row_id = await _insert_file_row()
-            if duplicate_cache_key is not None:
-                try:
-                    parsed_inserted_id = int(inserted_row_id or 0)
-                except Exception:
-                    parsed_inserted_id = 0
-                if parsed_inserted_id > 0:
-                    inserted_status = str(
-                        file_info.get("learn_list_existing_status") or "N"
-                    ).strip().upper()
-                    duplicate_cache[duplicate_cache_key] = (
-                        parsed_inserted_id,
-                        inserted_status,
-                    )
-            return inserted_row_id, False, ""
-
-        if duplicate_cache_key is not None:
-            duplicate_lock = duplicate_locks.get(duplicate_cache_key)
-            if not isinstance(duplicate_lock, asyncio.Lock):
-                duplicate_lock = asyncio.Lock()
-                duplicate_locks[duplicate_cache_key] = duplicate_lock
-            async with duplicate_lock:
-                row_id, matched_before_insert, matched_status = (
-                    await _lookup_or_insert_file_row()
-                )
-        else:
-            row_id, matched_before_insert, matched_status = (
-                await _lookup_or_insert_file_row()
-            )
-
-        if matched_before_insert:
-            return await _mark_duplicate(row_id, matched_status)
+        row_id = await _insert_file_row()
         if _content_author_debug_enabled():
             logger.debug(
                 "[ContentAuthorDebug][ensure.insert_result] job_id=%s row_id=%s url=%s file_author=%r file_content_author=%r duplicate=%s existing_status=%r",
@@ -6208,87 +6174,6 @@ class BoardContentFilePipelineMixin:
                     parsed_row_id,
                     repair_exc,
                 )
-        try:
-            reuse_same_category = str(
-                os.getenv("FILE_CRAWL_REUSE_SAME_CATEGORY_DUP_CHECK", "0") or "0"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            if reuse_same_category:
-                # This legacy branch used to delete the newly persisted row
-                # and reuse a same-subject/category learned row.  Subject and
-                # category alone are not a file identity, so that behavior
-                # can remove a valid file record.  File crawl now uses the
-                # subject+actual-size update path above instead.
-                logger.warning(
-                    "[FilePersist][legacy_same_category_duplicate_disabled] job_id=%s row_id=%s file=%s",
-                    getattr(self, "job_id", None),
-                    parsed_row_id,
-                    file_name,
-                )
-                reuse_same_category = False
-            if reuse_same_category and parsed_row_id > 0 and not bool(info.get("learn_list_reused_learned")):
-                account_identifier = await get_account_identifier_from_chatbot_setup(str(cid), str(dbn))
-                learn_table = get_learn_list_table_name(account_identifier)
-                info_cate1 = str(file_info.get("cate1") or "").strip()
-                info_cate2 = str(file_info.get("cate2") or "").strip()
-                dup_where = ["subject = %s", "status = 'Y'", "id <> %s"]
-                dup_params: List[Any] = [file_name, parsed_row_id]
-                if info_cate1:
-                    dup_where.append("cate1 = %s")
-                    dup_params.append(info_cate1)
-                else:
-                    dup_where.append("COALESCE(NULLIF(cate1, ''), '') = ''")
-                if info_cate2:
-                    dup_where.append("cate2 = %s")
-                    dup_params.append(info_cate2)
-                else:
-                    dup_where.append("COALESCE(NULLIF(cate2, ''), '') = ''")
-                duplicate_rows = await mysql_execute_query(
-                    f"SELECT id FROM `{learn_table}` WHERE {' AND '.join(dup_where)} LIMIT 1",
-                    tuple(dup_params),
-                    fetch=True,
-                    dbname=str(dbn),
-                )
-                try:
-                    info["_same_category_learned_duplicate_checked"] = True
-                    info["_same_category_learned_duplicate_ids"] = [
-                        int((row or {}).get("id") or 0)
-                        for row in (duplicate_rows or [])
-                        if int((row or {}).get("id") or 0) > 0
-                    ]
-                except Exception:
-                    info["_same_category_learned_duplicate_checked"] = True
-                    info["_same_category_learned_duplicate_ids"] = []
-                reuse_row_id = 0
-                if duplicate_rows:
-                    try:
-                        reuse_row_id = int((duplicate_rows[0] or {}).get("id") or 0)
-                    except Exception:
-                        reuse_row_id = 0
-                if reuse_row_id > 0 and reuse_row_id != parsed_row_id:
-                    await mysql_execute_query(
-                        f"DELETE FROM `{learn_table}` WHERE id = %s",
-                        (parsed_row_id,),
-                        dbname=str(dbn),
-                    )
-                    info["learn_list_duplicate"] = True
-                    info["learn_list_existing_status"] = "Y"
-                    info["learn_list_reused_learned"] = True
-                    row_id = reuse_row_id
-                    logger.debug(
-                        "[Duplicate][file] same-category learned row already exists; remove new pending row and reuse learned row | job_id=%s new_id=%s reuse_id=%s url=%s",
-                        getattr(self, "job_id", None),
-                        parsed_row_id,
-                        reuse_row_id,
-                        (url or "")[:180],
-                    )
-        except Exception as ex:
-            logger.debug(
-                "[Duplicate][file] failed to reuse existing learned row before counting | job_id=%s row_id=%s url=%s err=%s",
-                getattr(self, "job_id", None),
-                parsed_row_id,
-                (url or "")[:180],
-                ex,
-            )
         if not row_id:
             return None
         try:
@@ -6546,165 +6431,6 @@ class BoardContentFilePipelineMixin:
                 _record_file_study("skipped", "stop_requested")
                 await self._mark_study_done(url=save_key, outcome="skipped")
                 return
-            t_as0 = time.perf_counter()
-            if _file_pipeline_bottleneck_log_enabled():
-                logger.debug(
-                    "[Bottleneck][after_save] enter | wf_job=%s url=%s path=%s",
-                    getattr(self, "job_id", None),
-                    (url or "")[:200],
-                    (file_path or "")[:200],
-                )
-            account_id = await get_account_identifier_from_chatbot_setup(self.chat_bot_id, self.db_name)
-            learn_table = get_learn_list_table_name(account_id)
-            account_lookup_elapsed_sec = time.perf_counter() - t_as0
-            if account_lookup_elapsed_sec >= 3.0:
-                logger.warning(
-                    "[FileLearnTrace][account_table_resolve_slow] job_id=%s elapsed_sec=%.3f db=%s learn_list_id=%s file_url=%s",
-                    getattr(self, "job_id", None),
-                    account_lookup_elapsed_sec,
-                    getattr(self, "db_name", None),
-                    pre_learn_list_id,
-                    (url or "")[:220],
-                )
-            info_cate1 = str(info.get("cate1") or "").strip()
-            info_cate2 = str(info.get("cate2") or "").strip()
-
-            t_dup0 = time.perf_counter()
-            reuse_dup_check = str(
-                os.getenv("FILE_CRAWL_REUSE_SAME_CATEGORY_DUP_CHECK", "0") or "0"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            exists = None
-            if reuse_dup_check and info.get("_same_category_learned_duplicate_checked"):
-                cached_ids: List[int] = []
-                for raw_id in info.get("_same_category_learned_duplicate_ids") or []:
-                    try:
-                        parsed_id = int(raw_id)
-                    except Exception:
-                        parsed_id = 0
-                    if parsed_id > 0:
-                        cached_ids.append(parsed_id)
-                exists = [{"id": rid} for rid in cached_ids]
-            elif reuse_dup_check:
-                check_where = ["subject = %s", "status = 'Y'", "id <> %s"]
-                check_params: list[Any] = [file_name, int(pre_learn_list_id or 0)]
-                if info_cate1:
-                    check_where.append("cate1 = %s")
-                    check_params.append(info_cate1)
-                else:
-                    check_where.append("COALESCE(NULLIF(cate1, ''), '') = ''")
-                if info_cate2:
-                    check_where.append("cate2 = %s")
-                    check_params.append(info_cate2)
-                else:
-                    check_where.append("COALESCE(NULLIF(cate2, ''), '') = ''")
-                check_sql = (
-                    f"SELECT id FROM `{learn_table}` "
-                    f"WHERE {' AND '.join(check_where)} LIMIT 20"
-                )
-                exists = await mysql_execute_query(
-                    check_sql,
-                    tuple(check_params),
-                    fetch=True,
-                    dbname=self.db_name,
-                )
-            duplicate_check_elapsed_sec = time.perf_counter() - t_dup0
-            if duplicate_check_elapsed_sec >= 3.0:
-                logger.warning(
-                    "[FileLearnTrace][learn_duplicate_check_slow] job_id=%s elapsed_sec=%.3f db=%s learn_list_id=%s enabled=%s file_url=%s",
-                    getattr(self, "job_id", None),
-                    duplicate_check_elapsed_sec,
-                    getattr(self, "db_name", None),
-                    pre_learn_list_id,
-                    reuse_dup_check,
-                    (url or "")[:220],
-                )
-            if _file_pipeline_bottleneck_log_enabled():
-                logger.debug(
-                    "[Bottleneck][after_save] maria dup_check(status=Y) %sms hit=%s reused=%s | subject=%s cate1=%s cate2=%s",
-                    int((time.perf_counter() - t_dup0) * 1000),
-                    bool(exists),
-                    bool(reuse_dup_check and info.get("_same_category_learned_duplicate_checked")),
-                    (file_name or "")[:100],
-                    info_cate1 or "-",
-                    info_cate2 or "-",
-                )
-
-            duplicate_ids: Set[int] = set()
-            existing_status = str(info.get("learn_list_existing_status") or "").strip().upper()
-            if bool(info.get("learn_list_duplicate")) and existing_status == "Y" and pre_learn_list_id:
-                try:
-                    duplicate_ids.add(int(pre_learn_list_id))
-                except Exception:
-                    pass
-
-            if exists:
-                for row in exists:
-                    try:
-                        dup_id = int((row or {}).get("id"))
-                    except Exception:
-                        dup_id = 0
-                    if dup_id > 0:
-                        duplicate_ids.add(dup_id)
-
-            skip_learned_duplicate = str(
-                os.getenv("FILE_CRAWL_SKIP_LEARNED_DUPLICATE_RELEARN", "0") or "0"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            if duplicate_ids and skip_learned_duplicate:
-                logger.debug(
-                    "[Duplicate][file] learned duplicate detected during learn pipeline; keep existing learning and skip relearn | job_id=%s current_id=%s duplicate_ids=%s subject=%s size=%s",
-                    getattr(self, "job_id", None),
-                    pre_learn_list_id,
-                    sorted(duplicate_ids),
-                    (file_name or "")[:100],
-                    file_size,
-                )
-                target_summary_id = 0
-                try:
-                    if bool(info.get("learn_list_duplicate")) and existing_status == "Y" and pre_learn_list_id:
-                        target_summary_id = int(pre_learn_list_id)
-                    elif duplicate_ids:
-                        target_summary_id = sorted(duplicate_ids)[0]
-                except Exception:
-                    target_summary_id = 0
-                try:
-                    await self._record_study_skip(
-                        reason="duplicate_learn_pipeline_skip",
-                        url=url,
-                        learn_list_id=target_summary_id or pre_learn_list_id,
-                        status=existing_status,
-                        detail=f"duplicate learned rows={sorted(duplicate_ids)}",
-                    )
-                except Exception:
-                    pass
-                await self._mark_study_done(url=save_key, outcome="skipped")
-                _log_file_url_status(
-                    stage="learning",
-                    status="skipped",
-                    process_url=url,
-                    post_url=info.get("source_page") or info.get("source_url") or "",
-                    file_url=url,
-                    selected="yes",
-                    saved="yes",
-                    learn="skipped",
-                    reason="duplicate_learn_pipeline_skip",
-                    name=file_name,
-                    learn_list_id=target_summary_id or pre_learn_list_id,
-                    job_id=getattr(self, "job_id", ""),
-                    db_name=getattr(self, "db_name", ""),
-                )
-                _record_file_study("skipped", "duplicate_learn_pipeline_skip", db_id=target_summary_id or pre_learn_list_id)
-                return
-            if duplicate_ids:
-                logger.debug(
-                    "[Duplicate][file] learned duplicate detected but relearn/save continues | job_id=%s current_id=%s duplicate_ids=%s subject=%s size=%s env_skip=%s",
-                    getattr(self, "job_id", None),
-                    pre_learn_list_id,
-                    sorted(duplicate_ids),
-                    (file_name or "")[:100],
-                    file_size,
-                    skip_learned_duplicate,
-                )
-
             t_cp0 = time.perf_counter()
             logger.debug(
                 "[LearningTrace][board_file.before_copy] job_id=%s db=%s url=%s src=%s",
@@ -6998,35 +6724,6 @@ class BoardContentFilePipelineMixin:
                         getattr(self, "job_id", None),
                         (url or "")[:220],
                         fixed_mask_count,
-                    )
-                learn_list_content_url = str(info.get("_learn_list_content_url") or "").strip()
-                if extracted_text and valid_learn_list_id > 0 and learn_list_content_url:
-                    # Send the same masked file body that will be chunked for
-                    # PG learning. The external server backfills this exact row.
-                    self._dispatch_file_simhash_request(
-                        info=info,
-                        file_name=file_subject,
-                        extracted_text=extracted_text,
-                        db_name=str(getattr(self, "db_name", "") or ""),
-                        chat_bot_id=str(getattr(self, "chat_bot_id", "") or ""),
-                        file_url=learn_list_content_url,
-                        learn_list_row_id=valid_learn_list_id,
-                    )
-                    logger.info(
-                        "[FileSimHash][backfill_request_dispatched] job_id=%s db=%s row_id=%s post_url=%s file_url=%s file=%s masked_chars=%s",
-                        getattr(self, "job_id", None),
-                        getattr(self, "db_name", None),
-                        valid_learn_list_id,
-                        (info.get("source_page") or info.get("source_url") or "")[:220],
-                        (url or "")[:220],
-                        file_subject[:160],
-                        len(extracted_text),
-                    )
-                elif extracted_text:
-                    logger.warning(
-                        "[FileSimHash][backfill_request_skipped] job_id=%s row_id=%s reason=learn_list_content_unavailable",
-                        getattr(self, "job_id", None),
-                        valid_learn_list_id,
                     )
                 file_result = {
                     "source_url": url,
@@ -7442,6 +7139,17 @@ class BoardContentFilePipelineMixin:
         """Keep bounded per-job DB timing metrics without per-item success logs."""
         op = str(operation or "unknown")
         elapsed_ms = max(0.0, float(elapsed_sec or 0.0) * 1000.0)
+        try:
+            from backend.shared.file_crawl_db_diagnostics import record_file_crawl_db_operation
+
+            record_file_crawl_db_operation(
+                job_id=getattr(self, "job_id", ""),
+                db_name=getattr(self, "db_name", ""),
+                operation=op,
+                elapsed_ms=elapsed_ms,
+            )
+        except Exception:
+            pass
         metrics = getattr(self, "_file_db_operation_metrics", None)
         if not isinstance(metrics, dict):
             metrics = {}
@@ -7617,7 +7325,7 @@ class BoardContentFilePipelineMixin:
                 worker_health,
             )
             logger.info(
-                "[FileCrawlTrace][download_lanes] job_id=%s normal_queued=%s normal_unfinished=%s large_queued=%s large_unfinished=%s",
+                "[FileCrawlTrace][download_lanes] job_id=%s http_queued=%s http_unfinished=%s playwright_queued=%s playwright_unfinished=%s",
                 getattr(self, "job_id", None),
                 snapshot.get("collection_batch_queue", 0),
                 snapshot.get("collection_batch_queue_unfinished", 0),
@@ -8442,6 +8150,143 @@ class BoardContentFilePipelineMixin:
                                 file_path,
                                 url=url,
                                 file_name=file_name,
+                            )
+                        if pre_extracted_text:
+                            active_progress[trace_key]["stage"] = "simhash_pre_persist"
+                            pre_extracted_text, simhash_identity = await self._prepare_file_simhash_before_persist(
+                                info=info,
+                                file_name=file_name,
+                                file_size=file_size,
+                                file_url=url,
+                                extracted_text=pre_extracted_text,
+                            )
+                            if simhash_identity:
+                                # MariaDB duplicate matching is hash-only.  Keep the
+                                # cross-job claim on that same identity so concurrent
+                                # files with differing size metadata cannot both insert.
+                                hash_key = build_file_simhash_claim_key(simhash_identity[0]) or simhash_identity[0]
+                                hash_claim_acquired = await try_acquire_cross_job_claim(
+                                    "file_simhash",
+                                    str(getattr(self, "db_name", "") or ""),
+                                    hash_key,
+                                    str(getattr(self, "job_id", "") or ""),
+                                )
+                                matched_maria_row = await self._find_file_maria_simhash_duplicate(
+                                    simhash_decimal=simhash_identity[0],
+                                    normalized_length=simhash_identity[1],
+                                    file_size=simhash_identity[2],
+                                )
+                                if matched_maria_row or not hash_claim_acquired:
+                                    duplicate_reason = (
+                                        "maria_simhash_match_pre_persist"
+                                        if matched_maria_row
+                                        else "simhash_claim_conflict_pre_persist"
+                                    )
+                                    async with self._stats_lock:
+                                        self.stats["file_simhash_duplicate_skip_count"] = int(
+                                            self.stats.get("file_simhash_duplicate_skip_count", 0) or 0
+                                        ) + 1
+                                        self._bump_stats_revision_locked()
+                                    self._record_file_simhash_gate_result(
+                                        decision="duplicate_skip",
+                                        reason=duplicate_reason,
+                                        simhash=simhash_identity[0],
+                                        file_name=file_name,
+                                        file_url=url,
+                                        source_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                        matched_learn_list_id=(matched_maria_row or {}).get("id"),
+                                        matched_status=(matched_maria_row or {}).get("status"),
+                                    )
+                                    logger.info(
+                                        "[FileSimHash][pre_persist_duplicate_skip] job_id=%s reason=%s simhash=%s matched_learn_list_id=%s matched_status=%s file=%s file_url=%s",
+                                        getattr(self, "job_id", None),
+                                        duplicate_reason,
+                                        simhash_identity[0],
+                                        (matched_maria_row or {}).get("id") if matched_maria_row else "-",
+                                        (matched_maria_row or {}).get("status") if matched_maria_row else "-",
+                                        (file_name or "")[:160],
+                                        (url or "")[:220],
+                                    )
+                                    self._record_job_result_stage(
+                                        url=save_key,
+                                        stage="persist",
+                                        status="skipped",
+                                        reason=duplicate_reason,
+                                        source_url=info.get("source_page") or info.get("source_url"),
+                                        file_url=url,
+                                        file_name=file_name,
+                                        file_path=file_path,
+                                    )
+                                    await self._record_file_persist_outcome(
+                                        outcome="skipped",
+                                        reason=duplicate_reason,
+                                        file_url=url,
+                                        file_name=file_name,
+                                    )
+                                    await self._discard_file_crawl_local_download(
+                                        file_path,
+                                        reason=duplicate_reason,
+                                    )
+                                    await self._mark_save_skipped(url=save_key)
+                                    continue
+                                logger.info(
+                                    "[FileSimHash][pre_persist_gate] job_id=%s decision=allow_insert simhash=%s hash_claim_acquired=%s file=%s file_url=%s",
+                                    getattr(self, "job_id", None),
+                                    simhash_identity[0],
+                                    hash_claim_acquired,
+                                    (file_name or "")[:160],
+                                    (url or "")[:220],
+                                )
+                                async with self._stats_lock:
+                                    self.stats["file_simhash_gate_pass_count"] = int(
+                                        self.stats.get("file_simhash_gate_pass_count", 0) or 0
+                                    ) + 1
+                                    self._bump_stats_revision_locked()
+                                self._record_file_simhash_gate_result(
+                                    decision="allow_insert",
+                                    reason="maria_not_matched",
+                                    simhash=simhash_identity[0],
+                                    file_name=file_name,
+                                    file_url=url,
+                                    source_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                )
+                            else:
+                                logger.info(
+                                    "[FileSimHash][pre_persist_gate] job_id=%s decision=allow_insert_without_hash reason=simhash_unavailable file=%s file_url=%s",
+                                    getattr(self, "job_id", None),
+                                    (file_name or "")[:160],
+                                    (url or "")[:220],
+                                )
+                                async with self._stats_lock:
+                                    self.stats["file_simhash_gate_unavailable_allow_count"] = int(
+                                        self.stats.get("file_simhash_gate_unavailable_allow_count", 0) or 0
+                                    ) + 1
+                                    self._bump_stats_revision_locked()
+                                self._record_file_simhash_gate_result(
+                                    decision="allow_insert_without_hash",
+                                    reason="simhash_unavailable",
+                                    file_name=file_name,
+                                    file_url=url,
+                                    source_url=str(info.get("source_page") or info.get("source_url") or ""),
+                                )
+                        else:
+                            logger.info(
+                                "[FileSimHash][pre_persist_gate] job_id=%s decision=allow_insert_without_hash reason=empty_extracted_text file=%s file_url=%s",
+                                getattr(self, "job_id", None),
+                                (file_name or "")[:160],
+                                (url or "")[:220],
+                            )
+                            async with self._stats_lock:
+                                self.stats["file_simhash_gate_unavailable_allow_count"] = int(
+                                    self.stats.get("file_simhash_gate_unavailable_allow_count", 0) or 0
+                                ) + 1
+                                self._bump_stats_revision_locked()
+                            self._record_file_simhash_gate_result(
+                                decision="allow_insert_without_hash",
+                                reason="empty_extracted_text",
+                                file_name=file_name,
+                                file_url=url,
+                                source_url=str(info.get("source_page") or info.get("source_url") or ""),
                             )
                         active_progress[trace_key]["stage"] = "learn_list_ensure"
                         self._trace_file_pipeline_transition(

@@ -38,6 +38,7 @@ from backend.shared.crawl_redis_keys import (
 )
 from backend.shared.crawler_state import crawler_state
 from backend.shared.file_crawl_post_urls import load_file_crawl_post_url_strings
+from backend.shared.job_completion_summary import build_job_completion_summary
 from backend.shared.progress_contract import is_file_mode_workflow
 from db.crawl_db_manager import get_crawling_log_summary, resolve_crawling_log_id
 from db.db_redis import get_redis
@@ -209,6 +210,7 @@ def _file_processing_view(
     return {
         "status": processing_status,
         "queued_count": queued_count,
+        "download_queue_current_count": queued_count,
         "queued_total_count": queued_total_count,
         "queue_waiting_normal_count": max(0, int(queue_waiting.get("normal", 0) or 0)),
         "queue_waiting_large_count": max(0, int(queue_waiting.get("large", 0) or 0)),
@@ -217,6 +219,30 @@ def _file_processing_view(
         "study_pending_count": study_pending_count,
         "study_success_count": study_success_count,
         "study_failed_count": study_failed_count,
+    }
+
+
+def _file_simhash_gate_view(stats: Any, workflow: Any = None) -> Dict[str, Any]:
+    """Expose existing SimHash gate counters without dashboard DB queries."""
+    values = stats if isinstance(stats, dict) else {}
+
+    def count(key: str) -> int:
+        try:
+            return max(0, int(values.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    results: List[Dict[str, Any]] = []
+    raw_records = getattr(workflow, "_file_simhash_gate_results", {}) if workflow is not None else {}
+    if isinstance(raw_records, dict):
+        for item in list(raw_records.values())[-100:]:
+            if isinstance(item, dict):
+                results.append(_json_value(item))
+    return {
+        "duplicate_skip_count": count("file_simhash_duplicate_skip_count"),
+        "pass_count": count("file_simhash_gate_pass_count"),
+        "unavailable_allow_count": count("file_simhash_gate_unavailable_allow_count"),
+        "results": results,
     }
 
 
@@ -368,6 +394,7 @@ def _operational_attachment_view(
             attachment_found_count,
             queue_waiting=queue_waiting,
         ),
+        "simhash_gate": _file_simhash_gate_view(stats, workflow),
         "worker_occupancy": worker_occupancy,
         "workflow": {
             "db_name": _as_text(getattr(workflow, "db_name", "")) or _as_text(snapshot.get("db_name")),
@@ -448,6 +475,21 @@ def _job_view(job: Dict[str, Any], *, include_results: bool = False) -> Dict[str
     }
     view["event_count"] = len(job.get("events") or [])
     view["result_count"] = len(job.get("results") or [])
+    if _as_text(job.get("status")) in {"completed", "failed", "stopped"}:
+        stage = _as_text(job.get("stage"))
+        workflow_name = {
+            "start_url_load": "파일 시작 URL",
+            "attachment_extract": "파일 첨부 추출",
+            "download_validation": "파일 다운로드 검증",
+        }.get(stage, "파일 단계 검증")
+        completed_count = int(job.get("completed_count") or view["result_count"] or 0)
+        view["completion_summary"] = build_job_completion_summary(
+            {"collection_count": completed_count},
+            job_id=_as_text(job.get("job_id")) or "-",
+            workflow_name=workflow_name,
+            status=_as_text(job.get("status")),
+            processing_count=completed_count,
+        )
     if include_results:
         view["results"] = list(job.get("results") or [])
     return view
@@ -700,6 +742,7 @@ def _new_download_validation_job(
             "learning": False,
             "download_workers": runtime["total_workers"],
             "normal_download_workers": runtime["normal_workers"],
+            "playwright_download_workers": runtime["playwright_workers"],
             "large_download_workers": runtime["large_workers"],
             "download_max_concurrent": runtime["max_concurrent"],
         },
@@ -1003,18 +1046,16 @@ async def _run_download_validation(job_id: str) -> None:
                         browser_relauncher=relaunch_browser,
                         worker_id=worker_id,
                         worker_lane="normal",
-                        large_download_queue=(
-                            queues.large_collection_batch_queue if runtime["large_workers"] else None
-                        ),
+                        playwright_fallback_queue=queues.large_collection_batch_queue,
                         shared_download_semaphore=normal_semaphore,
                         item_taken_callback=record_download_worker_taken,
                     ),
                     name=f"file-crawl-stage-lab:download-normal:{job_id}:{worker_id}",
                 )
             )
-        if runtime["large_workers"]:
-            large_semaphore = asyncio.Semaphore(runtime["large_workers"])
-            for index in range(runtime["large_workers"]):
+        if runtime["playwright_workers"]:
+            playwright_semaphore = asyncio.Semaphore(runtime["playwright_workers"])
+            for index in range(runtime["playwright_workers"]):
                 worker_id = runtime["normal_workers"] + index + 1
                 worker_tasks.append(
                     asyncio.create_task(
@@ -1027,12 +1068,12 @@ async def _run_download_validation(job_id: str) -> None:
                             browser_releaser=lambda _browser: None,
                             browser_relauncher=relaunch_browser,
                             worker_id=worker_id,
-                            worker_lane="large",
-                            fallback_in_queue=queues.collection_batch_queue,
-                            shared_download_semaphore=large_semaphore,
+                            worker_lane="playwright",
+                            direct_http_enabled=False,
+                            shared_download_semaphore=playwright_semaphore,
                             item_taken_callback=record_download_worker_taken,
                         ),
-                        name=f"file-crawl-stage-lab:download-large:{job_id}:{worker_id}",
+                        name=f"file-crawl-stage-lab:download-playwright:{job_id}:{worker_id}",
                     )
                 )
         job["worker_tasks"] = worker_tasks
@@ -1045,11 +1086,11 @@ async def _run_download_validation(job_id: str) -> None:
             job["download_candidates"] = []
         job["queue_snapshot"] = queues.debug_snapshot()
         logger.info(
-            "[FileCrawlStageLab][download_queue_ready] job_id=%s db=%s normal_workers=%s large_workers=%s",
+            "[FileCrawlStageLab][download_queue_ready] job_id=%s db=%s normal_workers=%s playwright_workers=%s",
             job_id,
             job["db_name"],
             runtime["normal_workers"],
-            runtime["large_workers"],
+            runtime["playwright_workers"],
         )
 
         last_wait_event = time.monotonic()
@@ -1305,7 +1346,10 @@ async def file_crawl_stage_lab_page() -> FileResponse:
     return FileResponse(
         _HTML_PATH,
         media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "X-File-Crawl-Stage-Lab-Build": "no-idle-poll-v2",
+        },
     )
 
 
@@ -1383,6 +1427,9 @@ async def get_operational_file_crawl_job(job_id: str) -> Dict[str, Any]:
             history.get("stats") if isinstance(history.get("stats"), dict) else history,
             int(snapshot.get("attachment_found_count", 0) or 0),
         ),
+        "simhash_gate": _file_simhash_gate_view(
+            history.get("stats") if isinstance(history.get("stats"), dict) else history,
+        ),
         "worker_occupancy": [],
         "workflow": {
             "db_name": _as_text(history.get("db_name")) or _as_text(snapshot.get("db_name")),
@@ -1400,6 +1447,9 @@ async def get_operational_file_crawl_job(job_id: str) -> Dict[str, Any]:
         runtime["processing"] = _file_processing_view(
             redis_stats if isinstance(redis_stats, dict) else redis_state["state"],
             int(runtime.get("attachment_found_count", 0) or 0),
+        )
+        runtime["simhash_gate"] = _file_simhash_gate_view(
+            redis_stats if isinstance(redis_stats, dict) else redis_state["state"],
         )
     if not workflow and not history and not redis_state.get("available") and not snapshot.get("available"):
         raise HTTPException(status_code=404, detail="operational file crawl job was not found")

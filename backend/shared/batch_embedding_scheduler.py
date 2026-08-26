@@ -422,6 +422,19 @@ def _build_row_skeletons(
                 chunk_metadata.setdefault("content_size_bytes", file_size_value)
             if content_hash:
                 chunk_metadata.setdefault("content_hash", content_hash)
+            simhash_decimal = str(
+                result.get("simhash_decimal")
+                or (original_meta or {}).get("simhash_decimal")
+                or ""
+            ).strip()
+            simhash_normalized_length = str(
+                result.get("simhash_normalized_length")
+                or (original_meta or {}).get("simhash_normalized_length")
+                or ""
+            ).strip()
+            if simhash_decimal and simhash_normalized_length:
+                chunk_metadata.setdefault("simhash_decimal", simhash_decimal)
+                chunk_metadata.setdefault("simhash_normalized_length", simhash_normalized_length)
             if content_created_at not in (None, ""):
                 chunk_metadata.setdefault("content_created_at", str(content_created_at))
                 chunk_metadata.setdefault("created_at", str(content_created_at))

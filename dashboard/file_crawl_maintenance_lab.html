@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>파일 크롤링 유지보수</title>
+  <style>
+    :root { color-scheme: light; font-family: "Noto Sans KR", "Malgun Gothic", "Segoe UI", Arial, sans-serif; color: #172b40; background: #edf2f7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; }
+    main { max-width: 1320px; margin: 0 auto; }
+    h1, h2 { margin: 0; color: #102a43; } h1 { font-size: 23px; line-height: 1.3; } h2 { font-size: 15px; line-height: 1.35; }
+    main > p { margin: 7px 0 0; color: #62758a; }
+    .panel { background: #fff; border: 1px solid #c8d6e5; border-radius: 6px; padding: 18px; margin-top: 16px; box-shadow: 0 1px 1px rgba(31, 52, 73, .035); }
+    .panel > h2 { margin-bottom: 13px; }
+    .form { display: grid; grid-template-columns: minmax(120px, .55fr) minmax(200px, 1fr) minmax(200px, 1fr) minmax(150px, .7fr) minmax(110px, .45fr) repeat(4, auto); gap: 10px; align-items: end; }
+    .history-row { display: flex; gap: 9px; align-items: end; margin: 0 0 14px; }
+    .history-row label { flex: 1; }
+    .history-row select { width: 100%; height: 36px; border: 1px solid #b8c9de; border-radius: 4px; padding: 6px 9px; color: #243b53; background: #fff; }
+    label { display: grid; gap: 5px; font-size: 12px; font-weight: 700; color: #52677c; }
+    input, .form select { width: 100%; height: 38px; border: 1px solid #b8c9de; border-radius: 4px; padding: 8px 10px; color: #172b40; background: #fff; font: 14px inherit; outline: none; }
+    input:focus, select:focus { border-color: #2384e8; box-shadow: 0 0 0 3px rgba(35, 132, 232, .12); }
+    button { height: 38px; border: 1px solid #0878ef; border-radius: 4px; color: #fff; background: #0878ef; padding: 0 13px; font: 700 13px inherit; cursor: pointer; white-space: nowrap; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+    button:hover:not(:disabled) { background: #0668cf; border-color: #0668cf; }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button.secondary { color: #9a3412; border-color: #f2ad7a; background: #fff7ed; } button.secondary:hover:not(:disabled) { color: #7c2d12; border-color: #e78952; background: #ffedd5; } button:disabled { opacity: .52; cursor: wait; }
+    .notice { margin: 15px 0 8px; padding: 10px 12px; border-left: 3px solid #86b9ed; color: #52677c; background: #f5f9fd; font-size: 13px; line-height: 1.6; }
+    .status { min-height: 26px; padding: 4px 0 0; color: #075fc4; font-size: 14px; font-weight: 700; overflow-wrap: anywhere; white-space: pre-line; }
+    .progress-card { margin-top: 12px; padding: 13px; border: 1px solid #c8dcec; border-radius: 5px; background: #f8fbfe; }
+    .progress-card h2 { margin-bottom: 10px; }
+    .progress-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .progress-metric { min-width: 0; padding: 9px 10px; border: 1px solid #dbe7f2; border-radius: 4px; background: #fff; }
+    .progress-metric span { display: block; color: #62758a; font-size: 11px; font-weight: 700; }
+    .progress-metric strong { display: block; margin-top: 3px; color: #102a43; font-size: 18px; }
+    .progress-extra { margin: 10px 0 0; color: #52677c; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+    .candidate-list { margin: 0; padding-left: 19px; color: #52677c; font-size: 12px; line-height: 1.65; }
+    .candidate-list li + li { margin-top: 7px; }
+    #nasIssueList li { white-space: pre-line; }
+    .table-scroll { height: 390px; overflow: auto; border: 1px solid #d5e0eb; border-radius: 4px; background: #fff; overscroll-behavior: contain; }
+    table { width: 100%; min-width: 950px; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+    th, td { border-bottom: 1px solid #e4ebf3; padding: 10px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+    th { position: sticky; top: 0; z-index: 1; background: #f1f6fb; color: #405870; font-size: 12px; font-weight: 700; box-shadow: inset 0 -1px 0 #c8d6e5; }
+    tbody tr:nth-child(even) { background: #f8fbfe; } tbody tr:hover { background: #edf6ff; }
+    td .view, td .secondary { margin: 0 4px 4px 0; }
+    .small { font-size: 12px; line-height: 1.55; color: #62758a; }
+    .summary-cell { white-space: pre-line; }
+    .events { height: 460px; overflow: auto; margin: 0; padding: 0; border: 1px solid #d5e0eb; border-radius: 4px; background: #f9fbfd; list-style: none; overscroll-behavior: contain; }
+    .events li { padding: 10px 12px; border-bottom: 1px solid #e3ebf3; color: #344e68; font: 12px/1.55 Consolas, "D2Coding", monospace; overflow-wrap: anywhere; }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 18px; background: rgba(16, 42, 67, .42); }
+    .modal-backdrop[hidden] { display: none; }
+    .modal { width: min(640px, 100%); max-height: min(680px, calc(100vh - 36px)); display: flex; flex-direction: column; gap: 12px; padding: 18px; border-radius: 7px; background: #fff; box-shadow: 0 18px 54px rgba(16, 42, 67, .3); }
+    .modal-list { min-height: 90px; max-height: 420px; overflow: auto; padding: 10px 10px 10px 29px; border: 1px solid #d5e0eb; border-radius: 4px; background: #f8fbfe; overscroll-behavior: contain; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .events li:nth-child(even) { background: #f3f8fc; }
+    @media (max-width: 1080px) { .form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form button { width: 100%; } }
+    @media (max-width: 760px) { body { padding: 12px; } .panel { padding: 14px; } .history-row { display: grid; grid-template-columns: 1fr; align-items: stretch; } .history-row button { width: 100%; } .form { grid-template-columns: 1fr; } .progress-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .table-scroll { height: 340px; } .events { height: 340px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>파일 크롤링 유지보수</h1>
+  <p>운영 크롤링과 분리된 백필 작업입니다. 다운로드·MariaDB 저장·학습·임베딩을 실행하지 않습니다.</p>
+  <section class="panel">
+    <div class="history-row">
+      <label>입력 이력<select id="credentialHistory"><option value="">저장된 입력 이력 없음</option></select></label>
+      <button id="clearHistoryButton" class="secondary">이력 초기화</button>
+    </div>
+    <div class="form">
+      <label>DB명<input id="dbName" placeholder="예: jongno"></label>
+      <label>Chatbot ID<input id="chatBotId" placeholder="UUID"></label>
+      <label>PG Training Table<input id="pgTable" placeholder="예: td_1062bd0194ea_training_data"></label>
+      <label>대상 도메인<input id="targetDomain" placeholder="예: sb.go.kr"></label>
+      <label>Content Type<select id="contentType"><option value="file">file</option><option value="post">post</option></select></label>
+      <button id="metadataButton">메타데이터 dry-run</button>
+      <button id="metadataStopButton" class="secondary">메타데이터 중지</button>
+      <button id="simhashButton">해시 dry-run</button>
+      <button id="simhashStopButton" class="secondary">해시 중지</button>
+    </div>
+    <p class="notice">두 작업 모두 처음에는 dry-run만 실행하며, 결과의 ‘백필 승인’을 눌러야 DB 변경 또는 해시 API 요청이 실행됩니다. 메타데이터는 대상 도메인 입력이 필수이며 해당 도메인의 exploration URL만 접근합니다.</p>
+    <div id="status" class="status">대기 중</div>
+    <section id="progressCard" class="progress-card" hidden>
+      <h2>선택 작업 진행현황</h2>
+      <div class="progress-grid">
+        <div class="progress-metric"><span>총 상세페이지</span><strong id="progressTotal">0</strong></div>
+        <div class="progress-metric"><span>방문 완료</span><strong id="progressVisited">0</strong></div>
+        <div class="progress-metric"><span>첨부 목록 추출 완료</span><strong id="progressExtracted">0</strong></div>
+        <div class="progress-metric"><span>남은 상세페이지</span><strong id="progressRemaining">0</strong></div>
+      </div>
+      <p id="progressExtra" class="progress-extra"></p>
+      <p id="progressUrl" class="progress-extra"></p>
+    </section>
+    <section id="ambiguityCard" class="progress-card" hidden>
+      <h2>중복 파일명 매칭 후보</h2>
+      <p id="ambiguityNotice" class="progress-extra"></p>
+      <ol id="ambiguityList" class="candidate-list"></ol>
+    </section>
+    <section id="nasIssueCard" class="progress-card" hidden>
+      <h2>NAS 준비 제외 파일</h2>
+      <p id="nasIssueNotice" class="progress-extra"></p>
+      <ol id="nasIssueList" class="candidate-list"></ol>
+    </section>
+  </section>
+  <section class="panel">
+    <h2>작업 이력</h2>
+    <div class="table-scroll"><table><thead><tr><th>시각</th><th>구분</th><th>DB / Chatbot</th><th>상태</th><th>결과</th><th>제어</th></tr></thead><tbody id="jobs"></tbody></table></div>
+  </section>
+  <section class="panel">
+    <h2>선택 작업 이벤트</h2>
+    <ul id="events" class="events"><li>작업을 선택하면 실시간 진행 내역을 표시합니다.</li></ul>
+  </section>
+</main>
+<div id="approvalModal" class="modal-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="approvalTitle">
+  <section class="modal">
+    <h2 id="approvalTitle">백필 승인 대상 확인</h2>
+    <p id="approvalNotice" class="progress-extra"></p>
+    <ol id="approvalList" class="candidate-list modal-list"></ol>
+    <div class="modal-actions"><button id="approvalCancel" class="secondary">취소</button><button id="approvalConfirm">최종 승인</button></div>
+  </section>
+</div>
+<script>
+(() => {
+  const base = location.pathname.replace(/\/$/, '');
+  const jobsEl = document.getElementById('jobs');
+  const eventsEl = document.getElementById('events');
+  const statusEl = document.getElementById('status');
+  const progressCardEl = document.getElementById('progressCard');
+  const ambiguityCardEl = document.getElementById('ambiguityCard');
+  const nasIssueCardEl = document.getElementById('nasIssueCard');
+  const approvalModalEl = document.getElementById('approvalModal');
+  const historyEl = document.getElementById('credentialHistory');
+  const historyKey = 'file-crawl-maintenance-lab.credentials.v1';
+  let source = null;
+  let pendingApprovalJobId = '';
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const credentials = () => ({ db_name: document.getElementById('dbName').value.trim(), chat_bot_id: document.getElementById('chatBotId').value.trim(), pg_table: document.getElementById('pgTable').value.trim(), target_domain: document.getElementById('targetDomain').value.trim(), content_type: document.getElementById('contentType').value });
+  function loadCredentialHistory() {
+    try { const parsed = JSON.parse(localStorage.getItem(historyKey) || '[]'); return Array.isArray(parsed) ? parsed.filter(item => item && item.db_name && item.chat_bot_id) : []; }
+    catch (_) { return []; }
+  }
+  function renderCredentialHistory() {
+    const entries = loadCredentialHistory();
+    historyEl.innerHTML = '<option value="">입력 이력 선택</option>' + entries.map((item, index) => `<option value="${index}">${esc(item.db_name)} | ${esc(item.chat_bot_id)} | ${esc(item.target_domain || '-')} | ${esc(item.content_type || 'file')}</option>`).join('');
+  }
+  function saveCredentials() {
+    const current = credentials();
+    if (!current.db_name || !current.chat_bot_id) return;
+    const entries = loadCredentialHistory().filter(item => item.db_name !== current.db_name || item.chat_bot_id !== current.chat_bot_id || (item.pg_table || '') !== current.pg_table || (item.target_domain || '') !== current.target_domain || (item.content_type || 'file') !== current.content_type);
+    entries.unshift(current); localStorage.setItem(historyKey, JSON.stringify(entries.slice(0, 20)));
+    renderCredentialHistory();
+  }
+  async function request(path, options = {}) {
+    const response = await fetch(base + path, { headers: { 'Content-Type': 'application/json' }, ...options });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || '요청 실패');
+    return body;
+  }
+  function progressSummary(progress) {
+    if (!progress || !Number(progress.exploration_urls || 0)) return '';
+    const n = value => Number(value || 0).toLocaleString('ko-KR');
+    return `방문 ${n(progress.visited_details)}/${n(progress.exploration_urls)} · 목록 추출 ${n(progress.attachment_lists_extracted_details)} · 남음 ${n(progress.remaining_details)}`;
+  }
+  function renderProgress(progress) {
+    if (!progress || !Number(progress.exploration_urls || 0)) return;
+    const n = value => Number(value || 0).toLocaleString('ko-KR');
+    progressCardEl.hidden = false;
+    document.getElementById('progressTotal').textContent = n(progress.exploration_urls);
+    document.getElementById('progressVisited').textContent = n(progress.visited_details);
+    document.getElementById('progressExtracted').textContent = n(progress.attachment_lists_extracted_details);
+    document.getElementById('progressRemaining').textContent = n(progress.remaining_details);
+    document.getElementById('progressExtra').textContent = `발견 파일 ${n(progress.attachments_found)} · 파일명 DB 매칭 ${n(progress.attachment_matches)} · 작성자 ${n(progress.author_extracted_pages)} · 등록일 ${n(progress.reg_date_extracted_pages)}`;
+    document.getElementById('progressUrl').textContent = progress.last_source_url ? `마지막 처리: ${progress.last_source_url}` : '';
+  }
+  function renderAmbiguousCandidates(candidates) {
+    const items = Array.isArray(candidates) ? candidates : [];
+    ambiguityCardEl.hidden = !items.length;
+    if (!items.length) return;
+    document.getElementById('ambiguityNotice').textContent = `아래 ${items.length.toLocaleString('ko-KR')}건은 파일명만으로 하나의 대상에 확정할 수 없어 자동 백필에서 제외했습니다.`;
+    const list = document.getElementById('ambiguityList');
+    list.innerHTML = '';
+    for (const item of items) {
+      const li = document.createElement('li');
+      const ids = (item.learn_list_ids || []).join(', ') || '-';
+      const urls = (item.source_urls || []).join(' | ') || '-';
+      li.textContent = `${item.file || '-'} · LEARN_LIST ID: ${ids} · 상세 URL: ${urls}`;
+      list.appendChild(li);
+    }
+  }
+  function renderNasUnavailable(items) {
+    const details = Array.isArray(items) ? items : [];
+    nasIssueCardEl.hidden = !details.length;
+    if (!details.length) return;
+    document.getElementById('nasIssueNotice').textContent = `NAS에서 준비하지 못한 ${details.length.toLocaleString('ko-KR')}건입니다. 후보 경로와 파일 상태를 확인하세요.`;
+    const list = document.getElementById('nasIssueList');
+    list.innerHTML = '';
+    for (const item of details) {
+      const li = document.createElement('li');
+      const candidates = (item.candidates || []).map(candidate => `${candidate.path} [exists=${candidate.exists}, file=${candidate.is_file}]`).join(' / ') || '-';
+      li.textContent = `${item.file || '-'}\n· LEARN_LIST ID: ${item.learn_list_id || '-'} · 사유: ${item.reason || '-'}\n기존 경로: ${item.content_address || '-'}\nNAS 후보: ${candidates}`;
+      list.appendChild(li);
+    }
+  }
+  function metadataSummary(data) {
+    const n = value => Number(value || 0).toLocaleString('ko-KR');
+    const visited = data.visited_details ?? data.detail_scanned;
+    const lines = [
+      `탐색 URL ${n(data.exploration_urls)}건 · 상세페이지 방문 ${n(visited)}건 · 남음 ${n(data.remaining_details)}`,
+      `첨부파일 발견 ${n(data.attachments_found)}건 · 파일명 매칭 ${n(data.attachment_matches)}건 · 상세페이지 확정 ${n(data.first_detail_matches)}건`,
+      `중복 파일명 후보 ${n(data.ambiguous_filename_candidate_count)}건 (자동 백필 제외)`,
+      `작성자 추출 ${n(data.author_extracted_pages)}건 · 등록일 추출 ${n(data.reg_date_extracted_pages)}건`,
+      `PG 조회 행 ${n(data.pg_rows)}건 · 기존 source_url ${n(data.source_already_present)}건`,
+      `백필 예정 파일 ${n(data.planned_learn_rows)}건 · PG 행 ${n(data.planned_pg_rows)}건`,
+    ];
+    return lines.join('\n');
+  }
+  function simhashSummary(data) {
+    if (data.dry_run) {
+      return 'dry-run 완료';
+    }
+    const failed = Number(data.update_failed || 0);
+    if (failed) return `해시 업데이트 실패(${failed.toLocaleString('ko-KR')})`;
+    return `해시 업데이트 완료(${Number(data.updated || 0).toLocaleString('ko-KR')})`;
+  }
+  function simhashProgress(data) {
+    const current = Number(data.processed_rows || 0);
+    const total = Number(data.total_rows || 0);
+    return total > 0 ? ` · ${current.toLocaleString('ko-KR')} / ${total.toLocaleString('ko-KR')}건 처리` : '';
+  }
+  function executionHealthText(health) {
+    const state = health?.state || '';
+    const age = Number(health?.activity_age_seconds || 0).toLocaleString('ko-KR');
+    const label = ({ processing:'처리 중', waiting:'응답 대기', dead:'비정상 종료 감지', awaiting_approval:'승인 대기', completed:'완료', failed:'실패', stopped:'중지' })[state] || '상태 확인 중';
+    return `${label} · 마지막 처리 ${age}초 전`;
+  }
+  function summary(job) {
+    if (job.status === 'running') return progressSummary(job.progress) || '-';
+    if (['completed','failed','stopped'].includes(job.status) && job.completion_summary?.text) return job.completion_summary.text;
+    if (job.mode === 'metadata' && job.summary && Object.keys(job.summary).length) return metadataSummary(job.summary);
+    if (job.mode === 'simhash' && job.summary && Object.keys(job.summary).length) return simhashSummary(job.summary);
+    return Object.entries(job.summary || {}).map(([k,v]) => `${k}=${v}`).join(', ') || '-';
+  }
+  function modeLabel(mode) { return mode === 'metadata' ? '메타데이터 백필' : '해시 백필'; }
+  function statusLabel(status) { return ({ queued:'대기', running:'실행 중', awaiting_approval:'승인 대기', applying:'백필 적용 중', completed:'완료', failed:'실패', stopped:'중지' })[status] || status || '-'; }
+  function updateRunningStatus(data) {
+    const mode = modeLabel(data.mode);
+    if (data.event === 'execution_heartbeat') {
+      const progressLine = (statusEl.textContent || '작업 실행 상태').split('\n')[0];
+      statusEl.textContent = `${progressLine}\n${executionHealthText(data.execution_health)}`;
+      return;
+    }
+    if (data.event === 'backfill_started') {
+      statusEl.textContent = `${mode} 작업 실행 중`;
+      return;
+    }
+    if (data.event === 'metadata_scan_started') {
+      statusEl.textContent = `${mode} 작업 실행 중 · 탐색 URL ${Number(data.exploration_urls || 0).toLocaleString('ko-KR')}건`;
+      return;
+    }
+    if (data.event === 'metadata_scan_progress') {
+      renderProgress(data);
+      statusEl.textContent = `${mode} 작업 실행 중 · ${progressSummary(data)}`;
+      return;
+    }
+    if (data.event === 'simhash_nas_prepared') {
+      const phase = data.dry_run === false ? '백필' : 'dry-run';
+      statusEl.textContent = `${mode} ${phase} 실행 중${simhashProgress(data)} · NAS 파일 준비`;
+      return;
+    }
+    if (data.event === 'simhash_dry_run_prepared') {
+      statusEl.textContent = `${mode} dry-run 실행 중${simhashProgress(data)} · 승인 대상 확인`;
+      return;
+    }
+    if (data.event === 'simhash_updated' || data.event === 'simhash_dispatched') {
+      statusEl.textContent = `${mode} 백필 실행 중${simhashProgress(data)} · 해시 업데이트`;
+      return;
+    }
+    if (data.event === 'simhash_skipped') {
+      if (Array.isArray(data.candidates)) renderNasUnavailable([data]);
+      const error = data.error ? ` · ${data.error}` : '';
+      const phase = data.dry_run === false ? '백필' : 'dry-run';
+      statusEl.textContent = `${mode} ${phase} 실행 중${simhashProgress(data)} · 제외 (${data.reason || '-'})${error}`;
+      return;
+    }
+    if (data.event === 'metadata_dry_run_ready' || data.event === 'metadata_approval_required' || data.event === 'simhash_approval_required') {
+      renderAmbiguousCandidates(data.ambiguous_filename_candidates);
+      renderNasUnavailable((data.summary || data).nas_unavailable_details);
+      const dryRun = data.summary || data;
+      if (data.mode === 'simhash') {
+        const planned = Number(dryRun.planned_learn_rows || 0).toLocaleString('ko-KR');
+        const nasExcluded = Number(dryRun.nas_missing || 0).toLocaleString('ko-KR');
+        statusEl.textContent = `${modeLabel(data.mode)} dry-run 완료 · 백필 승인 대기(${planned})${Number(dryRun.nas_missing || 0) ? `\nNAS 제외(${nasExcluded})` : ''}`;
+      } else {
+        statusEl.textContent = `${modeLabel(data.mode)} dry-run 완료 · 백필 승인 대기\n${metadataSummary(dryRun)}`;
+      }
+      return;
+    }
+    if (data.event === 'metadata_backfill_apply_queued' || data.event === 'metadata_backfill_apply_started') {
+      statusEl.textContent = `메타데이터 백필 적용 중${Number(data.planned_rows || 0) ? ` · ${Number(data.planned_rows).toLocaleString('ko-KR')}건` : ''}`;
+      return;
+    }
+    if (data.event === 'simhash_backfill_apply_queued' || data.event === 'simhash_backfill_apply_started') {
+      statusEl.textContent = `해시 백필 적용 중${Number(data.planned_rows || 0) ? ` · ${Number(data.planned_rows).toLocaleString('ko-KR')}건` : ''}`;
+    }
+  }
+  function renderJobs(items) {
+    jobsEl.innerHTML = items.map(job => `<tr><td>${esc(job.created_at)}</td><td>${job.mode === 'metadata' ? '메타데이터' : '해시'}</td><td>${esc(job.db_name)}<br><span class="small">${esc(job.chat_bot_id)}<br>${esc(job.pg_table || '-')} · ${esc(job.target_domain || '-')} · ${esc(job.content_type || 'file')}</span></td><td>${esc(statusLabel(job.status))}</td><td class="small summary-cell">${esc(summary(job))}<br>${esc(job.error || '')}</td><td><button data-job="${esc(job.job_id)}" class="view">보기</button> ${job.status === 'awaiting_approval' ? `<button data-approve="${esc(job.job_id)}">백필 승인</button>` : ''} ${['queued','running','awaiting_approval','applying'].includes(job.status) ? `<button data-stop="${esc(job.job_id)}" class="secondary">중지</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="6">작업 이력이 없습니다.</td></tr>';
+  }
+  async function refresh() { try { renderJobs((await request('/api/jobs')).jobs || []); } catch (e) { statusEl.textContent = e.message; } }
+  function showEvents(jobId) {
+    if (source) source.close();
+    eventsEl.innerHTML = '<li>연결 중...</li>';
+    progressCardEl.hidden = true;
+    ambiguityCardEl.hidden = true;
+    nasIssueCardEl.hidden = true;
+    source = new EventSource(base + '/api/jobs/' + encodeURIComponent(jobId) + '/events');
+    source.addEventListener('maintenance', event => { const data = JSON.parse(event.data); updateRunningStatus(data); if (data.event !== 'execution_heartbeat') eventsEl.insertAdjacentHTML('afterbegin', `<li><b>${esc(data.at)}</b> ${esc(data.event)}<br>${esc(JSON.stringify(data))}</li>`); refresh(); });
+    source.addEventListener('terminal', event => { const data = JSON.parse(event.data); renderAmbiguousCandidates(data.ambiguous_filename_candidates); renderNasUnavailable((data.summary || data).nas_unavailable_details); statusEl.textContent = `작업 ${statusLabel(data.status)}\n${summary(data)}`; refresh(); source.close(); source = null; });
+    source.onerror = () => { if (source) { source.close(); source = null; } };
+  }
+  async function start(mode) {
+    const body = credentials();
+    if (!body.db_name || !body.chat_bot_id || (mode === 'metadata' && !body.pg_table)) { statusEl.textContent = mode === 'metadata' ? 'DB명, Chatbot ID, PG Training Table을 입력하세요.' : 'DB명과 Chatbot ID를 입력하세요.'; return; }
+    if (mode === 'metadata' && !body.target_domain) { statusEl.textContent = '메타데이터 백필은 대상 도메인을 입력하세요.'; return; }
+    saveCredentials();
+    statusEl.textContent = `${modeLabel(mode)} 작업 생성 중`;
+    try { const job = await request('/api/jobs', { method: 'POST', body: JSON.stringify({ ...body, mode }) }); showEvents(job.job_id); await refresh(); }
+    catch (e) { statusEl.textContent = e.message; }
+  }
+  async function stopMode(mode) {
+    try {
+      const result = await request('/api/modes/' + mode + '/stop', { method: 'POST' });
+      statusEl.textContent = `${mode === 'metadata' ? '메타데이터' : '해시'} 작업 ${result.count}건 중지 요청`;
+      if (source) { source.close(); source = null; }
+      await refresh();
+    } catch (e) { statusEl.textContent = e.message; }
+  }
+  function closeApprovalModal() {
+    pendingApprovalJobId = '';
+    approvalModalEl.hidden = true;
+  }
+  async function openApprovalModal(jobId) {
+    const job = await request('/api/jobs/' + encodeURIComponent(jobId));
+    const items = Array.isArray(job.approval_preview) ? job.approval_preview : [];
+    if (!items.length) throw new Error('승인 대상 파일 정보를 찾을 수 없습니다.');
+    pendingApprovalJobId = jobId;
+    document.getElementById('approvalNotice').textContent = `아래 ${items.length.toLocaleString('ko-KR')}건을 확인한 뒤 최종 승인하면 백필을 시작합니다.`;
+    const list = document.getElementById('approvalList');
+    list.innerHTML = '';
+    for (const item of items) {
+      const li = document.createElement('li');
+      const filename = item.file || item.subject || '-';
+      const rowId = item.learn_list_id || item.id || '-';
+      li.textContent = `${filename} · LEARN_LIST ID: ${rowId}${item.nas_path ? `\nNAS 경로: ${item.nas_path}` : ''}`;
+      list.appendChild(li);
+    }
+    approvalModalEl.hidden = false;
+  }
+  document.getElementById('metadataButton').onclick = () => start('metadata');
+  document.getElementById('metadataStopButton').onclick = () => stopMode('metadata');
+  document.getElementById('simhashButton').onclick = () => start('simhash');
+  document.getElementById('simhashStopButton').onclick = () => stopMode('simhash');
+  document.getElementById('approvalCancel').onclick = closeApprovalModal;
+  document.getElementById('approvalConfirm').onclick = async () => {
+    if (!pendingApprovalJobId) return;
+    const jobId = pendingApprovalJobId;
+    document.getElementById('approvalConfirm').disabled = true;
+    try {
+      statusEl.textContent = '백필 승인 요청 중';
+      const approved = await request('/api/jobs/' + encodeURIComponent(jobId) + '/approve', { method: 'POST' });
+      closeApprovalModal();
+      statusEl.textContent = `${modeLabel(approved.mode)} 백필 적용 중`;
+      showEvents(jobId);
+      await refresh();
+    } catch (e) {
+      statusEl.textContent = e.message;
+    } finally {
+      document.getElementById('approvalConfirm').disabled = false;
+    }
+  };
+  historyEl.onchange = () => {
+    if (historyEl.value === '') return;
+    const selected = loadCredentialHistory()[Number(historyEl.value)];
+    if (!selected) return;
+    document.getElementById('dbName').value = selected.db_name;
+    document.getElementById('chatBotId').value = selected.chat_bot_id;
+    document.getElementById('pgTable').value = selected.pg_table || '';
+    document.getElementById('targetDomain').value = selected.target_domain || '';
+    document.getElementById('contentType').value = selected.content_type || 'file';
+  };
+  document.getElementById('clearHistoryButton').onclick = () => {
+    localStorage.removeItem(historyKey); renderCredentialHistory(); statusEl.textContent = '입력 이력을 초기화했습니다.';
+  };
+  jobsEl.onclick = async event => {
+    const view = event.target.closest('[data-job]'); const approve = event.target.closest('[data-approve]'); const stop = event.target.closest('[data-stop]');
+    if (view) showEvents(view.dataset.job);
+    if (approve) { try { await openApprovalModal(approve.dataset.approve); } catch (e) { statusEl.textContent = e.message; } }
+    if (stop && confirm('이 유지보수 작업만 중지합니다.')) { await request('/api/jobs/' + encodeURIComponent(stop.dataset.stop) + '/stop', { method: 'POST' }); await refresh(); }
+  };
+  // Idle dashboard opening must not create background API traffic.  Running
+  // jobs publish progress through their own SSE connection instead.
+  renderCredentialHistory();
+})();
+</script>
+</body>
+</html>

@@ -57,13 +57,16 @@ stage names is `backend/file/file_crawl_stage_contract.py`.
    input: file_meta
    output: download_local_saved event
    preserve: attachment_name, saved_filename, storage_filename, original_meta
-   rule: remote work ends after response validation and atomic local file move
+   rule: remote work ends after response transfer and temporary-file write.
+         The worker passes the temp path, final path and response metadata to
+         local_file_finalize without waiting for local verification.
 
 9. local_file_finalize
    owner: BoardContentFilePipelineMixin local finalize workers
    input: download_local_saved event
    output: file_saved event
-   work: local file readiness, document metadata, storage sync
+   work: temporary-file stability check, size/HTML/HWPX integrity validation,
+         atomic final move, document metadata
    rule: this bounded local queue must not occupy a remote download worker
 
 10. save_event_handle
@@ -72,19 +75,28 @@ stage names is `backend/file/file_crawl_stage_contract.py`.
    output: learn_list file_info
    preserve: original_meta, attachment_name, cate1/cate2
 
-11. learn_list_row_ensure
+11. file_simhash_duplicate_gate
+   owner: BoardContentFilePipelineMixin._prepare_file_simhash_before_persist
+   input: parsed file text, masked file text, actual file size
+   output: SimHash duplicate decision, masked text, SimHash metadata
+   rule: synchronously generate the decimal SimHash from the masked file body.
+         A matching MariaDB LEARN_LIST hash skips persistence and learning.
+         SimHash generation failure is fail-open and continues without a hash.
+
+12. learn_list_row_ensure
    owner: _ensure_learn_list_row_for_file_save
    input: saved file_info
    output: insert_into_learn_list call
    preserve: subject candidates, category candidates, content URL
 
-12. learn_list_persist
+13. learn_list_persist
    owner: db.mariadb_save_update.insert_into_learn_list
    input: file_info
    output: LEARN_LIST insert/update
     decision:
       subject = _resolve_file_learning_subject(file_info)
       cate = coalesce_learn_list_cates(file_info)
+      hash = file_info.simhash_decimal when the SimHash gate succeeded
 ```
 
 ## Boundary Rules
@@ -106,8 +118,8 @@ stage names is `backend/file/file_crawl_stage_contract.py`.
 
 ## Local Postprocess Settings
 
-- FILE_CRAWL_DEFER_LOCAL_POSTPROCESS=1 enables the split stage for file
-  crawls that use defer_save_batch_until_learn_list.
+- File crawls using `defer_save_batch_until_learn_list` always use the split
+  local finalization stage so a download worker never waits on local checks.
 - FILE_CRAWL_LOCAL_FINALIZE_WORKERS defaults to 2.
 - FILE_CRAWL_LOCAL_FINALIZE_QUEUE_MAXSIZE defaults to 100.
 - FILE_PIPELINE_COLLECTION_QUEUE_MAXSIZE defaults to 500 for file crawls only;

@@ -28,6 +28,9 @@ _workers: list[asyncio.Task] = []
 _log_queue: Optional[asyncio.Queue[_DBWriteJob]] = None
 _log_queue_loop: Optional[asyncio.AbstractEventLoop] = None
 _log_workers: list[asyncio.Task] = []
+_learning_queue: Optional[asyncio.Queue[_DBWriteJob]] = None
+_learning_queue_loop: Optional[asyncio.AbstractEventLoop] = None
+_learning_workers: list[asyncio.Task] = []
 _ensure_lock = asyncio.Lock()
 _active = 0
 _completed = 0
@@ -68,6 +71,19 @@ def db_write_log_queue_workers() -> int:
         value = 1
     return max(1, min(value, 32))
 
+
+def db_write_learning_queue_enabled() -> bool:
+    raw = str(os.getenv("DB_WRITE_LEARNING_QUEUE_ENABLED", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def db_write_learning_queue_workers() -> int:
+    try:
+        value = int((os.getenv("DB_WRITE_LEARNING_QUEUE_WORKERS") or "1").strip())
+    except Exception:
+        value = 1
+    return max(1, min(value, 16))
+
 def db_write_queue_maxsize() -> int:
     try:
         value = int((os.getenv("DB_WRITE_QUEUE_MAXSIZE") or "5000").strip())
@@ -79,6 +95,14 @@ def db_write_queue_maxsize() -> int:
 def db_write_log_queue_maxsize() -> int:
     try:
         value = int((os.getenv("DB_WRITE_LOG_QUEUE_MAXSIZE") or "1000").strip())
+    except Exception:
+        value = 1000
+    return max(1, min(value, 100000))
+
+
+def db_write_learning_queue_maxsize() -> int:
+    try:
+        value = int((os.getenv("DB_WRITE_LEARNING_QUEUE_MAXSIZE") or "1000").strip())
     except Exception:
         value = 1000
     return max(1, min(value, 100000))
@@ -101,6 +125,16 @@ def _is_log_db_write(label: str) -> bool:
     return normalized.startswith(("crawling_log.", "crawling_log_"))
 
 
+def db_write_queue_kind_for_label(label: str) -> str:
+    """Keep long-running embedding presave work away from file persistence."""
+    if _is_log_db_write(label):
+        return "log"
+    normalized = str(label or "").strip().lower()
+    if db_write_learning_queue_enabled() and normalized.startswith("batch_embedding.presave_rows"):
+        return "learning"
+    return "default"
+
+
 async def run_db_write(
     label: str,
     callback: Callable[[], Any],
@@ -114,8 +148,8 @@ async def run_db_write(
         return result
 
     loop = asyncio.get_running_loop()
-    is_log_write = _is_log_db_write(label)
-    queue = await _ensure_queue(loop, log_queue=is_log_write)
+    queue_kind = db_write_queue_kind_for_label(label)
+    queue = await _ensure_queue(loop, queue_kind=queue_kind)
     future = loop.create_future()
     enqueued_at = time.monotonic()
     await queue.put(_DBWriteJob(label=str(label or "db_write"), callback=callback, future=future, enqueued_at=enqueued_at))
@@ -130,7 +164,7 @@ async def run_db_write(
             logger.warning(
                 "[DBWriteQueue] wait timeout | label=%s queue=%s timeout=%.1fs wait_elapsed=%.3fs timeout_overrun=%.3fs queue_wait_before_wait=%.3fs pending=%s active=%s completed=%s failed=%s workers=%s/%s maxsize=%s active_jobs=%s",
                 label,
-                "log" if is_log_write else "default",
+                queue_kind,
                 timeout,
                 wait_elapsed,
                 max(0.0, wait_elapsed - timeout),
@@ -154,10 +188,11 @@ def _next_worker_id() -> int:
     return _worker_id_seq
 
 
-async def _ensure_queue(loop: asyncio.AbstractEventLoop, *, log_queue: bool = False) -> asyncio.Queue[_DBWriteJob]:
+async def _ensure_queue(loop: asyncio.AbstractEventLoop, *, queue_kind: str = "default") -> asyncio.Queue[_DBWriteJob]:
     global _queue, _queue_loop, _workers, _log_queue, _log_queue_loop, _log_workers
+    global _learning_queue, _learning_queue_loop, _learning_workers
     async with _ensure_lock:
-        if log_queue:
+        if queue_kind == "log":
             if _log_queue_loop is not loop:
                 _log_queue = asyncio.Queue(maxsize=db_write_log_queue_maxsize())
                 _log_queue_loop = loop
@@ -167,8 +202,21 @@ async def _ensure_queue(loop: asyncio.AbstractEventLoop, *, log_queue: bool = Fa
             alive_workers = [task for task in _log_workers if not task.done()]
             _log_workers[:] = alive_workers
             while len(_log_workers) < db_write_log_queue_workers():
-                _log_workers.append(loop.create_task(_db_write_worker(_next_worker_id(), log_queue=True)))
+                _log_workers.append(loop.create_task(_db_write_worker(_next_worker_id(), queue_kind="log")))
             return _log_queue
+
+        if queue_kind == "learning":
+            if _learning_queue_loop is not loop:
+                _learning_queue = asyncio.Queue(maxsize=db_write_learning_queue_maxsize())
+                _learning_queue_loop = loop
+                _learning_workers = []
+            if _learning_queue is None:
+                _learning_queue = asyncio.Queue(maxsize=db_write_learning_queue_maxsize())
+            alive_workers = [task for task in _learning_workers if not task.done()]
+            _learning_workers[:] = alive_workers
+            while len(_learning_workers) < db_write_learning_queue_workers():
+                _learning_workers.append(loop.create_task(_db_write_worker(_next_worker_id(), queue_kind="learning")))
+            return _learning_queue
 
         if _queue_loop is not loop:
             _queue = asyncio.Queue(maxsize=db_write_queue_maxsize())
@@ -179,14 +227,19 @@ async def _ensure_queue(loop: asyncio.AbstractEventLoop, *, log_queue: bool = Fa
         alive_workers = [task for task in _workers if not task.done()]
         _workers[:] = alive_workers
         while len(_workers) < db_write_queue_workers():
-            _workers.append(loop.create_task(_db_write_worker(_next_worker_id())))
+            _workers.append(loop.create_task(_db_write_worker(_next_worker_id(), queue_kind="default")))
         return _queue
 
 
-async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
+async def _db_write_worker(worker_id: int, *, queue_kind: str = "default") -> None:
     global _active, _completed, _failed
     while True:
-        queue = _log_queue if log_queue else _queue
+        if queue_kind == "log":
+            queue = _log_queue
+        elif queue_kind == "learning":
+            queue = _learning_queue
+        else:
+            queue = _queue
         if queue is None:
             await asyncio.sleep(0.05)
             continue
@@ -196,7 +249,7 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
         queue_wait_sec = max(0.0, started_at - job.enqueued_at)
         _active_jobs[worker_id] = {
             "label": job.label,
-            "queue": "log" if log_queue else "default",
+            "queue": queue_kind,
             "wait_sec": round(max(0.0, started_at - job.enqueued_at), 3),
             "started_at": started_at,
             "started_ago_sec": 0.0,
@@ -208,7 +261,7 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
                 "[DBWriteQueue] slow queue wait | worker=%s label=%s queue=%s wait=%.3fs slow=%.3fs pending=%s",
                 worker_id,
                 job.label,
-                "log" if log_queue else "default",
+                queue_kind,
                 queue_wait_sec,
                 slow_sec,
                 queue.qsize(),
@@ -265,14 +318,19 @@ async def _db_write_worker(worker_id: int, *, log_queue: bool = False) -> None:
 def db_write_queue_status() -> Dict[str, Any]:
     queue = _queue
     log_queue = _log_queue
+    learning_queue = _learning_queue
     workers = list(_workers)
     log_workers = list(_log_workers)
+    learning_workers = list(_learning_workers)
     pending = queue.qsize() if queue is not None else 0
     log_pending = log_queue.qsize() if log_queue is not None else 0
+    learning_pending = learning_queue.qsize() if learning_queue is not None else 0
     default_workers_configured = db_write_queue_workers()
     log_workers_configured = db_write_log_queue_workers() if db_write_log_queue_enabled() else 0
+    learning_workers_configured = db_write_learning_queue_workers() if db_write_learning_queue_enabled() else 0
     default_workers_alive = sum(1 for task in workers if not task.done())
     log_workers_alive = sum(1 for task in log_workers if not task.done())
+    learning_workers_alive = sum(1 for task in learning_workers if not task.done())
     now = time.monotonic()
     active_jobs = []
     for worker_id, meta in sorted(_active_jobs.items()):
@@ -286,21 +344,26 @@ def db_write_queue_status() -> Dict[str, Any]:
     return {
         "enabled": db_write_queue_enabled(),
         "log_queue_enabled": db_write_log_queue_enabled(),
-        "pending": pending + log_pending,
+        "learning_queue_enabled": db_write_learning_queue_enabled(),
+        "pending": pending + log_pending + learning_pending,
         "default_pending": pending,
         "log_pending": log_pending,
+        "learning_pending": learning_pending,
         "active": _active,
         "completed": _completed,
         "failed": _failed,
-        "workers_configured": default_workers_configured + log_workers_configured,
-        "workers_alive": default_workers_alive + log_workers_alive,
+        "workers_configured": default_workers_configured + log_workers_configured + learning_workers_configured,
+        "workers_alive": default_workers_alive + log_workers_alive + learning_workers_alive,
         "default_workers_configured": default_workers_configured,
         "default_workers_alive": default_workers_alive,
         "log_workers_configured": log_workers_configured,
         "log_workers_alive": log_workers_alive,
-        "maxsize": db_write_queue_maxsize() + (db_write_log_queue_maxsize() if db_write_log_queue_enabled() else 0),
+        "learning_workers_configured": learning_workers_configured,
+        "learning_workers_alive": learning_workers_alive,
+        "maxsize": db_write_queue_maxsize() + (db_write_log_queue_maxsize() if db_write_log_queue_enabled() else 0) + (db_write_learning_queue_maxsize() if db_write_learning_queue_enabled() else 0),
         "default_maxsize": db_write_queue_maxsize(),
         "log_maxsize": db_write_log_queue_maxsize() if db_write_log_queue_enabled() else 0,
+        "learning_maxsize": db_write_learning_queue_maxsize() if db_write_learning_queue_enabled() else 0,
         "active_jobs": active_jobs,
     }
 

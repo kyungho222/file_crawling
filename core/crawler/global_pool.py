@@ -29,6 +29,7 @@ import time
 from playwright.async_api import async_playwright, Browser
 
 from config.settings import settings
+from core.crawler.file_download_topology import file_crawl_download_topology
 from core.crawler.queues import JobQueues
 from core.crawler.workers.scan import scan_worker
 from core.crawler.workers.collection import collection_worker
@@ -49,6 +50,7 @@ from core.crawler.browser_launch import (
     get_default_navigation_timeout_ms,
     get_default_timeout_ms,
 )
+from core.crawler.download_browser_pool import DownloadBrowserPool
 from db.repository import DBRepository
 
 logger = logging.getLogger(__name__)
@@ -504,6 +506,7 @@ class GlobalWorkerPool:
         self._download_runtime_config: Dict[str, Any] = {}
         self._elastic_download_tasks: set[asyncio.Task] = set()
         self._elastic_download_sequence = 0
+        self._download_browser_pool: Optional[DownloadBrowserPool] = None
 
         self._tasks: list[asyncio.Task] = []
         self._flush_task: Optional[asyncio.Task] = None
@@ -565,6 +568,7 @@ class GlobalWorkerPool:
         self._elastic_download_sequence += 1
         worker_id = (
             normal_workers
+            + int(runtime.get("playwright_workers") or 0)
             + int(runtime.get("large_workers") or 0)
             + self._elastic_download_sequence
         )
@@ -583,14 +587,12 @@ class GlobalWorkerPool:
                         browser=self._browser,
                         browser_getter=self.acquire_browser,
                         browser_releaser=self.release_browser,
+                        download_browser_getter=self.acquire_download_browser,
+                        download_browser_releaser=self.release_download_browser,
                         browser_relauncher=self._relaunch_browser,
                         worker_id=worker_id,
                         worker_lane="normal",
-                        large_download_queue=(
-                            self.large_collection_batch_queue
-                            if int(runtime.get("large_workers") or 0) > 0
-                            else None
-                        ),
+                        playwright_fallback_queue=self.large_collection_batch_queue,
                         shared_download_semaphore=semaphore,
                     ),
                     timeout=lifetime_sec,
@@ -933,25 +935,17 @@ class GlobalWorkerPool:
                 max_concurrent = int(getattr(settings, "DOWNLOAD_MAX_CONCURRENT", 5) or 5)
             max_concurrent = max(1, max_concurrent)
 
-            total_download_workers = max(1, int(getattr(settings, "DOWNLOAD_WORKERS", 5) or 5))
-            requested_large_workers = max(
-                0,
-                int(getattr(settings, "FILE_CRAWL_LARGE_DOWNLOAD_WORKERS", 2) or 0),
-            )
-            large_download_workers = min(requested_large_workers, max(0, total_download_workers - 1))
-            requested_normal_workers = max(
-                1,
-                int(getattr(settings, "FILE_CRAWL_NORMAL_DOWNLOAD_WORKERS", total_download_workers) or total_download_workers),
-            )
-            normal_download_workers = min(
-                requested_normal_workers,
-                total_download_workers - large_download_workers,
-            )
-            normal_download_workers = max(1, normal_download_workers)
+            download_topology = file_crawl_download_topology()
+            total_download_workers = download_topology["total_workers"]
+            normal_download_workers = download_topology["normal_workers"]
+            playwright_download_workers = download_topology["playwright_workers"]
+            large_download_workers = download_topology["large_workers"]
+            max_concurrent = download_topology["max_concurrent"]
             logger.info(
-                "[GlobalPool][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
+                "[GlobalPool][download_lanes] total=%s normal=%s playwright=%s large=%s max_concurrent=%s",
                 total_download_workers,
                 normal_download_workers,
+                playwright_download_workers,
                 large_download_workers,
                 max_concurrent,
             )
@@ -960,6 +954,7 @@ class GlobalWorkerPool:
             self._download_runtime_config = {
                 "max_concurrent": max_concurrent,
                 "normal_workers": normal_download_workers,
+                "playwright_workers": playwright_download_workers,
                 "large_workers": large_download_workers,
             }
             for i in range(normal_download_workers):
@@ -974,11 +969,11 @@ class GlobalWorkerPool:
                         browser=self._browser,
                         browser_getter=self.acquire_browser,
                         browser_releaser=self.release_browser,
+                        download_browser_getter=self.acquire_download_browser,
+                        download_browser_releaser=self.release_download_browser,
                         worker_id=i + 1,
                         worker_lane=worker_lane,
-                        large_download_queue=(
-                            self.large_collection_batch_queue if large_download_workers else None
-                        ),
+                        playwright_fallback_queue=self.large_collection_batch_queue,
                         browser_relauncher=self._relaunch_browser,
                         shared_download_semaphore=shared_download_semaphore,
                     ),
@@ -986,9 +981,9 @@ class GlobalWorkerPool:
                 )
                 self._track_worker_task(t)
 
-            if large_download_workers:
-                large_download_semaphore = asyncio.Semaphore(large_download_workers)
-                for i in range(large_download_workers):
+            if playwright_download_workers:
+                playwright_download_semaphore = asyncio.Semaphore(playwright_download_workers)
+                for i in range(playwright_download_workers):
                     t = asyncio.create_task(
                         download_worker(
                             self.large_collection_batch_queue,
@@ -998,13 +993,15 @@ class GlobalWorkerPool:
                             browser=self._browser,
                             browser_getter=self.acquire_browser,
                             browser_releaser=self.release_browser,
+                            download_browser_getter=self.acquire_download_browser,
+                            download_browser_releaser=self.release_download_browser,
                             worker_id=normal_download_workers + i + 1,
-                            worker_lane="large",
-                            fallback_in_queue=self.collection_batch_queue,
+                            worker_lane="playwright",
+                            direct_http_enabled=False,
                             browser_relauncher=self._relaunch_browser,
-                            shared_download_semaphore=large_download_semaphore,
+                            shared_download_semaphore=playwright_download_semaphore,
                         ),
-                        name=f"global-download-large-worker-{i+1}",
+                        name=f"global-download-playwright-worker-{i+1}",
                     )
                     self._track_worker_task(t)
 
@@ -1040,6 +1037,29 @@ class GlobalWorkerPool:
             headless=settings.HEADLESS, 
             args=launch_args
         ) # type: ignore[attr-defined]
+
+    async def _launch_download_browser(self) -> Browser:
+        """Launch a Chromium instance reserved for download fallback leases."""
+        return await self._launch_browser()
+
+    async def acquire_download_browser(self) -> Optional[Browser]:
+        if self._download_browser_pool is None:
+            self._download_browser_pool = DownloadBrowserPool(
+                self._launch_download_browser,
+                label="global",
+            )
+        return await self._download_browser_pool.acquire()
+
+    async def release_download_browser(self, browser: Optional[Browser]) -> None:
+        if self._download_browser_pool is not None:
+            await self._download_browser_pool.release(browser)
+
+    async def _close_download_browser_pool(self) -> None:
+        if self._download_browser_pool is None:
+            return
+        pool = self._download_browser_pool
+        self._download_browser_pool = None
+        await pool.close()
 
     def acquire_browser(self) -> Optional[Browser]:
         browser = self._browser
@@ -1232,6 +1252,7 @@ class GlobalWorkerPool:
             pass
         finally:
             try:
+                await self._close_download_browser_pool()
                 force_cleanup_tasks = list(self._retired_browser_force_cleanup_tasks)
                 for task in force_cleanup_tasks:
                     task.cancel()
