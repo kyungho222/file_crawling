@@ -25,10 +25,6 @@ from backend.file.file_detail_category import (
 from backend.file.file_crawl_stage3 import enqueue_file_crawl_stage3_candidates
 from backend.file.html_encoding import decode_html_response_bytes
 from backend.shared.date_utils import is_date_in_range, parse_date
-from core.crawler.file_host_request_gate import (
-    acquire_file_crawl_host_slot,
-    release_file_crawl_host_slot,
-)
 from utils.file import strip_fallback_download_label
 from utils.url import ensure_url_scheme
 
@@ -947,21 +943,12 @@ async def run_fast_file_attachment_front(
                 if _workflow_stop_requested():
                     logger.debug("[file-fast][stop_skip] stage=before_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                     return
-                host = (urlparse(str(item.url or "")).hostname or "").lower()
-                host_slot_acquired = False
-                try:
-                    if host:
-                        await acquire_file_crawl_host_slot(host, requested_limit=limit)
-                        host_slot_acquired = True
-                    html = await _fetch_with_workflow(
-                        workflow,
-                        item.url,
-                        timeout_sec,
-                        playwright_fallback_on_fetch_failure=playwright_fallback_on_fetch_failure,
-                    )
-                finally:
-                    if host_slot_acquired:
-                        await release_file_crawl_host_slot(host)
+                html = await _fetch_with_workflow(
+                    workflow,
+                    item.url,
+                    timeout_sec,
+                    playwright_fallback_on_fetch_failure=playwright_fallback_on_fetch_failure,
+                )
                 if _workflow_stop_requested():
                     logger.debug("[file-fast][stop_skip] stage=after_http_fetch job_id=%s post_url=%s", getattr(workflow, "job_id", ""), item.url)
                     return

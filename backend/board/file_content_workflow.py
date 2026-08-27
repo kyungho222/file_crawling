@@ -818,8 +818,6 @@ def _file_pipeline_worker_config() -> Dict[str, int]:
         "scan_workers": 1,
         "collection_workers": collection_workers,
         "download_workers": download_topology["total_workers"],
-        "http_download_workers": download_topology["normal_workers"],
-        "playwright_download_workers": download_topology["playwright_workers"],
         "download_max_concurrent": download_topology["max_concurrent"],
         "study_workers": study_workers,
     }
@@ -1846,12 +1844,10 @@ class BoardContentFilePipelineMixin:
                 self._file_worker_manager_cleanup_pending = None
                 worker_config = _file_pipeline_worker_config()
                 logger.info(
-                "[FileCrawlTrace][worker_config] job_id=%s download_workers=%s http_download_workers=%s playwright_download_workers=%s download_max_concurrent=%s save_workers=%s study_workers=%s",
-                self.job_id,
-                worker_config.get("download_workers"),
-                worker_config.get("http_download_workers"),
-                worker_config.get("playwright_download_workers"),
-                worker_config.get("download_max_concurrent"),
+                    "[FileCrawlTrace][worker_config] job_id=%s download_workers=%s download_max_concurrent=%s save_workers=%s study_workers=%s",
+                    self.job_id,
+                    worker_config.get("download_workers"),
+                    worker_config.get("download_max_concurrent"),
                     self._file_progress_worker_count(),
                     worker_config.get("study_workers"),
                 )
@@ -7064,8 +7060,9 @@ class BoardContentFilePipelineMixin:
         stages = []
         if manager is not None:
             stages.extend(
-                (("scan", getattr(manager, "scan_tasks", [])),
+                 (("scan", getattr(manager, "scan_tasks", [])),
                  ("collection", getattr(manager, "collection_tasks", [])),
+                 ("source_prewarm", getattr(manager, "source_prewarm_tasks", [])),
                  ("download", getattr(manager, "download_tasks", [])),
                  ("study", getattr(manager, "study_tasks", [])))
             )
@@ -7325,7 +7322,7 @@ class BoardContentFilePipelineMixin:
                 worker_health,
             )
             logger.info(
-                "[FileCrawlTrace][download_lanes] job_id=%s http_queued=%s http_unfinished=%s playwright_queued=%s playwright_unfinished=%s",
+                "[FileCrawlTrace][download_lanes] job_id=%s normal_queued=%s normal_unfinished=%s large_queued=%s large_unfinished=%s",
                 getattr(self, "job_id", None),
                 snapshot.get("collection_batch_queue", 0),
                 snapshot.get("collection_batch_queue_unfinished", 0),
@@ -7347,6 +7344,9 @@ class BoardContentFilePipelineMixin:
                 int(snapshot.get("collection_batch_queue_unfinished", 0) or 0),
                 int(snapshot.get("large_collection_batch_queue", 0) or 0),
                 int(snapshot.get("large_collection_batch_queue_unfinished", 0) or 0),
+                int(snapshot.get("source_prewarm_batch_queue", 0) or 0),
+                int(snapshot.get("source_prewarm_batch_queue_buffer", 0) or 0),
+                int(snapshot.get("source_prewarm_batch_queue_unfinished", 0) or 0),
                 int(snapshot.get("progress_queue_unfinished", 0) or 0),
             )
             now = time.monotonic()
@@ -7495,13 +7495,6 @@ class BoardContentFilePipelineMixin:
                     "[FileCrawlTrace][stall_active_downloads]\njob_id=%s\nactive_count=0\nreason=no_active_download_worker",
                     getattr(self, "job_id", None),
                 )
-            logger.warning(
-                "[FileCrawlTrace][progress_queue_stall] job_id=%s stalled_sec=%.1f progress=%s workers=%s",
-                getattr(self, "job_id", None),
-                stagnant_sec,
-                progress_trace,
-                worker_health,
-            )
             last_change_at = now
 
     async def _ensure_file_local_finalize_workers(self) -> None:

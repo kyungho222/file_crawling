@@ -271,15 +271,13 @@ class WorkerManager:
         topology = file_crawl_download_topology()
         total_workers = topology["total_workers"]
         normal_workers = topology["normal_workers"]
-        playwright_workers = topology["playwright_workers"]
         large_workers = topology["large_workers"]
         max_concurrent = topology["max_concurrent"]
 
         logger.info(
-            "[WorkerManager][download_lanes] total=%s normal=%s playwright=%s large=%s max_concurrent=%s",
+            "[WorkerManager][download_lanes] total=%s normal=%s large=%s max_concurrent=%s",
             total_workers,
             normal_workers,
-            playwright_workers,
             large_workers,
             max_concurrent,
         )
@@ -288,7 +286,6 @@ class WorkerManager:
         self._download_runtime_config = {
             "max_concurrent": max_concurrent,
             "normal_workers": normal_workers,
-            "playwright_workers": playwright_workers,
             "large_workers": large_workers,
         }
         for i in range(normal_workers):
@@ -309,7 +306,6 @@ class WorkerManager:
                     worker_id=i + 1,
                     worker_lane=worker_lane,
                     large_download_queue=None,
-                    playwright_fallback_queue=self.job_queues.large_collection_batch_queue,
                     shared_download_semaphore=shared_download_semaphore,
                 )
             )
@@ -317,9 +313,9 @@ class WorkerManager:
             self.tasks.append(t)
             self._log_download_task_lifecycle(t, worker_id=i + 1, lane=worker_lane)
 
-        if playwright_workers:
-            playwright_download_semaphore = asyncio.Semaphore(playwright_workers)
-            for i in range(playwright_workers):
+        if large_workers:
+            large_download_semaphore = asyncio.Semaphore(large_workers)
+            for i in range(large_workers):
                 t = asyncio.create_task(
                     download_worker(
                         self.job_queues.large_collection_batch_queue,
@@ -333,9 +329,9 @@ class WorkerManager:
                         download_browser_releaser=self.release_download_browser,
                         browser_relauncher=self._relaunch_browser,
                         worker_id=normal_workers + i + 1,
-                        worker_lane="playwright",
-                        direct_http_enabled=False,
-                        shared_download_semaphore=playwright_download_semaphore,
+                        worker_lane="large",
+                        fallback_in_queue=self.job_queues.collection_batch_queue,
+                        shared_download_semaphore=large_download_semaphore,
                     )
                 )
                 self.download_tasks.append(t)
@@ -343,7 +339,7 @@ class WorkerManager:
                 self._log_download_task_lifecycle(
                     t,
                     worker_id=normal_workers + i + 1,
-                    lane="playwright",
+                    lane="large",
                 )
 
     async def ensure_elastic_normal_download_worker(
@@ -353,7 +349,7 @@ class WorkerManager:
         max_elastic_workers: int = 2,
         lifetime_sec: float = 600.0,
     ) -> bool:
-        """Keep the fixed HTTP/PW download topology intact."""
+        """Keep the fixed three-worker download topology intact."""
         max_elastic_workers = 0
         runtime = dict(getattr(self, "_download_runtime_config", {}) or {})
         normal_workers = int(runtime.get("normal_workers") or 0)
@@ -380,7 +376,6 @@ class WorkerManager:
         self._elastic_download_sequence += 1
         worker_id = (
             normal_workers
-            + int(runtime.get("playwright_workers") or 0)
             + int(runtime.get("large_workers") or 0)
             + self._elastic_download_sequence
         )
@@ -407,7 +402,11 @@ class WorkerManager:
                         browser_relauncher=self._relaunch_browser,
                         worker_id=worker_id,
                         worker_lane="normal",
-                        playwright_fallback_queue=self.job_queues.large_collection_batch_queue,
+                        large_download_queue=(
+                            self.job_queues.large_collection_batch_queue
+                            if int(runtime.get("large_workers") or 0) > 0
+                            else None
+                        ),
                         shared_download_semaphore=semaphore,
                         recover_taken_batch_on_cancel=True,
                     ),
@@ -670,8 +669,8 @@ class WorkerManager:
                 for stale_browser in retired:
                     self._browser_use_count.pop(id(stale_browser), None)
                     await self._close_browser_instance(stale_browser)
-            logger.warning(
-                "[PlaywrightDiag][relaunch] scope=local db=%s current_browser_id=%s connected=%s current_leases=%s retired=%s",
+            logger.info(
+                "[PlaywrightDiag][relaunch_started] scope=local db=%s current_browser_id=%s connected=%s current_leases=%s retired=%s",
                 self.db_name,
                 id(old_browser) if old_browser else None,
                 bool(old_browser and old_browser.is_connected()),
@@ -683,6 +682,12 @@ class WorkerManager:
             except Exception:
                 raise
             self.browser = new_browser
+            logger.info(
+                "[PlaywrightDiag][relaunch_completed] scope=local db=%s browser_id=%s connected=%s",
+                self.db_name,
+                id(new_browser),
+                bool(new_browser and new_browser.is_connected()),
+            )
             if old_browser and old_browser is not new_browser:
                 self._retired_browsers[id(old_browser)] = old_browser
                 self._schedule_retired_browser_cleanup(old_browser)
@@ -695,6 +700,7 @@ class WorkerManager:
         scan_batch_queue = self.job_queues.scan_batch_queue
         collection_batch_queue = self.job_queues.collection_batch_queue
         large_collection_batch_queue = self.job_queues.large_collection_batch_queue
+        source_prewarm_batch_queue = self.job_queues.source_prewarm_batch_queue
         save_batch_queue = self.job_queues.save_batch_queue
         study_batch_queue = self.job_queues.study_batch_queue
         # flush 주기 단축(기본 50ms): batch buffer로 인해 다음 단계가 지연되는 현상 완화
@@ -710,6 +716,7 @@ class WorkerManager:
                     not scan_batch_queue.empty()
                     or not collection_batch_queue.empty()
                     or not large_collection_batch_queue.empty()
+                    or not source_prewarm_batch_queue.empty()
                     or not save_batch_queue.empty()
                     or not study_batch_queue.empty()
                 )
@@ -720,6 +727,7 @@ class WorkerManager:
                 await asyncio.sleep(0.01)
                 await collection_batch_queue.flush()
                 await large_collection_batch_queue.flush()
+                await source_prewarm_batch_queue.flush()
                 await asyncio.sleep(0.01)
                 await save_batch_queue.flush()
                 await asyncio.sleep(0.01)
@@ -773,6 +781,7 @@ class WorkerManager:
             await self.job_queues.scan_batch_queue.flush()
             await self.job_queues.collection_batch_queue.flush()
             await self.job_queues.large_collection_batch_queue.flush()
+            await self.job_queues.source_prewarm_batch_queue.flush()
             await self.job_queues.save_batch_queue.flush()
             await self.job_queues.study_batch_queue.flush()
             logger.info("[WorkerManager] Batch queues flushed.")

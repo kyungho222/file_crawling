@@ -2,7 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Awaitable
+
+
+def common_http_header_deadline_sec() -> float:
+    """Return the common direct-download header deadline before PW fallback."""
+    try:
+        value = float(os.getenv("DOWNLOAD_HTTP_HEADER_HARD_TIMEOUT_SEC", "20") or "20")
+    except (TypeError, ValueError):
+        value = 20.0
+    return max(1.0, min(value, 120.0))
 
 
 def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:

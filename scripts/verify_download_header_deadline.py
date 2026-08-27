@@ -10,10 +10,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.crawler.http_header_deadline import await_http_response_headers
+from core.crawler.http_header_deadline import (
+    await_http_response_headers,
+    common_http_header_deadline_sec,
+)
 
 
 async def main() -> None:
+    assert common_http_header_deadline_sec() == 20.0
     started_at = time.monotonic()
     try:
         await await_http_response_headers(asyncio.sleep(0.2), timeout_sec=0.03)

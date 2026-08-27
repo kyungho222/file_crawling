@@ -11,8 +11,7 @@
     "include_origin": true,
     "http_retries": 3,
     "http_retries_before_playwright": 1,
-    "http_header_hard_timeout_sec": 10,
-    "playwright_fallback": true,
-    "download_browser_pool": true
+    "playwright_fallback": false,
+    "download_browser_pool": false
   }
 }

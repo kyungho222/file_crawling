@@ -57,18 +57,12 @@ def _env_batch_size(name: str, default: int) -> int:
     return max(1, min(value, 500))
 
 
-def _collection_queue_maxsize() -> int:
-    """Keep download backpressure shallow without changing other batch queues."""
-    if os.getenv("CRAWLER_COLLECTION_QUEUE_MAXSIZE") is not None:
-        return _env_queue_maxsize("CRAWLER_COLLECTION_QUEUE_MAXSIZE", 30)
-    if os.getenv("CRAWLER_BATCH_QUEUE_MAXSIZE") is not None:
-        return _env_queue_maxsize("CRAWLER_BATCH_QUEUE_MAXSIZE", 30)
-    return 30
-
-
-def _collection_lane_queue_maxsize() -> int:
-    """Split the existing aggregate collection capacity across both lanes."""
-    return max(1, (_collection_queue_maxsize() + 1) // 2)
+def _download_queue_maxsize() -> int:
+    """Keep pending download candidates in memory until a worker consumes them."""
+    # asyncio.Queue treats zero as unbounded. Download throughput is governed by
+    # workers and host slots; a full ingress queue must not stall attachment
+    # extraction or make a crawl appear to stop before candidates are queued.
+    return 0
 
 
 _job_pause_flags: Dict[str, Dict[str, bool]] = {}
@@ -295,13 +289,19 @@ class JobQueues:
     collection_batch_queue: BatchQueue = field(
         default_factory=lambda: BatchQueue(
             batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1),
-            queue_maxsize=_collection_lane_queue_maxsize(),
+            queue_maxsize=_download_queue_maxsize(),
         )
     )
     large_collection_batch_queue: BatchQueue = field(
         default_factory=lambda: BatchQueue(
             batch_size=_env_batch_size("CRAWLER_COLLECTION_BATCH_SIZE", 1),
-            queue_maxsize=_collection_lane_queue_maxsize(),
+            queue_maxsize=_download_queue_maxsize(),
+        )
+    )
+    source_prewarm_batch_queue: BatchQueue = field(
+        default_factory=lambda: BatchQueue(
+            batch_size=1,
+            queue_maxsize=_download_queue_maxsize(),
         )
     )
     save_batch_queue: BatchQueue = field(default_factory=lambda: BatchQueue(batch_size=_env_batch_size("CRAWLER_SAVE_BATCH_SIZE", 3)))
@@ -322,6 +322,7 @@ class JobQueues:
             "scan_batch_queue": await _clear_batch_queue_nowait(self.scan_batch_queue),
             "collection_batch_queue": await _clear_batch_queue_nowait(self.collection_batch_queue),
             "large_collection_batch_queue": await _clear_batch_queue_nowait(self.large_collection_batch_queue),
+            "source_prewarm_batch_queue": await _clear_batch_queue_nowait(self.source_prewarm_batch_queue),
             "save_batch_queue": await _clear_batch_queue_nowait(self.save_batch_queue),
             "study_batch_queue": await _clear_batch_queue_nowait(self.study_batch_queue),
             "retry_batch_queue": await _clear_batch_queue_nowait(self.retry_batch_queue),
@@ -356,6 +357,7 @@ class JobQueues:
             "scan_batch_queue": scan_batch_size,
             "collection_batch_queue": collection_batch_size,
             "large_collection_batch_queue": self.large_collection_batch_queue.queue.qsize(),
+            "source_prewarm_batch_queue": self.source_prewarm_batch_queue.queue.qsize(),
             "save_batch_queue": save_batch_size,
             "study_batch_queue": study_batch_size,
             "retry_batch_queue": self.retry_batch_queue.queue.qsize(),
@@ -368,6 +370,7 @@ class JobQueues:
             "scan_batch_queue",
             "collection_batch_queue",
             "large_collection_batch_queue",
+            "source_prewarm_batch_queue",
             "save_batch_queue",
             "study_batch_queue",
             "retry_batch_queue",

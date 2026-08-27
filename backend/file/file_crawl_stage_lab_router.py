@@ -23,7 +23,10 @@ from config.settings import settings
 from core.crawler.batch_queue import BatchQueue
 from core.crawler.file_download_topology import file_crawl_download_topology
 from core.crawler.queues import create_job_queues, dispose_job_queues
-from core.crawler.workers.download import download_worker, get_download_worker_activity_snapshot
+from core.crawler.workers.download import (
+    download_worker,
+    get_download_worker_activity_snapshot,
+)
 from backend.file.fast_attachment_producer import run_fast_file_attachment_front
 from backend.file.file_crawl_attachment_snapshot import read_file_crawl_attachment_snapshot
 from backend.file.file_download_workflow import (
@@ -742,7 +745,6 @@ def _new_download_validation_job(
             "learning": False,
             "download_workers": runtime["total_workers"],
             "normal_download_workers": runtime["normal_workers"],
-            "playwright_download_workers": runtime["playwright_workers"],
             "large_download_workers": runtime["large_workers"],
             "download_max_concurrent": runtime["max_concurrent"],
         },
@@ -1046,16 +1048,18 @@ async def _run_download_validation(job_id: str) -> None:
                         browser_relauncher=relaunch_browser,
                         worker_id=worker_id,
                         worker_lane="normal",
-                        playwright_fallback_queue=queues.large_collection_batch_queue,
+                        large_download_queue=(
+                            queues.large_collection_batch_queue if runtime["large_workers"] else None
+                        ),
                         shared_download_semaphore=normal_semaphore,
                         item_taken_callback=record_download_worker_taken,
                     ),
                     name=f"file-crawl-stage-lab:download-normal:{job_id}:{worker_id}",
                 )
             )
-        if runtime["playwright_workers"]:
-            playwright_semaphore = asyncio.Semaphore(runtime["playwright_workers"])
-            for index in range(runtime["playwright_workers"]):
+        if runtime["large_workers"]:
+            large_semaphore = asyncio.Semaphore(runtime["large_workers"])
+            for index in range(runtime["large_workers"]):
                 worker_id = runtime["normal_workers"] + index + 1
                 worker_tasks.append(
                     asyncio.create_task(
@@ -1068,12 +1072,12 @@ async def _run_download_validation(job_id: str) -> None:
                             browser_releaser=lambda _browser: None,
                             browser_relauncher=relaunch_browser,
                             worker_id=worker_id,
-                            worker_lane="playwright",
-                            direct_http_enabled=False,
-                            shared_download_semaphore=playwright_semaphore,
+                            worker_lane="large",
+                            fallback_in_queue=queues.collection_batch_queue,
+                            shared_download_semaphore=large_semaphore,
                             item_taken_callback=record_download_worker_taken,
                         ),
-                        name=f"file-crawl-stage-lab:download-playwright:{job_id}:{worker_id}",
+                        name=f"file-crawl-stage-lab:download-large:{job_id}:{worker_id}",
                     )
                 )
         job["worker_tasks"] = worker_tasks
@@ -1086,11 +1090,11 @@ async def _run_download_validation(job_id: str) -> None:
             job["download_candidates"] = []
         job["queue_snapshot"] = queues.debug_snapshot()
         logger.info(
-            "[FileCrawlStageLab][download_queue_ready] job_id=%s db=%s normal_workers=%s playwright_workers=%s",
+            "[FileCrawlStageLab][download_queue_ready] job_id=%s db=%s normal_workers=%s large_workers=%s",
             job_id,
             job["db_name"],
             runtime["normal_workers"],
-            runtime["playwright_workers"],
+            runtime["large_workers"],
         )
 
         last_wait_event = time.monotonic()
